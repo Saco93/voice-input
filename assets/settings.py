@@ -505,7 +505,7 @@ class SettingsWindow(Adw.PreferencesWindow):
                 "api_base_url": self.api_base_entry.get_text(),
                 "api_key": self.api_key_entry.get_text(),
                 "model": self.model_llm_entry.get_text(),
-                "timeout_ms": 7000,
+                "timeout_ms": 5000,
                 "provider_sort": self.provider_sort_entry.get_text(),
                 "agent_context_enabled": self.agent_context_switch.get_active(),
                 "agent_context_max_chars": int(

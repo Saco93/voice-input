@@ -156,12 +156,13 @@ Agent-aware refinement is opt-in because the reference excerpt is sent to the co
 
 ```toml
 [llm]
+timeout_ms = 5000 # total budget shared by contextual and transcript-only attempts
 provider_sort = "latency"
 agent_context_enabled = true
 agent_context_max_chars = 6000
 ```
 
-When the API base URL belongs to OpenRouter, `provider_sort = "latency"` adds `provider.sort = "latency"` to each refinement request. The option is intentionally ignored for other OpenAI-compatible providers so they never receive an OpenRouter-specific field.
+When the API base URL belongs to OpenRouter, `provider_sort = "latency"` adds `provider.sort = "latency"` to each refinement request. The option is intentionally ignored for other OpenAI-compatible providers so they never receive an OpenRouter-specific field. `timeout_ms` is a total refinement budget, not a per-attempt timeout: network, timeout, authentication, rate-limit, and provider failures fail open to the final ASR text without a second request; only context-specific payload or response errors may retry without context using the remaining budget. Truncated model responses are rejected instead of being inserted into the focused application.
 
 Pi integration installs `~/.pi/agent/extensions/voice-input-session-registry.ts`. Existing Pi processes must run `/reload` once after installation; future Pi sessions load it automatically. Codex needs no extension because the daemon identifies the focused Codex process and its main CLI rollout directly. Context discovery or parsing failures silently fall back to transcript-only refinement. The reference is length-limited, obvious secret-bearing lines and token patterns are redacted, and its contents are explicitly treated as untrusted terminology reference rather than instructions.
 
