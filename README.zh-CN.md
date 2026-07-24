@@ -37,8 +37,8 @@ flowchart LR
 
 - 使用 Hyprland 与 Wayland 的 Arch Linux / Omarchy
 - Rust toolchain、PipeWire（`pw-record`）、`wtype`、`wl-clipboard`
-- 主 HUD 使用 [Quickshell](https://quickshell.org/)
-- 可选：本地 fallback 使用 `/usr/bin/voxtype`；XWayland 使用 `xclip` + `xdotool`；Settings 使用 GTK4/libadwaita
+- HUD 和 Settings 使用 [Quickshell](https://quickshell.org/)
+- 可选：本地 fallback 使用 `/usr/bin/voxtype`；XWayland 使用 `xclip` + `xdotool`
 
 ### 安装
 
@@ -87,6 +87,7 @@ systemctl --user status voice-input.service voice-input-hud.service
 - Wayland/XWayland 长文本自动粘贴与剪贴板恢复
 - systemd 加密凭据：配置、argv、日志和 UI 中不保存密钥
 - 跟随 Omarchy 主题、焦点显示器且不抢焦点的 Quickshell HUD
+- 原生 Quickshell Settings，由 Rust 负责配置验证、持久化和加密凭据
 - 明确使用 `/usr/bin/voxtype` 作为本地 fallback，不再与主程序同名混淆
 
 ## 文档

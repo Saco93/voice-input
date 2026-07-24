@@ -37,8 +37,8 @@ No-speech sessions cancel immediately. Audio capture, ASR, HUD rendering, persis
 
 - Arch Linux / Omarchy with Hyprland and Wayland
 - Rust toolchain, PipeWire (`pw-record`), `wtype`, and `wl-clipboard`
-- [Quickshell](https://quickshell.org/) for the primary HUD
-- Optional: `/usr/bin/voxtype` for local fallback; `xclip` + `xdotool` for XWayland; GTK4/libadwaita for Settings
+- [Quickshell](https://quickshell.org/) for the HUD and Settings
+- Optional: `/usr/bin/voxtype` for local fallback; `xclip` + `xdotool` for XWayland
 
 ### Install
 
@@ -87,6 +87,7 @@ systemctl --user status voice-input.service voice-input-hud.service
 - Automatic long-text paste and clipboard restoration across Wayland/XWayland
 - Encrypted systemd credentials; no secrets in config, argv, logs, or UI
 - Theme-aware, monitor-aware, click-through Quickshell HUD
+- Native Quickshell Settings with validated Rust persistence and encrypted credentials
 - Explicit `/usr/bin/voxtype` local fallback without binary-name ambiguity
 
 ## Documentation

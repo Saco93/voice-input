@@ -2,6 +2,7 @@ PREFIX ?= $(HOME)/.local
 BIN_DIR ?= $(PREFIX)/bin
 SHARE_DIR ?= $(PREFIX)/share/voice-input
 QUICKSHELL_DIR ?= $(SHARE_DIR)/quickshell
+QUICKSHELL_SETTINGS_DIR ?= $(SHARE_DIR)/quickshell-settings
 SYSTEMD_USER_DIR ?= $(HOME)/.config/systemd/user
 PI_EXTENSIONS_DIR ?= $(HOME)/.pi/agent/extensions
 CONFIG_HOME ?= $(HOME)/.config
@@ -18,11 +19,15 @@ run:
 
 install: build
 	install -Dm755 target/release/voice-input $(BIN_DIR)/voice-input
-	install -Dm755 assets/hud.py $(SHARE_DIR)/hud.py
-	install -Dm755 assets/settings.py $(SHARE_DIR)/settings.py
 	install -Dm644 assets/quickshell/shell.qml $(QUICKSHELL_DIR)/shell.qml
 	install -Dm644 assets/quickshell/StateStore.qml $(QUICKSHELL_DIR)/StateStore.qml
 	install -Dm644 assets/quickshell/HudSurface.qml $(QUICKSHELL_DIR)/HudSurface.qml
+	rm -rf $(QUICKSHELL_SETTINGS_DIR)
+	install -d -m755 $(QUICKSHELL_SETTINGS_DIR)
+	cp -a assets/quickshell-settings/. $(QUICKSHELL_SETTINGS_DIR)/
+	find $(QUICKSHELL_SETTINGS_DIR) -type f -exec chmod 0644 {} +
+	# Remove obsolete GTK/Python assets left by upgrades from older releases.
+	rm -f $(SHARE_DIR)/hud.py $(SHARE_DIR)/settings.py
 	install -Dm644 assets/pi/voice-input-session-registry.ts $(PI_EXTENSIONS_DIR)/voice-input-session-registry.ts
 	install -Dm644 assets/config.toml $(SHARE_DIR)/config.toml
 	install -Dm644 assets/omarchy-hyprland-snippet.conf $(SHARE_DIR)/omarchy-hyprland-snippet.conf
@@ -60,8 +65,9 @@ install: build
 	@printf "Installed voice-input to %s\n" "$(BIN_DIR)/voice-input"
 	@printf "Hyprland snippet: %s\n" "$(SHARE_DIR)/omarchy-hyprland-snippet.conf"
 	@printf "Waybar snippet:   %s\n" "$(SHARE_DIR)/omarchy-waybar-snippet.jsonc"
-	@printf "Quickshell HUD:   %s\n" "$(QUICKSHELL_DIR)"
-	@printf "Pi session hook:  %s\n" "$(PI_EXTENSIONS_DIR)/voice-input-session-registry.ts"
+	@printf "Quickshell HUD:      %s\n" "$(QUICKSHELL_DIR)"
+	@printf "Quickshell Settings: %s\n" "$(QUICKSHELL_SETTINGS_DIR)"
+	@printf "Pi session hook:     %s\n" "$(PI_EXTENSIONS_DIR)/voice-input-session-registry.ts"
 
 enable-service: install
 	systemctl --user daemon-reload
