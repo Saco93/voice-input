@@ -183,25 +183,11 @@ fn settings_get(store: &ConfigStore) -> std::result::Result<Value, ProtocolError
     let loaded = store
         .load()
         .map_err(|_| error("config_read_failed", "configuration could not be loaded"))?;
-    let alibaba = credentials::status(ALIBABA_CREDENTIAL_ID).map_err(|_| {
-        error(
-            "credential_status_failed",
-            "credential status could not be read",
-        )
-    })?;
-    let openrouter = credentials::status(OPENROUTER_CREDENTIAL_ID).map_err(|_| {
-        error(
-            "credential_status_failed",
-            "credential status could not be read",
-        )
-    })?;
+    let credential_statuses = current_credential_statuses()?;
     Ok(json!({
         "config": loaded.config,
         "revision": loaded.revision,
-        "credentials": {
-            ALIBABA_CREDENTIAL_ID: alibaba,
-            OPENROUTER_CREDENTIAL_ID: openrouter,
-        },
+        "credentials": credential_statuses,
         "choices": {
             "hotkey.mode": ["hold", "toggle"],
             "asr.provider": ["local-cli", "alibaba-qwen-realtime"],
@@ -261,31 +247,61 @@ fn settings_save(
         }
     }
 
-    let revision = store
-        .save(&config, Some(&params.revision))
-        .map_err(store_error)?;
-
     let legacy_values = BTreeMap::from([
         (ALIBABA_CREDENTIAL_ID, loaded.config.asr.alibaba.api_key),
         (OPENROUTER_CREDENTIAL_ID, loaded.config.llm.api_key),
     ]);
     let mut updated = BTreeMap::new();
-    let mut credential_errors = BTreeMap::new();
+
+    // Migrate a legacy plaintext value before serializing the config, because
+    // Config deliberately omits api_key fields. A failed migration must not
+    // silently remove the user's only copy of that credential.
     for id in [ALIBABA_CREDENTIAL_ID, OPENROUTER_CREDENTIAL_ID] {
         let action = params.credentials.get(id);
-        let replacement = match action.map(|action| action.action.as_str()) {
-            Some("replace") => action.and_then(|action| action.value.as_deref()),
-            Some("keep") | None => {
-                let configured = credentials::status(id)
-                    .map(|status| status.configured)
-                    .unwrap_or(false);
-                (!configured)
-                    .then(|| legacy_values.get(id).map(String::as_str))
-                    .flatten()
-                    .filter(|value| !value.is_empty())
-            }
-            _ => None,
-        };
+        let configured = credentials::status(id)
+            .map_err(|_| {
+                error(
+                    "credential_status_failed",
+                    "credential status could not be read",
+                )
+            })?
+            .configured;
+        let legacy = legacy_values.get(id).map(String::as_str).unwrap_or("");
+        let replacement = action
+            .filter(|action| action.action == "replace")
+            .and_then(|action| action.value.as_deref());
+        let value_to_protect =
+            (!configured && !legacy.is_empty()).then_some(replacement.unwrap_or(legacy));
+        if let Some(value) = value_to_protect {
+            credentials::replace(id, value).map_err(|_| ProtocolError {
+                code: "credential_write_failed",
+                message: "legacy credential could not be migrated; configuration was not saved"
+                    .into(),
+                fields: Some(BTreeMap::from([(
+                    format!("credentials.{id}"),
+                    "credential could not be migrated".into(),
+                )])),
+            })?;
+            updated.insert(id, true);
+        } else {
+            updated.insert(id, false);
+        }
+    }
+
+    let revision = store
+        .save(&config, Some(&params.revision))
+        .map_err(store_error)?;
+
+    let mut credential_errors = BTreeMap::new();
+    for id in [ALIBABA_CREDENTIAL_ID, OPENROUTER_CREDENTIAL_ID] {
+        if updated.get(id) == Some(&true) {
+            continue;
+        }
+        let replacement = params.credentials.get(id).and_then(|action| {
+            (action.action == "replace")
+                .then_some(action.value.as_deref())
+                .flatten()
+        });
         if let Some(value) = replacement {
             match credentials::replace(id, value) {
                 Ok(()) => {
@@ -296,8 +312,6 @@ fn settings_save(
                     credential_errors.insert(id, "credential could not be updated");
                 }
             }
-        } else {
-            updated.insert(id, false);
         }
     }
 
@@ -316,13 +330,48 @@ fn settings_save(
     } else {
         json!({"requested": false, "ok": true})
     };
+    let restart_ok = restart["ok"].as_bool().unwrap_or(false);
+    let has_credential_errors = !credential_errors.is_empty();
+    let message = match (has_credential_errors, restart_ok) {
+        (false, true) if params.restart => "Configuration saved; service restarted",
+        (false, true) => "Configuration saved",
+        (true, true) => "Configuration saved, but one or more credentials could not be updated",
+        (false, false) => "Configuration saved, but the service could not be restarted",
+        (true, false) => {
+            "Configuration saved, but credential updates and the service restart had errors"
+        }
+    };
+    let credential_statuses = current_credential_statuses().unwrap_or_else(|_| json!({}));
 
     Ok(json!({
         "saved": true,
+        "config": config,
         "revision": revision,
+        "credentials": credential_statuses,
         "credentials_updated": updated,
         "credential_errors": credential_errors,
-        "restart": restart
+        "restart": restart,
+        "message": message,
+        "partial": has_credential_errors || !restart_ok
+    }))
+}
+
+fn current_credential_statuses() -> std::result::Result<Value, ProtocolError> {
+    let alibaba = credentials::status(ALIBABA_CREDENTIAL_ID).map_err(|_| {
+        error(
+            "credential_status_failed",
+            "credential status could not be read",
+        )
+    })?;
+    let openrouter = credentials::status(OPENROUTER_CREDENTIAL_ID).map_err(|_| {
+        error(
+            "credential_status_failed",
+            "credential status could not be read",
+        )
+    })?;
+    Ok(json!({
+        ALIBABA_CREDENTIAL_ID: alibaba,
+        OPENROUTER_CREDENTIAL_ID: openrouter,
     }))
 }
 
@@ -513,6 +562,34 @@ mod tests {
         assert_eq!(response["ok"], true);
         assert_eq!(response["result"]["config"]["audio"]["sample_rate"], 16_000);
         assert!(!response.to_string().contains("api_key"));
+    }
+
+    #[test]
+    fn save_round_trip_returns_current_revision_and_config() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = ConfigStore::new(temp.path().join("config.toml"));
+        let loaded = store.load().unwrap();
+        let request = json!({
+            "version": 1,
+            "id": 4,
+            "method": "settings.save",
+            "params": {
+                "revision": loaded.revision,
+                "config": loaded.config,
+                "credentials": {},
+                "restart": false
+            }
+        });
+        let response: Value =
+            serde_json::from_slice(&handle_line(request.to_string().as_bytes(), &store)).unwrap();
+        assert_eq!(response["ok"], true);
+        assert_eq!(response["result"]["saved"], true);
+        assert_eq!(response["result"]["partial"], false);
+        assert_eq!(response["result"]["config"]["audio"]["sample_rate"], 16_000);
+        assert_eq!(
+            response["result"]["revision"],
+            store.load().unwrap().revision
+        );
     }
 
     #[test]

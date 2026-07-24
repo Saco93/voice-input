@@ -423,15 +423,10 @@ impl Config {
             "asr.backend_command",
             &self.asr.backend_command,
             4_096,
-            self.asr.provider != AsrProvider::LocalCli,
+            self.asr.provider != AsrProvider::LocalCli && !self.asr.fallback_to_local,
         );
-        validate_text(
-            &mut fields,
-            "asr.engine",
-            &self.asr.engine,
-            256,
-            self.asr.provider != AsrProvider::LocalCli,
-        );
+        // An empty engine intentionally delegates engine selection to the local backend.
+        validate_text(&mut fields, "asr.engine", &self.asr.engine, 256, true);
         validate_text(&mut fields, "asr.model", &self.asr.model, 512, true);
         range(
             &mut fields,
@@ -452,7 +447,7 @@ impl Config {
             "asr.alibaba.endpoint",
             &self.asr.alibaba.endpoint,
             &["ws", "wss"],
-            false,
+            self.asr.provider != AsrProvider::AlibabaQwenRealtime,
         );
         validate_text(
             &mut fields,
@@ -476,12 +471,13 @@ impl Config {
             50,
             10_000,
         );
+        // Empty means derive Alibaba's compatible HTTP endpoint from the realtime host.
         validate_url(
             &mut fields,
             "asr.alibaba.final_pass_base_url",
             &self.asr.alibaba.final_pass_base_url,
             &["http", "https"],
-            !self.asr.alibaba.final_pass_enabled,
+            true,
         );
         validate_text(
             &mut fields,
@@ -512,19 +508,21 @@ impl Config {
             0,
             10_000,
         );
+        // Type mode also needs a paste chord for long text and clipboard fallback.
         validate_text(
             &mut fields,
             "output.paste_keys",
             &self.output.paste_keys,
             256,
-            !matches!(self.output.mode, OutputMode::Paste),
+            matches!(self.output.mode, OutputMode::Clipboard),
         );
+        // Empty intentionally falls back to the Wayland paste chord.
         validate_text(
             &mut fields,
             "output.xwayland_paste_keys",
             &self.output.xwayland_paste_keys,
             256,
-            !self.output.prefer_paste_for_xwayland,
+            true,
         );
 
         validate_url(
@@ -990,6 +988,25 @@ mod tests {
         assert!(error.fields.contains_key("asr.alibaba.vad_threshold"));
         assert!(error.fields.contains_key("llm.api_base_url"));
         assert!(error.fields.contains_key("llm.model"));
+    }
+
+    #[test]
+    fn optional_derived_endpoints_and_backend_defaults_validate() {
+        let mut config = Config::default();
+        config.asr.provider = super::AsrProvider::AlibabaQwenRealtime;
+        config.asr.alibaba.final_pass_enabled = true;
+        config.asr.alibaba.final_pass_base_url.clear();
+        config.asr.engine.clear();
+        config.output.xwayland_paste_keys.clear();
+        config
+            .validate()
+            .expect("derived final-pass URL and documented empty fallbacks are valid");
+
+        config.asr.backend_command.clear();
+        let error = config
+            .validate()
+            .expect_err("local fallback still requires its backend executable");
+        assert!(error.fields.contains_key("asr.backend_command"));
     }
 
     #[test]

@@ -371,7 +371,17 @@ QtObject {
                 revision = result.revision;
             if (result.credentials)
                 credentials = clone(result.credentials);
-            statusMessage = result.message || "Saved and restarted Voice Input.";
+            if (result.partial) {
+                const partialFields = {};
+                const credentialErrors = result.credential_errors || {};
+                for (const credentialId in credentialErrors)
+                    partialFields["credentials." + credentialId] = credentialErrors[credentialId];
+                fieldErrors = partialFields;
+                globalError = result.message || "Settings were saved with additional errors.";
+                statusMessage = "";
+            } else {
+                statusMessage = result.message || "Saved and restarted Voice Input.";
+            }
             saved();
         } else if (method === "llm.test") {
             statusMessage = result.message || "LLM connection test succeeded.";
