@@ -6,7 +6,6 @@ After=graphical-session.target
 [Service]
 Type=simple
 Environment=VOICE_INPUT_ASSET_DIR=@VOICE_INPUT_ASSET_DIR@
-Environment=VOICE_INPUT_EXTERNAL_HUD=1
 # Relative credential IDs are looked up in the per-user systemd encrypted
 # credential stores. Missing credentials are non-fatal for local-only use.
 LoadCredentialEncrypted=alibaba-api-key

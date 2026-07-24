@@ -35,6 +35,9 @@ QtObject {
         "transcript": "",
         "tooltip": "",
         "bars": [],
+        "hud_enabled": true,
+        "hud_margin_bottom": 72,
+        "hud_height": 56,
         "hud_position": "bottom-center",
         "hud_offset_x": 0,
         "hud_offset_y": 0,
@@ -47,6 +50,12 @@ QtObject {
     readonly property var bars: (phase === "arming" || phase === "recording")
         ? waveformBars
         : (snapshot.bars || emptyWaveform)
+    readonly property bool hudEnabled: snapshot.hud_enabled === undefined
+        ? true : Boolean(snapshot.hud_enabled)
+    readonly property int hudMarginBottom: snapshot.hud_margin_bottom === undefined
+        ? 72 : Number(snapshot.hud_margin_bottom)
+    readonly property int hudHeight: snapshot.hud_height === undefined
+        ? 56 : Number(snapshot.hud_height)
     readonly property string hudPosition: snapshot.hud_position || "bottom-center"
     readonly property int hudOffsetX: snapshot.hud_offset_x || 0
     readonly property int hudOffsetY: snapshot.hud_offset_y || 0

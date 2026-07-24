@@ -10,7 +10,7 @@ PanelWindow {
     required property var store
 
     screen: screenModel
-    visible: (store.active || fadeOut.running) && isFocusedScreen
+    visible: store.hudEnabled && (store.active || fadeOut.running) && isFocusedScreen
     color: "transparent"
     exclusionMode: ExclusionMode.Ignore
     focusable: false
@@ -89,7 +89,7 @@ PanelWindow {
     Rectangle {
         id: capsule
         width: panel.cardWidth
-        height: Math.max(56, transcriptViewport.height + 24)
+        height: Math.max(Math.max(32, store.hudHeight), transcriptViewport.height + 24)
         x: {
             if (store.hudPosition === "bottom-left")
                 return 24 + store.hudOffsetX;
@@ -97,12 +97,12 @@ PanelWindow {
                 return panel.width - width - 24 + store.hudOffsetX;
             return (panel.width - width) / 2 + store.hudOffsetX;
         }
-        y: panel.height - height - Math.max(0, 72 + store.hudOffsetY)
+        y: panel.height - height - Math.max(0, store.hudMarginBottom + store.hudOffsetY)
         radius: height / 2
         color: Qt.rgba(0.067, 0.078, 0.106, 0.92)
         border.width: 1
         border.color: Qt.rgba(1, 1, 1, 0.10)
-        opacity: store.active && panel.geometryReady ? 1 : 0
+        opacity: store.hudEnabled && store.active && panel.geometryReady ? 1 : 0
 
         Behavior on opacity { NumberAnimation { duration: 180; easing.type: Easing.OutCubic } }
         Behavior on width { NumberAnimation { duration: 170; easing.type: Easing.OutCubic } }
