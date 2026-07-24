@@ -1,0 +1,17 @@
+{
+  "custom/voice-input": {
+    "exec": "voice-input status --follow --format json --extended",
+    "return-type": "json",
+    "format": "{icon}",
+    "format-icons": {
+      "idle": "",
+      "recording": "󰍬",
+      "transcribing": "󰔟",
+      "refining": "󰚩",
+      "error": "󰅙"
+    },
+    "tooltip": true,
+    "on-click-right": "voice-input settings",
+    "on-click": "voice-input setup model"
+  }
+}

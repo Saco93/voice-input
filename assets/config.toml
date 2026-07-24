@@ -1,0 +1,66 @@
+state_file = "auto"
+
+[hotkey]
+accelerator = "SUPER CTRL, X"
+mode = "hold"
+
+[audio]
+device = "default"
+sample_rate = 16000
+max_duration_secs = 90
+partial_interval_ms = 1500
+pre_roll_enabled = false
+pre_roll_ms = 500
+
+[asr]
+provider = "local-cli"
+backend_command = "/usr/bin/voxtype"
+engine = "sensevoice"
+model = ""
+language = "simplified-chinese"
+connect_timeout_ms = 5000
+finalize_timeout_ms = 8000
+fallback_to_local = true
+
+[asr.alibaba]
+endpoint = "wss://dashscope.aliyuncs.com/api-ws/v1/realtime"
+model = "qwen3-asr-flash-realtime-2026-02-10"
+turn_mode = "server-vad"
+vad_threshold = 0.2
+silence_duration_ms = 400
+final_pass_enabled = false
+final_pass_base_url = ""
+final_pass_model = "qwen3-asr-flash-2026-02-10"
+final_pass_timeout_ms = 20000
+final_pass_enable_itn = false
+
+[output]
+mode = "type"
+fallback_to_clipboard = true
+type_delay_ms = 0
+pre_type_delay_ms = 140
+paste_keys = "shift+Insert"
+prefer_paste_for_xwayland = true
+xwayland_paste_keys = "shift+Insert"
+
+[ime]
+manage_fcitx5 = true
+force_ascii_before_output = true
+
+[llm]
+enabled = false
+api_base_url = "https://api.openai.com/v1"
+model = ""
+timeout_ms = 7000
+provider_sort = ""
+agent_context_enabled = false
+agent_context_max_chars = 6000
+
+[hud]
+enabled = true
+margin_bottom = 72
+height = 56
+position = "bottom-center"
+offset_x = 0
+offset_y = 0
+nudge_step = 24

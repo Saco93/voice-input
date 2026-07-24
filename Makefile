@@ -1,0 +1,75 @@
+PREFIX ?= $(HOME)/.local
+BIN_DIR ?= $(PREFIX)/bin
+SHARE_DIR ?= $(PREFIX)/share/voice-input
+QUICKSHELL_DIR ?= $(SHARE_DIR)/quickshell
+SYSTEMD_USER_DIR ?= $(HOME)/.config/systemd/user
+PI_EXTENSIONS_DIR ?= $(HOME)/.pi/agent/extensions
+CONFIG_HOME ?= $(HOME)/.config
+CONFIG_DIR ?= $(CONFIG_HOME)/voice-input
+CREDENTIAL_STORE_DIR ?= $(CONFIG_HOME)/credstore.encrypted
+
+.PHONY: build run install clean enable-service disable-service
+
+build:
+	cargo build --release --offline
+
+run:
+	cargo run --offline -- daemon
+
+install: build
+	install -Dm755 target/release/voice-input $(BIN_DIR)/voice-input
+	install -Dm755 assets/hud.py $(SHARE_DIR)/hud.py
+	install -Dm755 assets/settings.py $(SHARE_DIR)/settings.py
+	install -Dm644 assets/quickshell/shell.qml $(QUICKSHELL_DIR)/shell.qml
+	install -Dm644 assets/quickshell/StateStore.qml $(QUICKSHELL_DIR)/StateStore.qml
+	install -Dm644 assets/quickshell/HudSurface.qml $(QUICKSHELL_DIR)/HudSurface.qml
+	install -Dm644 assets/pi/voice-input-session-registry.ts $(PI_EXTENSIONS_DIR)/voice-input-session-registry.ts
+	install -Dm644 assets/config.toml $(SHARE_DIR)/config.toml
+	install -Dm644 assets/omarchy-hyprland-snippet.conf $(SHARE_DIR)/omarchy-hyprland-snippet.conf
+	install -Dm644 assets/omarchy-waybar-snippet.jsonc $(SHARE_DIR)/omarchy-waybar-snippet.jsonc
+	mkdir -p $(SYSTEMD_USER_DIR)
+	sed \
+		-e 's|@VOICE_INPUT_BIN@|$(BIN_DIR)/voice-input|g' \
+		-e 's|@VOICE_INPUT_ASSET_DIR@|$(SHARE_DIR)|g' \
+		assets/voice-input.service > $(SYSTEMD_USER_DIR)/voice-input.service
+	sed \
+		-e 's|@VOICE_INPUT_QUICKSHELL_DIR@|$(QUICKSHELL_DIR)|g' \
+		assets/voice-input-hud.service > $(SYSTEMD_USER_DIR)/voice-input-hud.service
+	install -d -m700 $(CONFIG_DIR) $(CREDENTIAL_STORE_DIR)
+	if [ ! -f $(CONFIG_DIR)/config.toml ]; then \
+		if [ -f $(HOME)/.config/voxtype/config.toml ] \
+			&& grep -q '^\[llm\]' $(HOME)/.config/voxtype/config.toml \
+			&& grep -q '^provider = ' $(HOME)/.config/voxtype/config.toml; then \
+			install -m600 $(HOME)/.config/voxtype/config.toml $(CONFIG_DIR)/config.toml; \
+		else \
+			install -m600 assets/config.toml $(CONFIG_DIR)/config.toml; \
+		fi; \
+	fi
+	for credential in alibaba-api-key openrouter-api-key; do \
+		if [ ! -f $(CREDENTIAL_STORE_DIR)/$$credential ]; then \
+			for source in \
+				$(CONFIG_DIR)/credentials/$$credential.cred \
+				$(CONFIG_HOME)/voxtype/credentials/$$credential.cred; do \
+				if [ -f $$source ]; then \
+					install -m600 $$source $(CREDENTIAL_STORE_DIR)/$$credential; \
+					break; \
+				fi; \
+			done; \
+		fi; \
+	done
+	@printf "Installed voice-input to %s\n" "$(BIN_DIR)/voice-input"
+	@printf "Hyprland snippet: %s\n" "$(SHARE_DIR)/omarchy-hyprland-snippet.conf"
+	@printf "Waybar snippet:   %s\n" "$(SHARE_DIR)/omarchy-waybar-snippet.jsonc"
+	@printf "Quickshell HUD:   %s\n" "$(QUICKSHELL_DIR)"
+	@printf "Pi session hook:  %s\n" "$(PI_EXTENSIONS_DIR)/voice-input-session-registry.ts"
+
+enable-service: install
+	systemctl --user daemon-reload
+	systemctl --user enable voice-input.service voice-input-hud.service
+	systemctl --user restart voice-input.service voice-input-hud.service
+
+disable-service:
+	systemctl --user disable --now voice-input-hud.service voice-input.service || true
+
+clean:
+	cargo clean

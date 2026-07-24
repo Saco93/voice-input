@@ -1,0 +1,23 @@
+[package]
+name = "voice-input"
+version = "0.1.0"
+edition = "2024"
+description = "A low-latency, agent-aware voice dictation service for Omarchy and Wayland"
+license = "MIT"
+repository = "https://github.com/Saco93/voice-input"
+readme = "README.md"
+keywords = ["dictation", "speech-to-text", "wayland", "omarchy"]
+categories = ["accessibility", "multimedia::audio"]
+
+[dependencies]
+anyhow = "1.0.102"
+base64 = "0.22.1"
+dirs = "5.0.1"
+reqwest = { version = "=0.12.9", default-features = false, features = ["blocking", "json", "rustls-tls-webpki-roots"] }
+rustls = { version = "0.23.37", features = ["ring"] }
+serde = { version = "1.0.214", features = ["derive"] }
+serde_json = "1.0.132"
+tempfile = "3.13.0"
+toml = "0.8.19"
+tungstenite = { version = "0.24.0", features = ["rustls-tls-webpki-roots"] }
+url = "2.5.7"

@@ -1,0 +1,15 @@
+[Unit]
+Description=Voice Input Quickshell HUD
+PartOf=graphical-session.target
+After=graphical-session.target voice-input.service
+Wants=voice-input.service
+
+[Service]
+Type=simple
+Environment=XDG_RUNTIME_DIR=%t
+ExecStart=/usr/bin/qs --no-duplicate --path @VOICE_INPUT_QUICKSHELL_DIR@
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=graphical-session.target

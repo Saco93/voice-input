@@ -1,0 +1,45 @@
+# Rust build output
+/target/
+
+# Local agent/editor metadata
+/.codex
+/.claude/
+/.idea/
+/.vscode/
+
+# Local configuration and environment overrides
+.env
+.env.*
+!.env.example
+config.local.toml
+*.local.toml
+
+# Credentials, private keys, and encrypted secret blobs
+credentials/
+*.cred
+*.pem
+*.key
+*.p12
+*.pfx
+*.age
+*.gpg
+
+# Runtime state, logs, databases, sessions, and recordings
+/runtime/
+state.json
+*.log
+*.jsonl
+*.db
+*.sqlite
+*.sqlite3
+*.wav
+*.flac
+*.mp3
+*.m4a
+*.ogg
+
+# Backups and OS-generated files
+*.bak
+*.backup
+*~
+.DS_Store
