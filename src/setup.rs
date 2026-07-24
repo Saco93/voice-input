@@ -168,6 +168,13 @@ pub fn print_hyprland_snippet() -> Result<()> {
     println!("# Keep the HUD from taking focus if Hyprland maps it as a regular client:");
     println!("windowrule = no_focus on, match:title ^Voice Input HUD$");
     println!("windowrule = no_anim on, match:title ^Voice Input HUD$");
+    println!("# Float Settings at its requested utility-window size:");
+    println!(
+        "windowrule = float on, match:class ^org\\.quickshell$, match:title ^Voice Input Settings$"
+    );
+    println!(
+        "windowrule = center on, match:class ^org\\.quickshell$, match:title ^Voice Input Settings$"
+    );
     println!("#");
     match config.hotkey.mode {
         HotkeyMode::Hold => {

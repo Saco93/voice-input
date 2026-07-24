@@ -1,7 +1,10 @@
 use std::{
     collections::BTreeMap,
+    fs,
     io::{self, BufRead, BufReader, BufWriter, Read, Write},
-    process::Command,
+    process::{Command, Stdio},
+    thread,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result};
@@ -12,10 +15,12 @@ use crate::{
     config::{Config, ConfigStore, LlmConfig, RevisionConflict, ValidationError},
     credentials::{self, ALIBABA_CREDENTIAL_ID, OPENROUTER_CREDENTIAL_ID},
     llm, paths,
+    state::{Phase, Snapshot},
 };
 
 const PROTOCOL_VERSION: u32 = 1;
 const MAX_REQUEST_LINE: usize = 1024 * 1024;
+const SERVICE_PROBE_TIMEOUT: Duration = Duration::from_millis(750);
 
 #[derive(Deserialize)]
 struct Request {
@@ -74,6 +79,43 @@ struct LlmTestParams {
 struct TestCredential {
     source: String,
     value: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum ServiceState {
+    Active,
+    Activating,
+    Deactivating,
+    Inactive,
+    Failed,
+    Unknown,
+}
+
+#[derive(Serialize)]
+struct ServiceStatus {
+    state: ServiceState,
+}
+
+#[derive(Serialize)]
+struct RuntimeStatus<'a> {
+    available: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    phase: Option<Phase>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    updated_at_ms: Option<u128>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    language: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    engine: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model: Option<&'a str>,
+}
+
+#[derive(Serialize)]
+struct RuntimeGetResult<'a> {
+    service: ServiceStatus,
+    runtime: RuntimeStatus<'a>,
 }
 
 pub fn run_stdio() -> Result<()> {
@@ -170,6 +212,10 @@ fn dispatch(request: &Request, store: &ConfigStore) -> std::result::Result<Value
                 .map_err(|_| error("invalid_params", "invalid settings.save parameters"))?;
             settings_save(store, params)
         }
+        "runtime.get" => {
+            require_empty_object(&request.params)?;
+            Ok(runtime_get())
+        }
         "llm.test" => {
             let params: LlmTestParams = serde_json::from_value(request.params.clone())
                 .map_err(|_| error("invalid_params", "invalid llm.test parameters"))?;
@@ -177,6 +223,103 @@ fn dispatch(request: &Request, store: &ConfigStore) -> std::result::Result<Value
         }
         _ => Err(error("method_not_found", "unknown method")),
     }
+}
+
+fn runtime_get() -> Value {
+    let service_state = probe_service_state();
+    let snapshot = paths::runtime_dir()
+        .ok()
+        .and_then(|directory| fs::read(directory.join("state.json")).ok())
+        .and_then(|contents| parse_runtime_snapshot(&contents));
+    runtime_response(service_state, snapshot.as_ref())
+}
+
+fn probe_service_state() -> ServiceState {
+    let Ok(mut child) = Command::new("/usr/bin/systemctl")
+        .args([
+            "--user",
+            "show",
+            "voice-input.service",
+            "--property=ActiveState",
+            "--value",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+    else {
+        return ServiceState::Unknown;
+    };
+
+    let deadline = Instant::now() + SERVICE_PROBE_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => {
+                let mut output = Vec::new();
+                return match child
+                    .stdout
+                    .take()
+                    .and_then(|mut stdout| stdout.read_to_end(&mut output).ok())
+                {
+                    Some(_) => normalize_service_state(&output),
+                    None => ServiceState::Unknown,
+                };
+            }
+            Ok(Some(_)) | Err(_) => return ServiceState::Unknown,
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(10)),
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return ServiceState::Unknown;
+            }
+        }
+    }
+}
+
+fn normalize_service_state(output: &[u8]) -> ServiceState {
+    match std::str::from_utf8(output).map(str::trim) {
+        Ok("active") => ServiceState::Active,
+        Ok("activating") | Ok("reloading") => ServiceState::Activating,
+        Ok("deactivating") => ServiceState::Deactivating,
+        Ok("inactive") => ServiceState::Inactive,
+        Ok("failed") | Ok("maintenance") => ServiceState::Failed,
+        _ => ServiceState::Unknown,
+    }
+}
+
+fn parse_runtime_snapshot(contents: &[u8]) -> Option<Snapshot> {
+    serde_json::from_slice(contents).ok()
+}
+
+fn runtime_response(service_state: ServiceState, snapshot: Option<&Snapshot>) -> Value {
+    let runtime = match snapshot {
+        Some(snapshot) => RuntimeStatus {
+            available: true,
+            phase: Some(snapshot.phase),
+            updated_at_ms: Some(snapshot.updated_at_ms),
+            language: nonempty(&snapshot.language),
+            engine: nonempty(&snapshot.engine),
+            model: nonempty(&snapshot.model),
+        },
+        None => RuntimeStatus {
+            available: false,
+            phase: None,
+            updated_at_ms: None,
+            language: None,
+            engine: None,
+            model: None,
+        },
+    };
+    serde_json::to_value(RuntimeGetResult {
+        service: ServiceStatus {
+            state: service_state,
+        },
+        runtime,
+    })
+    .expect("runtime response serialization cannot fail")
+}
+
+fn nonempty(value: &str) -> Option<&str> {
+    (!value.is_empty()).then_some(value)
 }
 
 fn settings_get(store: &ConfigStore) -> std::result::Result<Value, ProtocolError> {
@@ -533,8 +676,106 @@ fn drain_line(reader: &mut impl BufRead) -> std::result::Result<(), LineError> {
 mod tests {
     use serde_json::{Value, json};
 
-    use super::{handle_line, run_with_io};
-    use crate::config::ConfigStore;
+    use super::{
+        ServiceState, handle_line, normalize_service_state, parse_runtime_snapshot, run_with_io,
+        runtime_response,
+    };
+    use crate::{
+        config::{Config, ConfigStore},
+        state::Snapshot,
+    };
+
+    #[test]
+    fn service_state_is_bounded_and_normalized() {
+        assert_eq!(normalize_service_state(b"active\n"), ServiceState::Active);
+        assert_eq!(
+            normalize_service_state(b"  inactive  \n"),
+            ServiceState::Inactive
+        );
+        assert_eq!(
+            normalize_service_state(b"activating\n"),
+            ServiceState::Activating
+        );
+        assert_eq!(
+            normalize_service_state(b"deactivating\n"),
+            ServiceState::Deactivating
+        );
+        assert_eq!(normalize_service_state(b"failed\n"), ServiceState::Failed);
+        assert_eq!(
+            normalize_service_state(b"active but secret"),
+            ServiceState::Unknown
+        );
+        assert_eq!(normalize_service_state(&[0xff]), ServiceState::Unknown);
+    }
+
+    #[test]
+    fn missing_or_malformed_snapshot_is_unavailable_without_losing_service_state() {
+        let missing = runtime_response(ServiceState::Inactive, None);
+        assert_eq!(missing["service"]["state"], "inactive");
+        assert_eq!(missing["runtime"], json!({"available": false}));
+
+        let malformed = parse_runtime_snapshot(br#"{"phase":"recording"}"#);
+        assert!(malformed.is_none());
+        let response = runtime_response(ServiceState::Active, malformed.as_ref());
+        assert_eq!(response["service"]["state"], "active");
+        assert_eq!(response["runtime"], json!({"available": false}));
+    }
+
+    #[test]
+    fn valid_snapshot_exposes_only_allowlisted_runtime_metadata() {
+        let mut snapshot = Snapshot::idle(&Config::default());
+        snapshot.language = "Japanese".into();
+        snapshot.engine = "Safe Engine".into();
+        snapshot.model = "Safe Model".into();
+        snapshot.updated_at_ms = 1_234;
+        snapshot.tooltip = "private tooltip".into();
+        snapshot.transcript = "private transcript".into();
+        snapshot.raw_transcript = Some("private raw transcript".into());
+        snapshot.refined_transcript = Some("private refined transcript".into());
+        snapshot.output_target_hint = Some("private output hint".into());
+        snapshot.output_target_resolved = Some("private output target".into());
+        snapshot.output_mode = Some("private output mode".into());
+        snapshot.output_driver = Some("private output driver".into());
+        snapshot.error = Some("private runtime error".into());
+
+        let mut serialized = serde_json::to_value(snapshot).unwrap();
+        serialized
+            .as_object_mut()
+            .unwrap()
+            .insert("api_key".into(), json!("private credential"));
+        let parsed = parse_runtime_snapshot(&serde_json::to_vec(&serialized).unwrap()).unwrap();
+        let response = runtime_response(ServiceState::Active, Some(&parsed));
+
+        assert_eq!(response["service"]["state"], "active");
+        assert_eq!(response["runtime"]["available"], true);
+        assert_eq!(response["runtime"]["phase"], "idle");
+        assert_eq!(response["runtime"]["updated_at_ms"], 1_234);
+        assert_eq!(response["runtime"]["language"], "Japanese");
+        assert_eq!(response["runtime"]["engine"], "Safe Engine");
+        assert_eq!(response["runtime"]["model"], "Safe Model");
+        assert_eq!(response["runtime"].as_object().unwrap().len(), 6);
+
+        let encoded = response.to_string();
+        for forbidden in [
+            "private tooltip",
+            "private transcript",
+            "private raw transcript",
+            "private refined transcript",
+            "private output hint",
+            "private output target",
+            "private output mode",
+            "private output driver",
+            "private runtime error",
+            "private credential",
+            "api_key",
+            "tooltip",
+            "transcript",
+            "output_target",
+            "error",
+        ] {
+            assert!(!encoded.contains(forbidden), "leaked {forbidden}");
+        }
+    }
 
     #[test]
     fn protocol_errors_are_framed_and_redacted() {
