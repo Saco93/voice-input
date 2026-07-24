@@ -8,6 +8,7 @@ pub enum Command {
     Status(StatusOptions),
     Config(ConfigOptions),
     Settings,
+    SettingsBackend,
     Setup(SetupCommand),
     Llm(LlmCommand),
     Help,
@@ -95,6 +96,7 @@ pub fn parse() -> Result<Command> {
         "status" => parse_status(args.collect()),
         "config" => parse_config(args.collect()),
         "settings" => Ok(Command::Settings),
+        "settings-backend" => parse_settings_backend(args.collect()),
         "setup" => parse_setup(args.collect()),
         "llm" => parse_llm(args.collect()),
         other => bail!("unknown command `{other}`"),
@@ -204,6 +206,14 @@ fn parse_config(args: Vec<String>) -> Result<Command> {
     }
 
     Ok(Command::Config(ConfigOptions { format }))
+}
+
+fn parse_settings_backend(args: Vec<String>) -> Result<Command> {
+    if args == ["--stdio"] {
+        Ok(Command::SettingsBackend)
+    } else {
+        bail!("settings-backend requires exactly `--stdio`")
+    }
 }
 
 fn parse_setup(args: Vec<String>) -> Result<Command> {

@@ -1370,6 +1370,7 @@ dependencies = [
  "anyhow",
  "base64",
  "dirs",
+ "libc",
  "reqwest",
  "rustls",
  "serde",

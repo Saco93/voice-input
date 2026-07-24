@@ -9,6 +9,7 @@ mod http_client;
 mod llm;
 mod output;
 mod paths;
+mod settings_backend;
 mod setup;
 mod state;
 mod wav;

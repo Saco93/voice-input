@@ -1,12 +1,11 @@
 use std::{
     fs,
     path::PathBuf,
-    process::{Child, Command, Stdio},
     sync::{Arc, Mutex},
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -40,6 +39,12 @@ pub struct Snapshot {
     pub language: String,
     pub engine: String,
     pub model: String,
+    #[serde(default = "default_hud_enabled")]
+    pub hud_enabled: bool,
+    #[serde(default = "default_hud_margin_bottom")]
+    pub hud_margin_bottom: i32,
+    #[serde(default = "default_hud_height")]
+    pub hud_height: i32,
     pub hud_position: HudPosition,
     pub hud_offset_x: i32,
     pub hud_offset_y: i32,
@@ -80,6 +85,9 @@ impl Snapshot {
             language: config.asr.language.label().into(),
             engine: config.asr.active_engine_label(),
             model: config.asr.active_model_label(),
+            hud_enabled: config.hud.enabled,
+            hud_margin_bottom: config.hud.margin_bottom,
+            hud_height: config.hud.height,
             hud_position: config.hud.position,
             hud_offset_x: config.hud.offset_x,
             hud_offset_y: config.hud.offset_y,
@@ -110,6 +118,9 @@ impl Snapshot {
             payload["engine"] = json!(self.engine);
             payload["model"] = json!(self.model);
             payload["transcript"] = json!(self.transcript);
+            payload["hud_enabled"] = json!(self.hud_enabled);
+            payload["hud_margin_bottom"] = json!(self.hud_margin_bottom);
+            payload["hud_height"] = json!(self.hud_height);
             payload["hud_position"] = json!(self.hud_position);
             payload["hud_offset_x"] = json!(self.hud_offset_x);
             payload["hud_offset_y"] = json!(self.hud_offset_y);
@@ -136,7 +147,6 @@ struct StateInner {
     config: Config,
     snapshot: Mutex<Snapshot>,
     update_lock: Mutex<()>,
-    hud_process: Mutex<Option<Child>>,
 }
 
 impl StateHandle {
@@ -149,7 +159,6 @@ impl StateHandle {
                 config,
                 snapshot: Mutex::new(snapshot),
                 update_lock: Mutex::new(()),
-                hud_process: Mutex::new(None),
             }),
         };
         handle.persist()?;
@@ -199,9 +208,6 @@ impl StateHandle {
             }
         }
 
-        // HUD failures should not take the daemon down; typing and Waybar state still matter.
-        let _ = self.ensure_hud(&snapshot);
-
         Ok(())
     }
 
@@ -219,82 +225,18 @@ impl StateHandle {
         fs::rename(&temporary_path, path)
             .with_context(|| format!("failed to replace {}", path.display()))
     }
-
-    fn ensure_hud(&self, _snapshot: &Snapshot) -> Result<()> {
-        if !self.inner.config.hud.enabled || external_hud_enabled() {
-            return Ok(());
-        }
-        if _snapshot.phase == Phase::Idle {
-            return Ok(());
-        }
-
-        let mut process = self
-            .inner
-            .hud_process
-            .lock()
-            .expect("hud process mutex poisoned");
-        let should_spawn = match process.as_mut() {
-            Some(child) => child.try_wait().ok().flatten().is_some(),
-            None => true,
-        };
-
-        if !should_spawn {
-            return Ok(());
-        }
-
-        let script = paths::hud_script_path()?;
-        let runtime_dir = paths::runtime_dir()?;
-        let state_file = runtime_dir.join("state.json");
-        let waveform_socket = runtime_dir.join("waveform.sock");
-        let mut command = Command::new("python");
-        command
-            .arg(script)
-            .arg("--state-file")
-            .arg(state_file)
-            .arg("--waveform-socket")
-            .arg(waveform_socket)
-            .arg("--height")
-            .arg(self.inner.config.hud.height.to_string())
-            .arg("--margin-bottom")
-            .arg(self.inner.config.hud.margin_bottom.to_string())
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-
-        if let Ok(preload_path) = layer_shell_preload_path() {
-            let merged = std::env::var("LD_PRELOAD")
-                .ok()
-                .filter(|value| !value.trim().is_empty())
-                .map(|existing| format!("{preload_path}:{existing}"))
-                .unwrap_or(preload_path);
-            command.env("LD_PRELOAD", merged);
-        }
-
-        let child = command.spawn().context("failed to spawn HUD helper")?;
-        *process = Some(child);
-        Ok(())
-    }
 }
 
-fn external_hud_enabled() -> bool {
-    std::env::var("VOICE_INPUT_EXTERNAL_HUD")
-        .map(|value| matches!(value.as_str(), "1" | "true" | "yes"))
-        .unwrap_or(false)
+fn default_hud_enabled() -> bool {
+    true
 }
 
-fn layer_shell_preload_path() -> Result<String> {
-    let candidates = [
-        "/usr/lib/libgtk4-layer-shell.so",
-        "/usr/lib/libgtk4-layer-shell.so.0",
-    ];
+fn default_hud_margin_bottom() -> i32 {
+    72
+}
 
-    for candidate in candidates {
-        if fs::metadata(candidate).is_ok() {
-            return Ok(candidate.to_string());
-        }
-    }
-
-    bail!("gtk4-layer-shell shared library not found")
+fn default_hud_height() -> i32 {
+    56
 }
 
 fn now_ms() -> u128 {
@@ -302,4 +244,39 @@ fn now_ms() -> u128 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis()
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::Value;
+
+    use super::Snapshot;
+    use crate::config::Config;
+
+    #[test]
+    fn snapshot_carries_hud_configuration_in_extended_json() {
+        let mut config = Config::default();
+        config.hud.enabled = false;
+        config.hud.margin_bottom = 101;
+        config.hud.height = 64;
+        let snapshot = Snapshot::idle(&config);
+        let extended = snapshot.as_waybar_json(true);
+        assert_eq!(extended["hud_enabled"], false);
+        assert_eq!(extended["hud_margin_bottom"], 101);
+        assert_eq!(extended["hud_height"], 64);
+    }
+
+    #[test]
+    fn older_snapshot_uses_safe_hud_defaults() {
+        let config = Config::default();
+        let mut value = serde_json::to_value(Snapshot::idle(&config)).unwrap();
+        let object = value.as_object_mut().unwrap();
+        object.remove("hud_enabled");
+        object.remove("hud_margin_bottom");
+        object.remove("hud_height");
+        let snapshot: Snapshot = serde_json::from_value(Value::Object(object.clone())).unwrap();
+        assert!(snapshot.hud_enabled);
+        assert_eq!(snapshot.hud_margin_bottom, 72);
+        assert_eq!(snapshot.hud_height, 56);
+    }
 }

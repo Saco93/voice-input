@@ -1,6 +1,12 @@
-use std::{fs, io::Write, process::Command, thread, time::Duration};
+use std::{
+    fs,
+    io::Write,
+    process::{Command, Stdio},
+    thread,
+    time::Duration,
+};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 
 use crate::{
     args::{
@@ -33,6 +39,7 @@ pub fn run() -> Result<()> {
         ParsedCommand::Status(options) => run_status(options),
         ParsedCommand::Config(options) => print_config(options),
         ParsedCommand::Settings => open_settings(),
+        ParsedCommand::SettingsBackend => crate::settings_backend::run_stdio(),
         ParsedCommand::Setup(command) => run_setup(command),
         ParsedCommand::Llm(LlmCommand::Test) => {
             let mut config = Config::load()?;
@@ -117,20 +124,31 @@ fn print_config(options: ConfigOptions) -> Result<()> {
 }
 
 fn open_settings() -> Result<()> {
-    let script = paths::settings_script_path()?;
-    let status = Command::new("python")
-        .arg(script)
-        .arg("--config")
-        .arg(paths::config_path()?)
-        .arg("--binary")
-        .arg(paths::current_executable()?)
+    let settings_dir = paths::quickshell_settings_path()?;
+    let activated = Command::new("/usr/bin/qs")
+        .arg("--path")
+        .arg(&settings_dir)
+        .args(["ipc", "call", "voiceInputSettings", "activate"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
         .status()
-        .context("failed to launch settings UI")?;
-    if status.success() {
-        Ok(())
-    } else {
-        bail!("settings UI exited with status {status}")
+        .map(|status| status.success())
+        .unwrap_or(false);
+    if activated {
+        return Ok(());
     }
+
+    Command::new("/usr/bin/qs")
+        .args(["--daemonize", "--no-duplicate", "--path"])
+        .arg(settings_dir)
+        .env("VOICE_INPUT_BIN", paths::current_executable()?)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("failed to launch Quickshell settings UI")?;
+    Ok(())
 }
 
 fn run_setup(command: SetupCommand) -> Result<()> {

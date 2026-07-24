@@ -54,12 +54,8 @@ pub fn asset_dir() -> Result<PathBuf> {
     ))
 }
 
-pub fn hud_script_path() -> Result<PathBuf> {
-    Ok(asset_dir()?.join("hud.py"))
-}
-
-pub fn settings_script_path() -> Result<PathBuf> {
-    Ok(asset_dir()?.join("settings.py"))
+pub fn quickshell_settings_path() -> Result<PathBuf> {
+    Ok(asset_dir()?.join("quickshell-settings"))
 }
 
 pub fn waybar_snippet_path() -> Result<PathBuf> {

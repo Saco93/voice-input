@@ -475,6 +475,9 @@ impl Daemon {
                 language: self.config.asr.language.label().into(),
                 engine: self.config.asr.active_engine_label(),
                 model: self.config.asr.active_model_label(),
+                hud_enabled: self.config.hud.enabled,
+                hud_margin_bottom: self.config.hud.margin_bottom,
+                hud_height: self.config.hud.height,
                 hud_position: self.config.hud.position,
                 hud_offset_x: self.config.hud.offset_x,
                 hud_offset_y: self.config.hud.offset_y,
@@ -642,6 +645,9 @@ impl Daemon {
 
         let hud = self.config.hud.clone();
         self.state.update(move |snapshot| {
+            snapshot.hud_enabled = hud.enabled;
+            snapshot.hud_margin_bottom = hud.margin_bottom;
+            snapshot.hud_height = hud.height;
             snapshot.hud_position = hud.position;
             snapshot.hud_offset_x = hud.offset_x;
             snapshot.hud_offset_y = hud.offset_y;
