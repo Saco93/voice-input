@@ -124,7 +124,7 @@ mod tests {
     use reqwest::StatusCode;
 
     use super::{parse_response, resolve_base_url};
-    use crate::config::Config;
+    use crate::config::{Config, Language};
 
     #[test]
     fn derives_cn_base_url_from_realtime_endpoint() {
@@ -147,7 +147,9 @@ mod tests {
 
     #[test]
     fn parses_transcript_from_success_response() {
-        let config = Config::default();
+        let mut config = Config::default();
+        // Keep response parsing independent of the optional OpenCC executable.
+        config.asr.language = Language::English;
         let response = "{\"choices\":[{\"message\":{\"content\":\"请帮我把 Python JSON API 部署到 Kubernetes。\"}}]}";
 
         assert_eq!(
