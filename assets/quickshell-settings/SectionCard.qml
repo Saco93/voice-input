@@ -26,7 +26,7 @@ Rectangle {
         spacing: 8
 
         Label {
-            text: root.title
+            text: root.theme.tr(root.title)
             color: root.theme.foreground
             font.pixelSize: 14
             font.weight: Font.DemiBold
@@ -35,7 +35,7 @@ Rectangle {
 
         Label {
             visible: root.description.length > 0
-            text: root.description
+            text: root.theme.tr(root.description)
             color: root.theme.subtle
             font.pixelSize: 11
             wrapMode: Text.WordWrap

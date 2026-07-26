@@ -28,7 +28,7 @@ Rectangle {
             implicitHeight: 42
             leftPadding: 0
             rightPadding: 0
-            Accessible.name: (root.expanded ? "Hide " : "Show ") + "advanced settings"
+            Accessible.name: root.theme.tr((root.expanded ? "Hide " : "Show ") + "advanced settings")
             onClicked: root.expanded = !root.expanded
 
             contentItem: RowLayout {
@@ -39,14 +39,14 @@ Rectangle {
                     spacing: 2
 
                     Label {
-                        text: "Advanced"
+                        text: root.theme.tr("Advanced")
                         color: root.theme.foreground
                         font.pixelSize: 14
                         font.weight: Font.DemiBold
                     }
 
                     Label {
-                        text: root.description
+                        text: root.theme.tr(root.description)
                         color: root.theme.subtle
                         font.pixelSize: 11
                         wrapMode: Text.WordWrap
@@ -56,7 +56,7 @@ Rectangle {
                 }
 
                 Label {
-                    text: root.expanded ? "Hide" : "Show"
+                    text: root.theme.tr(root.expanded ? "Hide" : "Show")
                     color: root.theme.accent
                     font.pixelSize: 12
                     font.weight: Font.Medium

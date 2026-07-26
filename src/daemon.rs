@@ -216,9 +216,9 @@ enum HudMoveDirection {
 
 fn parse_hud_position(value: &str) -> Result<HudPosition> {
     match value {
-        "bottom-center" | "center" => Ok(HudPosition::BottomCenter),
-        "bottom-left" | "left" => Ok(HudPosition::BottomLeft),
-        "bottom-right" | "right" => Ok(HudPosition::BottomRight),
+        "bottom-center" | "center" => Ok(HudPosition::Center),
+        "bottom-left" | "left" => Ok(HudPosition::Left),
+        "bottom-right" | "right" => Ok(HudPosition::Right),
         other => bail!("unknown hud position `{other}`"),
     }
 }
@@ -516,17 +516,17 @@ impl Daemon {
                     },
                 )?;
                 let control_tx = session.control_tx.clone();
-                let event_handle = spawn_realtime_event_thread(
+                let event_handle = spawn_realtime_event_thread(RealtimeEventThreadContext {
                     session_id,
-                    self.config.clone(),
-                    self.state.clone(),
-                    partial_transcript.clone(),
-                    capture_ready.clone(),
-                    asr_ready.clone(),
-                    voice_active.clone(),
-                    speech_detected.clone(),
-                    session.event_rx,
-                );
+                    config: self.config.clone(),
+                    state: self.state.clone(),
+                    partial_transcript: partial_transcript.clone(),
+                    capture_ready: capture_ready.clone(),
+                    asr_ready: asr_ready.clone(),
+                    voice_active: voice_active.clone(),
+                    speech_detected: speech_detected.clone(),
+                    event_rx: session.event_rx,
+                });
                 (
                     Some(control_tx),
                     SessionAsrRuntime::Realtime {
@@ -572,19 +572,21 @@ impl Daemon {
             let (child, stdout) = spawn_pw_record(&self.config)?;
             let reader_handle = spawn_reader_thread(
                 stdout,
-                session_id,
-                self.config.clone(),
-                self.state.clone(),
-                stop_flag.clone(),
-                cancel_flag.clone(),
-                audio_buffer.clone(),
-                capture_ready,
-                asr_ready,
-                voice_active,
-                asr_control_tx,
-                asr_packetizer.clone(),
-                waveform_analyzer,
-                self.waveform.clone(),
+                ReaderThreadContext {
+                    session_id,
+                    config: self.config.clone(),
+                    state: self.state.clone(),
+                    stop_flag: stop_flag.clone(),
+                    cancel_flag: cancel_flag.clone(),
+                    audio_buffer: audio_buffer.clone(),
+                    capture_ready,
+                    asr_ready,
+                    voice_active,
+                    asr_control_tx,
+                    asr_packetizer: asr_packetizer.clone(),
+                    waveform_analyzer,
+                    waveform: self.waveform.clone(),
+                },
             );
             SessionCaptureMode::Dedicated {
                 child,
@@ -622,14 +624,14 @@ impl Daemon {
 
     fn center_hud(&mut self) -> Result<()> {
         self.update_hud_config(|hud| {
-            hud.position = HudPosition::BottomCenter;
+            hud.position = HudPosition::Center;
             hud.offset_x = 0;
         })
     }
 
     fn reset_hud(&mut self) -> Result<()> {
         self.update_hud_config(|hud| {
-            hud.position = HudPosition::BottomCenter;
+            hud.position = HudPosition::Center;
             hud.offset_x = 0;
             hud.offset_y = 0;
         })
@@ -1170,8 +1172,7 @@ fn run_capture_service(
     bail!("pre-roll capture stream ended unexpectedly")
 }
 
-fn spawn_reader_thread(
-    mut stdout: impl Read + Send + 'static,
+struct ReaderThreadContext {
     session_id: u64,
     config: Config,
     state: StateHandle,
@@ -1185,8 +1186,28 @@ fn spawn_reader_thread(
     asr_packetizer: Option<Arc<Mutex<AsrPacketizer>>>,
     waveform_analyzer: Arc<Mutex<WaveformAnalyzer>>,
     waveform: WaveformPublisher,
+}
+
+fn spawn_reader_thread(
+    mut stdout: impl Read + Send + 'static,
+    context: ReaderThreadContext,
 ) -> thread::JoinHandle<Result<()>> {
     thread::spawn(move || {
+        let ReaderThreadContext {
+            session_id,
+            config,
+            state,
+            stop_flag,
+            cancel_flag,
+            audio_buffer,
+            capture_ready,
+            asr_ready,
+            voice_active,
+            asr_control_tx,
+            asr_packetizer,
+            waveform_analyzer,
+            waveform,
+        } = context;
         let started = Instant::now();
         let mut bytes = [0u8; 512];
         let mut asr_control_tx = asr_control_tx;
@@ -1257,7 +1278,7 @@ fn spawn_reader_thread(
     })
 }
 
-fn spawn_realtime_event_thread(
+struct RealtimeEventThreadContext {
     session_id: u64,
     config: Config,
     state: StateHandle,
@@ -1267,8 +1288,23 @@ fn spawn_realtime_event_thread(
     voice_active: Arc<AtomicBool>,
     speech_detected: Arc<AtomicBool>,
     event_rx: mpsc::Receiver<backend::AsrEvent>,
+}
+
+fn spawn_realtime_event_thread(
+    context: RealtimeEventThreadContext,
 ) -> thread::JoinHandle<Result<Option<String>>> {
     thread::spawn(move || {
+        let RealtimeEventThreadContext {
+            session_id,
+            config,
+            state,
+            partial_transcript,
+            capture_ready,
+            asr_ready,
+            voice_active,
+            speech_detected,
+            event_rx,
+        } = context;
         let mut final_transcript = None;
 
         while let Ok(event) = event_rx.recv() {

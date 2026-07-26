@@ -14,7 +14,7 @@ pub fn config_path() -> Result<PathBuf> {
 pub fn runtime_dir() -> Result<PathBuf> {
     let base = env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
-        .or_else(|| dirs::runtime_dir())
+        .or_else(dirs::runtime_dir)
         .ok_or_else(|| anyhow!("XDG runtime directory not found"))?;
     Ok(base.join("voice-input"))
 }

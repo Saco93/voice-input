@@ -42,17 +42,17 @@ ShellRoot {
     }
 
     function providerLabel(value) {
-        return value === "alibaba-qwen-realtime" ? "Alibaba Qwen realtime" : "Local CLI";
+        return theme.tr(value === "alibaba-qwen-realtime" ? "Alibaba Qwen realtime" : "Local CLI");
     }
 
     function outputLabel(value) {
         if (value === "clipboard")
-            return "Clipboard only";
+            return theme.tr("Clipboard only");
 
         if (value === "paste")
-            return "Clipboard paste";
+            return theme.tr("Clipboard paste");
 
-        return "Direct typing";
+        return theme.tr("Direct typing");
     }
 
     function statusService() {
@@ -86,51 +86,51 @@ ShellRoot {
 
     function serviceSummary() {
         if (controller.runtimeLoading && controller.runtimeStatusState === "unknown")
-            return "Checking local service status…";
+            return theme.tr("Checking local service status…");
 
         if (controller.runtimeStatusState !== "available")
-            return controller.runtimeStatusMessage || "Runtime status is unavailable.";
+            return theme.tr(controller.runtimeStatusMessage || "Runtime status is unavailable.");
 
         const running = serviceRunning();
         if (running === true)
-            return "Running";
+            return theme.tr("Running");
 
         if (running === false)
-            return "Not running";
+            return theme.tr("Not running");
 
         const service = statusService();
         const state = service.active_state !== undefined ? service.active_state : service.state;
         if (state !== undefined && String(state).length > 0)
-            return "Service state: " + String(state);
+            return theme.tr("Service state: " + String(state));
 
-        return "Service state was not reported.";
+        return theme.tr("Service state was not reported.");
     }
 
     function runtimeSummary() {
         if (controller.runtimeStatusState !== "available")
-            return "No runtime details reported.";
+            return theme.tr("No runtime details reported.");
 
         const runtime = statusRuntime();
         if (runtime.available === false)
-            return "Runtime details are unavailable.";
+            return theme.tr("Runtime details are unavailable.");
 
         const parts = [];
         if (runtime.phase !== undefined && String(runtime.phase).length > 0)
-            parts.push("Phase: " + String(runtime.phase));
+            parts.push(theme.tr("Phase: " + String(runtime.phase)));
 
         if (runtime.language !== undefined && String(runtime.language).length > 0)
-            parts.push("Language: " + String(runtime.language));
+            parts.push(theme.tr("Language: " + String(runtime.language)));
 
         const updated = Number(runtime.updated_at_ms);
         if (Number.isFinite(updated) && updated > 0)
-            parts.push("Updated: " + new Date(updated).toLocaleString());
+            parts.push(theme.tr("Updated: " + new Date(updated).toLocaleString(Qt.locale(theme.i18n.locale))));
 
-        return parts.length > 0 ? parts.join(" · ") : "No runtime details reported.";
+        return parts.length > 0 ? parts.join(" · ") : theme.tr("No runtime details reported.");
     }
 
     function serviceUnit() {
         const service = statusService();
-        return service.unit !== undefined && String(service.unit).length > 0 ? String(service.unit) : "Voice Input service";
+        return service.unit !== undefined && String(service.unit).length > 0 ? String(service.unit) : theme.tr("Voice Input service");
     }
 
     Theme {
@@ -281,7 +281,7 @@ ShellRoot {
                             }
 
                             Label {
-                                text: "Voice Input"
+                                text: theme.tr("Voice Input")
                                 color: theme.foreground
                                 font.pixelSize: 14
                                 font.weight: Font.DemiBold
@@ -300,7 +300,7 @@ ShellRoot {
                             model: shell.destinations
                             currentIndex: 0
                             activeFocusOnTab: true
-                            Accessible.name: "Settings destinations"
+                            Accessible.name: theme.tr("Settings destinations")
                             keyNavigationWraps: true
 
                             delegate: ItemDelegate {
@@ -313,7 +313,7 @@ ShellRoot {
                                 highlighted: destinationList.currentIndex === index
                                 leftPadding: 12
                                 rightPadding: 9
-                                Accessible.name: modelData.title
+                                Accessible.name: theme.tr(modelData.title)
                                 onClicked: shell.navigate(modelData.title)
 
                                 Rectangle {
@@ -340,7 +340,7 @@ ShellRoot {
                                     }
 
                                     Text {
-                                        text: modelData.title
+                                        text: theme.tr(modelData.title)
                                         color: theme.foreground
                                         font.pixelSize: 12
                                         font.weight: destinationList.currentIndex === index ? Font.DemiBold : Font.Medium
@@ -402,7 +402,7 @@ ShellRoot {
                                     }
 
                                     Label {
-                                        text: "Local service"
+                                        text: theme.tr("Local service")
                                         color: theme.foreground
                                         font.pixelSize: 11
                                         font.weight: Font.DemiBold
@@ -445,7 +445,7 @@ ShellRoot {
                             spacing: 8
 
                             Label {
-                                text: shell.destinations[Math.max(0, destinationList.currentIndex)].title
+                                text: theme.tr(shell.destinations[Math.max(0, destinationList.currentIndex)].title)
                                 color: theme.foreground
                                 font.pixelSize: 16
                                 font.weight: Font.DemiBold
@@ -454,16 +454,90 @@ ShellRoot {
 
                             Label {
                                 visible: controller.dirty
-                                text: "Unsaved"
+                                text: theme.tr("Unsaved")
                                 color: theme.warning
                                 font.pixelSize: 10
+                            }
+
+                            Rectangle {
+                                Layout.preferredWidth: 88
+                                Layout.preferredHeight: 30
+                                radius: 7
+                                color: theme.elevated
+                                border.color: theme.border
+
+                                RowLayout {
+                                    anchors.fill: parent
+                                    anchors.margins: 2
+                                    spacing: 2
+
+                                    Button {
+                                        Layout.fillWidth: true
+                                        Layout.fillHeight: true
+                                        text: "EN"
+                                        flat: true
+                                        Accessible.name: theme.tr("Switch settings language to English")
+                                        onClicked: theme.i18n.setLocale("en")
+
+                                        contentItem: Text {
+                                            text: parent.text
+                                            color: theme.i18n.locale === "en" ? theme.background : theme.subtle
+                                            font.pixelSize: 10
+                                            font.weight: Font.DemiBold
+                                            horizontalAlignment: Text.AlignHCenter
+                                            verticalAlignment: Text.AlignVCenter
+                                        }
+
+                                        background: Rectangle {
+                                            radius: 5
+                                            color: theme.i18n.locale === "en" ? theme.accent : (parent.hovered ? Qt.alpha(theme.accent, 0.12) : "transparent")
+                                            border.width: parent.activeFocus ? 1 : 0
+                                            border.color: theme.accent
+                                        }
+
+                                    }
+
+                                    Label {
+                                        text: "/"
+                                        color: theme.subtle
+                                        font.pixelSize: 9
+                                    }
+
+                                    Button {
+                                        Layout.fillWidth: true
+                                        Layout.fillHeight: true
+                                        text: "中文"
+                                        flat: true
+                                        Accessible.name: theme.tr("Switch settings language to Simplified Chinese")
+                                        onClicked: theme.i18n.setLocale("zh-CN")
+
+                                        contentItem: Text {
+                                            text: parent.text
+                                            color: theme.i18n.locale === "zh-CN" ? theme.background : theme.subtle
+                                            font.pixelSize: 10
+                                            font.weight: Font.DemiBold
+                                            horizontalAlignment: Text.AlignHCenter
+                                            verticalAlignment: Text.AlignVCenter
+                                        }
+
+                                        background: Rectangle {
+                                            radius: 5
+                                            color: theme.i18n.locale === "zh-CN" ? theme.accent : (parent.hovered ? Qt.alpha(theme.accent, 0.12) : "transparent")
+                                            border.width: parent.activeFocus ? 1 : 0
+                                            border.color: theme.accent
+                                        }
+
+                                    }
+
+                                }
+
                             }
 
                             ToolButton {
                                 id: overflowButton
 
                                 text: "⋮"
-                                Accessible.name: "More actions"
+                                Accessible.name: theme.tr("More actions")
                                 onClicked: overflowMenu.open()
 
                                 Menu {
@@ -472,7 +546,7 @@ ShellRoot {
                                     y: overflowButton.height
 
                                     MenuItem {
-                                        text: controller.loading ? "Reloading…" : "Reload settings"
+                                        text: theme.tr(controller.loading ? "Reloading…" : "Reload settings")
                                         enabled: !controller.busy
                                         onTriggered: controller.reload()
                                     }
@@ -571,7 +645,7 @@ ShellRoot {
                                         }
 
                                         Label {
-                                            text: controller.runtimeLoading ? "Refreshing…" : "Local report"
+                                            text: theme.tr(controller.runtimeLoading ? "Refreshing…" : "Local report")
                                             color: theme.subtle
                                             font.pixelSize: 9
                                         }
@@ -597,7 +671,7 @@ ShellRoot {
                                             spacing: 2
 
                                             Label {
-                                                text: "Speech"
+                                                text: theme.tr("Speech")
                                                 color: theme.foreground
                                                 font.pixelSize: 11
                                                 font.weight: Font.DemiBold
@@ -624,14 +698,14 @@ ShellRoot {
                                             spacing: 2
 
                                             Label {
-                                                text: "Refinement"
+                                                text: theme.tr("Refinement")
                                                 color: theme.foreground
                                                 font.pixelSize: 11
                                                 font.weight: Font.DemiBold
                                             }
 
                                             Label {
-                                                text: controller.value("llm.enabled", false) ? "Enabled" : "Skipped"
+                                                text: theme.tr(controller.value("llm.enabled", false) ? "Enabled" : "Skipped")
                                                 color: theme.subtle
                                                 font.pixelSize: 9
                                                 elide: Text.ElideRight
@@ -651,7 +725,7 @@ ShellRoot {
                                             spacing: 2
 
                                             Label {
-                                                text: "Output"
+                                                text: theme.tr("Output")
                                                 color: theme.foreground
                                                 font.pixelSize: 11
                                                 font.weight: Font.DemiBold
@@ -714,7 +788,7 @@ ShellRoot {
 
                                 Label {
                                     visible: controller.dirty
-                                    text: "These summaries include unsaved changes. Save to apply them to Voice Input."
+                                    text: theme.tr("These summaries include unsaved changes. Save to apply them to Voice Input.")
                                     color: theme.warning
                                     font.pixelSize: 10
                                     wrapMode: Text.WordWrap
@@ -1622,7 +1696,7 @@ ShellRoot {
 
                                 Label {
                                     visible: controller.globalError.length > 0
-                                    text: controller.globalError
+                                    text: theme.tr(controller.globalError)
                                     color: theme.error
                                     font.pixelSize: 11
                                     font.weight: Font.Medium
@@ -1633,7 +1707,7 @@ ShellRoot {
 
                                 Label {
                                     visible: controller.globalError.length === 0 && controller.statusMessage.length > 0
-                                    text: controller.statusMessage
+                                    text: theme.tr(controller.statusMessage)
                                     color: theme.success
                                     font.pixelSize: 11
                                     wrapMode: Text.WordWrap
@@ -1642,7 +1716,7 @@ ShellRoot {
 
                                 Label {
                                     visible: controller.globalError.length === 0 && controller.statusMessage.length === 0
-                                    text: controller.saving ? "Saving configuration and restarting service…" : (controller.loading ? "Reloading configuration…" : (controller.testing ? "Testing LLM settings…" : (controller.dirty ? "Changes have not been saved." : "Configuration is up to date.")))
+                                    text: theme.tr(controller.saving ? "Saving configuration and restarting service…" : (controller.loading ? "Reloading configuration…" : (controller.testing ? "Testing LLM settings…" : (controller.dirty ? "Changes have not been saved." : "Configuration is up to date."))))
                                     color: controller.dirty ? theme.warning : theme.subtle
                                     font.pixelSize: 11
                                 }
@@ -1683,7 +1757,7 @@ ShellRoot {
             x: Math.round((parent.width - width) / 2)
             y: Math.round((parent.height - height) / 2)
             modal: true
-            title: "Discard unsaved changes?"
+            title: theme.tr("Discard unsaved changes?")
             standardButtons: Dialog.NoButton
 
             background: Rectangle {
@@ -1696,7 +1770,7 @@ ShellRoot {
                 spacing: 18
 
                 Label {
-                    text: "Your configuration or credential replacements have not been saved."
+                    text: theme.tr("Your configuration or credential replacements have not been saved.")
                     color: theme.foreground
                     wrapMode: Text.WordWrap
                     Layout.preferredWidth: 380

@@ -21,7 +21,7 @@ RowLayout {
         spacing: 2
 
         Label {
-            text: root.label
+            text: root.theme.tr(root.label)
             color: root.theme.foreground
             font.pixelSize: 12
             font.weight: Font.Medium
@@ -31,7 +31,7 @@ RowLayout {
 
         Label {
             visible: root.help.length > 0
-            text: root.help
+            text: root.theme.tr(root.help)
             color: root.theme.subtle
             font.pixelSize: 10
             wrapMode: Text.WordWrap
@@ -53,8 +53,8 @@ RowLayout {
         bottomPadding: 0
         checked: root.checked
         enabled: root.enabled
-        Accessible.name: root.label
-        Accessible.description: root.help
+        Accessible.name: root.theme.tr(root.label)
+        Accessible.description: root.theme.tr(root.help)
         onToggled: root.toggled(checked)
 
         indicator: Rectangle {

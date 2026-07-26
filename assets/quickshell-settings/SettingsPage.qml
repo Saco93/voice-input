@@ -23,7 +23,7 @@ Item {
 
         Label {
             visible: root.description.length > 0
-            text: root.description
+            text: root.theme.tr(root.description)
             color: root.theme.subtle
             font.pixelSize: 11
             wrapMode: Text.WordWrap

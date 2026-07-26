@@ -44,9 +44,9 @@ pub enum HudMoveDirection {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HudPositionCommand {
-    BottomCenter,
-    BottomLeft,
-    BottomRight,
+    Center,
+    Left,
+    Right,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -148,9 +148,9 @@ fn parse_hud(args: Vec<String>) -> Result<Command> {
         }
         "position" => {
             let position = match args.get(1).map(String::as_str) {
-                Some("bottom-center") | Some("center") => HudPositionCommand::BottomCenter,
-                Some("bottom-left") | Some("left") => HudPositionCommand::BottomLeft,
-                Some("bottom-right") | Some("right") => HudPositionCommand::BottomRight,
+                Some("bottom-center") | Some("center") => HudPositionCommand::Center,
+                Some("bottom-left") | Some("left") => HudPositionCommand::Left,
+                Some("bottom-right") | Some("right") => HudPositionCommand::Right,
                 Some(other) => bail!("unknown hud position `{other}`"),
                 None => bail!("hud position requires bottom-center|bottom-left|bottom-right"),
             };

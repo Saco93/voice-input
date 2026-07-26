@@ -70,14 +70,13 @@ fn record_control_command(action: crate::args::RecordAction) -> String {
     if matches!(
         action,
         crate::args::RecordAction::Start | crate::args::RecordAction::Toggle
-    ) {
-        if let Ok(target_hint) = output::detect_output_target_hint() {
-            let label = match target_hint {
-                output::OutputTargetHint::Wayland => "wayland",
-                output::OutputTargetHint::XWayland => "xwayland",
-            };
-            return format!("{base} {label}");
-        }
+    ) && let Ok(target_hint) = output::detect_output_target_hint()
+    {
+        let label = match target_hint {
+            output::OutputTargetHint::Wayland => "wayland",
+            output::OutputTargetHint::XWayland => "xwayland",
+        };
+        return format!("{base} {label}");
     }
 
     base.into()
@@ -192,9 +191,9 @@ fn hud_control_command(command: HudCommand) -> String {
         HudCommand::Position(position) => format!(
             "hud position {}",
             match position {
-                HudPositionCommand::BottomCenter => "bottom-center",
-                HudPositionCommand::BottomLeft => "bottom-left",
-                HudPositionCommand::BottomRight => "bottom-right",
+                HudPositionCommand::Center => "bottom-center",
+                HudPositionCommand::Left => "bottom-left",
+                HudPositionCommand::Right => "bottom-right",
             }
         ),
         HudCommand::Center => "hud center".into(),

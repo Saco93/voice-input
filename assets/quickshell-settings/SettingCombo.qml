@@ -20,7 +20,7 @@ ColumnLayout {
     spacing: 4
 
     Label {
-        text: root.label
+        text: root.theme.tr(root.label)
         color: root.theme.foreground
         font.pixelSize: 12
         font.weight: Font.Medium
@@ -30,7 +30,7 @@ ColumnLayout {
 
     Label {
         visible: root.help.length > 0
-        text: root.help
+        text: root.theme.tr(root.help)
         color: root.theme.subtle
         font.pixelSize: 10
         wrapMode: Text.WordWrap
@@ -44,8 +44,8 @@ ColumnLayout {
         model: root.labels
         currentIndex: Math.max(0, root.values.indexOf(root.value))
         enabled: root.enabled
-        Accessible.name: root.label
-        Accessible.description: root.help
+        Accessible.name: root.theme.tr(root.label)
+        Accessible.description: root.theme.tr(root.help)
         onActivated: (index) => {
             return root.selected(root.values[index]);
         }
@@ -53,7 +53,7 @@ ColumnLayout {
         contentItem: Text {
             leftPadding: 11
             rightPadding: combo.indicator.width + 11
-            text: combo.displayText
+            text: root.theme.tr(combo.currentText)
             color: root.theme.foreground
             verticalAlignment: Text.AlignVCenter
             elide: Text.ElideRight
@@ -78,7 +78,7 @@ ColumnLayout {
             required property int index
 
             width: combo.width
-            text: modelData
+            text: root.theme.tr(modelData)
             highlighted: combo.highlightedIndex === index
 
             contentItem: Text {
@@ -98,7 +98,7 @@ ColumnLayout {
 
     Label {
         visible: root.error.length > 0
-        text: root.error
+        text: root.theme.tr(root.error)
         color: root.theme.error
         font.pixelSize: 11
         wrapMode: Text.WordWrap

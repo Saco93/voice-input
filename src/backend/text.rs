@@ -67,10 +67,10 @@ fn transcript_from_line(line: &str) -> Option<String> {
         return Some(extract_quoted(suffix).unwrap_or_else(|| suffix.to_string()));
     }
 
-    if line.contains("Transcription completed") {
-        if let Some(transcript) = extract_quoted(line) {
-            return Some(transcript);
-        }
+    if line.contains("Transcription completed")
+        && let Some(transcript) = extract_quoted(line)
+    {
+        return Some(transcript);
     }
 
     None

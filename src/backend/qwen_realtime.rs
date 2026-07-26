@@ -23,6 +23,10 @@ use crate::{
     config::{AlibabaTurnMode, Config},
 };
 
+type QwenSocket = WebSocket<MaybeTlsStream<TcpStream>>;
+type QwenHandshakeResponse = tungstenite::http::Response<Option<Vec<u8>>>;
+type QwenConnection = (QwenSocket, QwenHandshakeResponse);
+
 pub struct QwenRealtimeBackend;
 
 impl QwenRealtimeBackend {
@@ -303,10 +307,10 @@ fn run_session(
             );
         }
 
-        if let Some(deadline) = finalize_deadline {
-            if Instant::now() > deadline {
-                bail!("Alibaba realtime ASR finalize timed out");
-            }
+        if let Some(deadline) = finalize_deadline
+            && Instant::now() > deadline
+        {
+            bail!("Alibaba realtime ASR finalize timed out");
         }
 
         if !finish_requested && !ready {
@@ -315,7 +319,7 @@ fn run_session(
     }
 }
 
-fn send_json(socket: &mut WebSocket<MaybeTlsStream<TcpStream>>, payload: Value) -> Result<()> {
+fn send_json(socket: &mut QwenSocket, payload: Value) -> Result<()> {
     socket
         .send(Message::Text(payload.to_string()))
         .context("failed to send websocket event")
@@ -386,10 +390,7 @@ fn configure_socket(stream: &mut MaybeTlsStream<TcpStream>) -> Result<()> {
 fn connect_with_timeout(
     request: tungstenite::http::Request<()>,
     timeout: Duration,
-) -> Result<(
-    WebSocket<MaybeTlsStream<TcpStream>>,
-    tungstenite::http::Response<Option<Vec<u8>>>,
-)> {
+) -> Result<QwenConnection> {
     let uri = request.uri();
     let host = uri
         .host()

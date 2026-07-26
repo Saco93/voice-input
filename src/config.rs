@@ -62,16 +62,18 @@ pub struct AsrConfig {
     pub alibaba: AlibabaRealtimeConfig,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum AsrProvider {
+    #[default]
     LocalCli,
     AlibabaQwenRealtime,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum AlibabaTurnMode {
+    #[default]
     ServerVad,
     Manual,
 }
@@ -154,12 +156,15 @@ pub struct HudConfig {
     pub nudge_step: i32,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "kebab-case")]
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub enum HudPosition {
-    BottomCenter,
-    BottomLeft,
-    BottomRight,
+    #[default]
+    #[serde(rename = "bottom-center")]
+    Center,
+    #[serde(rename = "bottom-left")]
+    Left,
+    #[serde(rename = "bottom-right")]
+    Right,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -310,7 +315,7 @@ impl Default for Config {
                 enabled: true,
                 margin_bottom: 72,
                 height: 56,
-                position: HudPosition::BottomCenter,
+                position: HudPosition::Center,
                 offset_x: 0,
                 offset_y: 0,
                 nudge_step: 24,
@@ -329,11 +334,6 @@ impl Default for AlibabaRealtimeConfig {
         Config::default().asr.alibaba
     }
 }
-impl Default for AsrProvider {
-    fn default() -> Self {
-        Self::LocalCli
-    }
-}
 impl Default for LlmConfig {
     fn default() -> Self {
         Config::default().llm
@@ -342,16 +342,6 @@ impl Default for LlmConfig {
 impl Default for HudConfig {
     fn default() -> Self {
         Config::default().hud
-    }
-}
-impl Default for HudPosition {
-    fn default() -> Self {
-        Self::BottomCenter
-    }
-}
-impl Default for AlibabaTurnMode {
-    fn default() -> Self {
-        Self::ServerVad
     }
 }
 
@@ -973,7 +963,7 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
-    use super::{Config, ConfigStore, RevisionConflict};
+    use super::{Config, ConfigStore, HudPosition, RevisionConflict};
 
     #[test]
     fn validation_reports_field_map() {
@@ -1045,6 +1035,24 @@ mod tests {
         let path = temp.path().join("config.toml");
         fs::write(&path, "[broken").unwrap();
         assert!(ConfigStore::new(path).load().is_err());
+    }
+
+    #[test]
+    fn hud_position_serialization_preserves_config_values() {
+        for (position, value) in [
+            (HudPosition::Center, "bottom-center"),
+            (HudPosition::Left, "bottom-left"),
+            (HudPosition::Right, "bottom-right"),
+        ] {
+            let mut config = Config::default();
+            config.hud.position = position;
+            let serialized = toml::to_string(&config).unwrap();
+            assert!(serialized.contains(format!("position = \"{value}\"").as_str()));
+            assert_eq!(
+                toml::from_str::<Config>(&serialized).unwrap().hud.position,
+                position
+            );
+        }
     }
 
     #[test]

@@ -12,10 +12,10 @@ Button {
     leftPadding: 15
     rightPadding: 15
     font.weight: primary ? Font.DemiBold : Font.Medium
-    Accessible.name: text
+    Accessible.name: root.theme.tr(text)
 
     contentItem: Text {
-        text: root.text
+        text: root.theme.tr(root.text)
         color: root.primary ? root.theme.background : root.theme.foreground
         horizontalAlignment: Text.AlignHCenter
         verticalAlignment: Text.AlignVCenter

@@ -1,0 +1,425 @@
+import QtQuick
+import Quickshell
+import Quickshell.Io
+
+QtObject {
+    // A UI preference failure must never affect the settings window.
+    // Keep the system-language fallback for malformed preferences.
+
+    id: root
+
+    readonly property string preferencePath: {
+        const xdgConfig = Quickshell.env("XDG_CONFIG_HOME");
+        const configRoot = xdgConfig && xdgConfig.length > 0 ? xdgConfig : Quickshell.env("HOME") + "/.config";
+        return configRoot + "/voice-input/settings-ui.json";
+    }
+    readonly property string systemLocale: {
+        const candidates = [Quickshell.env("LC_ALL"), Quickshell.env("LC_MESSAGES"), Quickshell.env("LANG"), Qt.locale().name];
+        for (let i = 0; i < candidates.length; ++i) {
+            const candidate = String(candidates[i] || "").toLowerCase();
+            if (candidate.length > 0)
+                return candidate.indexOf("zh") === 0 ? "zh-CN" : "en";
+
+        }
+        return "en";
+    }
+    property string locale: systemLocale
+    property bool explicitChoice: false
+    readonly property var zh: ({
+        "Voice Input": "语音输入",
+        "Overview": "概览",
+        "Speech": "语音识别",
+        "Refinement": "文本优化",
+        "Output": "输出",
+        "Appearance": "外观",
+        "Advanced": "高级设置",
+        "Settings destinations": "设置页面",
+        "Local service": "本地服务",
+        "Checking local service status…": "正在检查本地服务状态…",
+        "Runtime status is unavailable.": "运行状态不可用。",
+        "Runtime status is temporarily unavailable.": "运行状态暂时不可用。",
+        "Running": "正在运行",
+        "Not running": "未运行",
+        "Service state was not reported.": "未报告服务状态。",
+        "No runtime details reported.": "未报告运行详情。",
+        "Runtime details are unavailable.": "运行详情不可用。",
+        "Voice Input service": "语音输入服务",
+        "Unsaved": "未保存",
+        "More actions": "更多操作",
+        "Reloading…": "正在重新加载…",
+        "Reload settings": "重新加载设置",
+        "Close": "关闭",
+        "English": "英语",
+        "Simplified Chinese": "简体中文",
+        "Traditional Chinese": "繁体中文",
+        "Japanese": "日语",
+        "Korean": "韩语",
+        "Switch settings language to English": "将设置语言切换为英语",
+        "Switch settings language to Simplified Chinese": "将设置语言切换为简体中文",
+        "See the local service report and review the settings you are preparing to use.": "查看本地服务报告，并检查准备使用的设置。",
+        "Refreshing…": "正在刷新…",
+        "Local report": "本地报告",
+        "Enabled": "已启用",
+        "Disabled": "已禁用",
+        "Skipped": "已跳过",
+        "Pending": "待应用",
+        "Alibaba Qwen realtime": "Alibaba Qwen 实时识别",
+        "Local CLI": "本地 CLI",
+        "Clipboard only": "仅剪贴板",
+        "Clipboard paste": "通过剪贴板粘贴",
+        "Direct typing": "直接键入",
+        "Type": "键入",
+        "Model: provider default": "模型：使用提供商默认值",
+        "Coordinates with Fcitx5": "与 Fcitx5 协同",
+        "Leaves Fcitx5 unchanged": "不更改 Fcitx5",
+        "HUD visible": "HUD 可见",
+        "HUD hidden": "HUD 隐藏",
+        "These summaries include unsaved changes. Save to apply them to Voice Input.": "这些摘要包含尚未保存的更改。保存后才会应用到语音输入。",
+        "Configure audio capture and speech recognition.": "配置音频采集和语音识别。",
+        "Audio capture": "音频采集",
+        "Recording source and capture window.": "设置录音来源和采集时长。",
+        "Device": "设备",
+        "Maximum duration": "最长时长",
+        "Seconds.": "秒。",
+        "Enable pre-roll": "启用预录",
+        "Keep a short capture buffer so the first syllable is preserved.": "保留一段短暂的采集缓冲，以免遗漏第一个音节。",
+        "Recognition": "语音识别",
+        "Recognition provider, language, and fallback.": "设置识别提供商、语言和备用方案。",
+        "Provider": "提供商",
+        "Language": "语言",
+        "Fallback to local": "失败时使用本地识别",
+        "Use local recognition when remote recognition fails.": "远程识别失败时使用本地识别。",
+        "Local recognition": "本地识别",
+        "Local CLI backend used as the provider or fallback.": "作为主要提供商或备用方案的本地 CLI 后端。",
+        "Backend command": "后端命令",
+        "Executable used by local recognition.": "本地识别使用的可执行文件。",
+        "Local engine": "本地引擎",
+        "Local model": "本地模型",
+        "Backend default": "使用后端默认值",
+        "Alibaba realtime": "Alibaba 实时识别",
+        "Credential and realtime recognition behavior.": "设置凭据和实时识别行为。",
+        "Replace Alibaba API key": "替换 Alibaba API key",
+        "Enter a new credential": "输入新凭据",
+        "Realtime model": "实时模型",
+        "Turn mode": "分段模式",
+        "Server VAD": "服务端 VAD",
+        "Manual commit": "手动提交",
+        "Technical settings for this page.": "此页面的技术设置。",
+        "Capture cadence, timeouts, and Alibaba tuning.": "设置采集频率、超时和 Alibaba 调优参数。",
+        "Show advanced settings": "显示高级设置",
+        "Hide advanced settings": "隐藏高级设置",
+        "Show": "显示",
+        "Hide": "隐藏",
+        "Audio tuning": "音频调优",
+        "Sample rate": "采样率",
+        "Samples per second (Hz).": "每秒采样数（Hz）。",
+        "Partial interval": "中间结果间隔",
+        "Milliseconds between partial updates.": "中间结果更新之间的毫秒数。",
+        "Pre-roll window": "预录窗口",
+        "Milliseconds retained before activation.": "激活前保留的毫秒数。",
+        "Recognition timeouts": "识别超时",
+        "Connect timeout": "连接超时",
+        "Finalize timeout": "最终结果超时",
+        "Milliseconds.": "毫秒。",
+        "Alibaba tuning": "Alibaba 调优",
+        "Endpoint": "端点",
+        "VAD threshold": "VAD 阈值",
+        "Silence duration": "静音时长",
+        "Alibaba final pass": "Alibaba 最终处理",
+        "Enable final pass": "启用最终处理",
+        "Base URL": "基础 URL",
+        "Model": "模型",
+        "Timeout": "超时",
+        "Enable ITN": "启用 ITN",
+        "Apply inverse text normalization.": "应用逆文本规范化。",
+        "Optionally refine recognized transcripts with an LLM.": "可以选择使用 LLM 优化识别后的文本。",
+        "Enable refinement": "启用文本优化",
+        "Conservatively refine recognized transcripts.": "以保守方式优化识别后的文本。",
+        "Provider default": "使用提供商默认值",
+        "Credential": "凭据",
+        "The replacement is sent only to the backend and is never copied into the draft.": "替换值只发送到后端，不会复制到设置草稿中。",
+        "Replace OpenRouter API key": "替换 OpenRouter API key",
+        "Context": "上下文",
+        "Use agent context": "使用 Agent 上下文",
+        "Send a redacted excerpt from the focused Pi or Codex session.": "发送当前 Pi 或 Codex 会话中经过脱敏的片段。",
+        "Test refinement": "测试文本优化",
+        "Test the current LLM draft and credential without saving it.": "无需保存即可测试当前 LLM 设置草稿和凭据。",
+        "Testing…": "正在测试…",
+        "Test LLM": "测试 LLM",
+        "Endpoint, timeout, provider ordering, and context limits.": "设置端点、超时、提供商顺序和上下文限制。",
+        "Provider settings": "提供商设置",
+        "API base URL": "API 基础 URL",
+        "Provider sort": "提供商顺序",
+        "Optional OpenRouter provider ordering expression.": "可选的 OpenRouter 提供商顺序表达式。",
+        "Agent context": "Agent 上下文",
+        "Context limit": "上下文限制",
+        "Maximum characters sent from a redacted agent-session excerpt.": "经过脱敏的 Agent 会话片段最多发送的字符数。",
+        "Control text delivery and input-method coordination.": "控制文本输出和输入法协同。",
+        "Delivery": "输出方式",
+        "Mode": "模式",
+        "Fallback to clipboard": "失败时复制到剪贴板",
+        "Copy text when direct delivery fails.": "直接输出失败时复制文本。",
+        "Input method": "输入法",
+        "Manage Fcitx5": "管理 Fcitx5",
+        "Coordinate output with the active Fcitx5 input method.": "输出时与当前 Fcitx5 输入法协同。",
+        "Force ASCII before output": "输出前强制切换到 ASCII",
+        "Switch to ASCII mode before inserting recognized text.": "插入识别文本前切换到 ASCII 模式。",
+        "Delivery timing, paste keys, and XWayland behavior.": "设置输出时序、粘贴按键和 XWayland 行为。",
+        "Timing and keys": "时序和按键",
+        "Type delay": "键入延迟",
+        "Milliseconds between generated key events.": "生成的按键事件之间的毫秒数。",
+        "Pre-type delay": "键入前延迟",
+        "Milliseconds before delivery starts.": "开始输出前等待的毫秒数。",
+        "Paste keys": "粘贴按键",
+        "Prefer paste for XWayland": "XWayland 优先使用粘贴",
+        "Avoid garbled direct typing in XWayland clients.": "避免在 XWayland 客户端中直接键入时出现乱码。",
+        "XWayland paste keys": "XWayland 粘贴按键",
+        "Control HUD visibility and placement.": "控制 HUD 的可见性和位置。",
+        "Enable HUD": "启用 HUD",
+        "Position": "位置",
+        "Bottom center": "底部居中",
+        "Bottom left": "左下角",
+        "Bottom right": "右下角",
+        "HUD geometry, offsets, and keyboard nudge distance.": "设置 HUD 尺寸、偏移和键盘微调距离。",
+        "Geometry": "尺寸和位置",
+        "Bottom margin": "底部边距",
+        "Pixels.": "像素。",
+        "Base height": "基础高度",
+        "Horizontal offset": "水平偏移",
+        "Signed pixels.": "带正负号的像素值。",
+        "Adjustment": "调整",
+        "Vertical offset": "垂直偏移",
+        "Nudge step": "微调步长",
+        "Signed pixel adjustment per nudge command.": "每次微调命令移动的带正负号像素值。",
+        "Configure the global trigger and state storage.": "配置全局触发方式和状态存储。",
+        "Hotkey": "快捷键",
+        "Accelerator": "快捷键组合",
+        "Hyprland-style modifier and key description.": "Hyprland 格式的修饰键和按键描述。",
+        "Hold": "按住",
+        "Toggle": "切换",
+        "State": "状态",
+        "State file": "状态文件",
+        "Use auto, disabled, or an absolute custom path.": "使用 auto、disabled 或自定义绝对路径。",
+        "Saving configuration and restarting service…": "正在保存配置并重启服务…",
+        "Reloading configuration…": "正在重新加载配置…",
+        "Testing LLM settings…": "正在测试 LLM 设置…",
+        "Changes have not been saved.": "更改尚未保存。",
+        "Configuration is up to date.": "配置已是最新状态。",
+        "Discard": "放弃更改",
+        "Saving…": "正在保存…",
+        "Save & restart": "保存并重启",
+        "Discard unsaved changes?": "要放弃未保存的更改吗？",
+        "Your configuration or credential replacements have not been saved.": "配置更改或凭据替换尚未保存。",
+        "Keep editing": "继续编辑",
+        "Discard and close": "放弃并关闭",
+        "Not configured": "未配置",
+        "Configured": "已配置",
+        "Blank keeps it unchanged.": "留空将保持不变。",
+        "Blank uses the stored credential.": "留空将使用已存储的凭据。",
+        "Settings backend is not running.": "设置后端未运行。",
+        "VOICE_INPUT_BIN is not set; cannot start the settings backend.": "未设置 VOICE_INPUT_BIN，无法启动设置后端。",
+        "Fix the highlighted numeric fields before continuing.": "请先修正突出显示的数值字段。",
+        "Invalid value.": "值无效。",
+        "The settings backend returned malformed JSON.": "设置后端返回了格式错误的 JSON。",
+        "The settings backend returned an invalid response.": "设置后端返回了无效响应。",
+        "The settings backend rejected the request.": "设置后端拒绝了请求。",
+        "Settings loaded.": "设置已加载。",
+        "Settings were saved with additional errors.": "设置已保存，但还出现了其他错误。",
+        "Saved and restarted Voice Input.": "已保存设置并重启语音输入。",
+        "LLM connection test succeeded.": "LLM 连接测试成功。",
+        "Set VOICE_INPUT_BIN to the Voice Input executable path.": "请将 VOICE_INPUT_BIN 设置为语音输入可执行文件的路径。",
+        "The settings backend reported an internal error.": "设置后端报告了内部错误。",
+        "request line exceeds 1 MiB": "请求行超过 1 MiB",
+        "request line must contain JSON": "请求行必须包含 JSON",
+        "invalid request envelope": "请求封装无效",
+        "only protocol version 1 is supported": "仅支持协议版本 1",
+        "invalid settings.save parameters": "settings.save 参数无效",
+        "invalid llm.test parameters": "llm.test 参数无效",
+        "unknown method": "未知方法",
+        "configuration could not be loaded": "无法加载配置",
+        "must not contain api_key fields": "不得包含 api_key 字段",
+        "configuration validation failed": "配置验证失败",
+        "config does not match the settings schema": "配置与设置 schema 不匹配",
+        "configuration changed since it was loaded": "配置在加载后已被其他程序更改",
+        "unsupported credential ID": "不支持的凭据 ID",
+        "replacement credential is required": "必须提供替换凭据",
+        "invalid credential value": "凭据值无效",
+        "invalid credential action": "凭据操作无效",
+        "unknown credential action": "未知凭据操作",
+        "credential status could not be read": "无法读取凭据状态",
+        "legacy credential could not be migrated; configuration was not saved": "无法迁移旧凭据；配置未保存",
+        "credential could not be migrated": "无法迁移凭据",
+        "credential could not be updated": "无法更新凭据",
+        "voice-input.service could not be restarted": "无法重启 voice-input.service",
+        "Configuration saved; service restarted": "配置已保存；服务已重启",
+        "Configuration saved": "配置已保存",
+        "Configuration saved, but one or more credentials could not be updated": "配置已保存，但一个或多个凭据无法更新",
+        "Configuration saved, but the service could not be restarted": "配置已保存，但服务无法重启",
+        "Configuration saved, but credential updates and the service restart had errors": "配置已保存，但更新凭据和重启服务时出现错误",
+        "entered credential value is required": "必须提供输入的凭据值",
+        "stored credential could not be read": "无法读取已存储的凭据",
+        "invalid credential source": "凭据来源无效",
+        "LLM connectivity test failed": "LLM 连接测试失败",
+        "params must be an empty object": "params 必须是空对象",
+        "configuration could not be saved": "无法保存配置",
+        "is required": "必填",
+        "must not contain control characters": "不得包含控制字符",
+        "must be a valid URL": "必须是有效的 URL",
+        "must not contain embedded credentials": "不得包含嵌入式凭据",
+        "must include a host": "必须包含主机名",
+        "must not exceed maximum recording duration": "不得超过最长录音时长",
+        "must be finite and between 0 and 1": "必须是 0 到 1 之间的有限数值",
+        "active": "活动",
+        "activating": "正在启动",
+        "deactivating": "正在停止",
+        "inactive": "未活动",
+        "failed": "失败",
+        "stopped": "已停止",
+        "unknown": "未知",
+        "idle": "空闲",
+        "arming": "正在准备",
+        "recording": "正在录音",
+        "transcribing": "正在转写",
+        "refining": "正在优化",
+        "outputting": "正在输出",
+        "error": "错误",
+        "english": "英语",
+        "simplified-chinese": "简体中文",
+        "traditional-chinese": "繁体中文",
+        "japanese": "日语",
+        "korean": "韩语",
+        "bottom-center": "底部居中",
+        "bottom-left": "左下角",
+        "bottom-right": "右下角"
+    })
+    property FileView preferenceFile
+
+    function format(text, values) {
+        let result = String(text);
+        for (let i = 0; i < values.length; ++i) result = result.replace(new RegExp("\\{" + i + "\\}", "g"), String(values[i]))
+        return result;
+    }
+
+    function tr(text) {
+        if (text === undefined || text === null)
+            return "";
+
+        const source = String(text);
+        if (root.locale !== "zh-CN")
+            return source;
+
+        if (root.zh[source] !== undefined)
+            return root.zh[source];
+
+        let match = source.match(/^Open (.+)$/);
+        if (match)
+            return "打开" + root.tr(match[1]);
+
+        match = source.match(/^Configured via (.+)$/);
+        if (match)
+            return "已通过 " + match[1] + " 配置";
+
+        match = source.match(/^(.*)\. Blank keeps it unchanged\.$/);
+        if (match)
+            return root.tr(match[1]) + "。留空将保持不变。";
+
+        match = source.match(/^(.*)\. Blank uses the stored credential\.$/);
+        if (match)
+            return root.tr(match[1]) + "。留空将使用已存储的凭据。";
+
+        match = source.match(/^Settings backend exited \(code (.+)\)\.$/);
+        if (match)
+            return "设置后端已退出（代码 " + match[1] + "）。";
+
+        match = source.match(/^Unsupported settings protocol version: (.+)$/);
+        if (match)
+            return "不支持的设置协议版本：" + match[1];
+
+        match = source.match(/^Enter a whole number(?: of at least (.+))?\.$/);
+        if (match)
+            return match[1] === undefined ? "请输入整数。" : "请输入不小于 " + match[1] + " 的整数。";
+
+        match = source.match(/^Enter a finite number(?: of at least (.+))?\.$/);
+        if (match)
+            return match[1] === undefined ? "请输入有限数值。" : "请输入不小于 " + match[1] + " 的有限数值。";
+
+        match = source.match(/^must be at most (.+) bytes$/);
+        if (match)
+            return "最多只能包含 " + match[1] + " 字节";
+
+        match = source.match(/^must be between (.+) and (.+)$/);
+        if (match)
+            return "必须介于 " + match[1] + " 和 " + match[2] + " 之间";
+
+        match = source.match(/^must use (.+)$/);
+        if (match)
+            return "必须使用 " + match[1];
+
+        match = source.match(/^Service state: (.+)$/);
+        if (match)
+            return "服务状态：" + root.tr(match[1]);
+
+        match = source.match(/^Phase: (.+)$/);
+        if (match)
+            return "阶段：" + root.tr(match[1]);
+
+        match = source.match(/^Language: (.+)$/);
+        if (match)
+            return "语言：" + root.tr(match[1]);
+
+        match = source.match(/^Updated: (.+)$/);
+        if (match)
+            return "更新时间：" + match[1];
+
+        match = source.match(/^Model: (.+)$/);
+        if (match)
+            return "模型：" + match[1];
+
+        match = source.match(/^Position: (.+)$/);
+        if (match)
+            return "位置：" + root.tr(match[1].replace(/ /g, "-"));
+
+        return source;
+    }
+
+    function setLocale(nextLocale) {
+        if (nextLocale !== "en" && nextLocale !== "zh-CN")
+            return ;
+
+        explicitChoice = true;
+        locale = nextLocale;
+        preferenceAdapter.locale = nextLocale;
+        try {
+            preferenceFile.writeAdapter();
+        } catch (error) {
+        }
+    }
+
+    function loadPreference() {
+        if (explicitChoice)
+            return ;
+
+        try {
+            if (preferenceAdapter.locale === "en" || preferenceAdapter.locale === "zh-CN")
+                locale = preferenceAdapter.locale;
+
+        } catch (error) {
+        }
+    }
+
+    preferenceFile: FileView {
+        path: root.preferencePath
+        atomicWrites: true
+        blockAllReads: true
+        printErrors: false
+        onLoaded: root.loadPreference()
+
+        JsonAdapter {
+            id: preferenceAdapter
+
+            property string locale: ""
+        }
+
+    }
+
+}

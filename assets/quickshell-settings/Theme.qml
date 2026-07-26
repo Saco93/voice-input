@@ -3,11 +3,11 @@ import Quickshell
 import Quickshell.Io
 
 QtObject {
+    // Keep the last valid palette.
+
     id: root
 
-    readonly property string themePath: Quickshell.env("HOME")
-        + "/.config/omarchy/current/theme/colors.toml"
-
+    readonly property string themePath: Quickshell.env("HOME") + "/.config/omarchy/current/theme/colors.toml"
     // Safe, high-contrast defaults are retained if the Omarchy theme is missing
     // or is being replaced while this window is open.
     property var palette: ({
@@ -21,7 +21,6 @@ QtObject {
         "success": "#82aaa1",
         "warning": "#facc15"
     })
-
     readonly property color accent: palette.accent
     readonly property color foreground: palette.foreground
     readonly property color background: palette.background
@@ -33,10 +32,16 @@ QtObject {
     readonly property color warning: palette.warning
     readonly property color border: Qt.alpha(foreground, 0.14)
     readonly property color subtle: Qt.alpha(foreground, 0.68)
+    property I18n i18n
+    property FileView themeFile
+    property Timer refreshTimer
+
+    function tr(text) {
+        return i18n.tr(text);
+    }
 
     function readColor(source, key, fallback) {
-        const pattern = new RegExp("^\\s*" + key
-            + "\\s*=\\s*[\\\"'](#[0-9a-fA-F]{6,8})[\\\"']", "m");
+        const pattern = new RegExp("^\\s*" + key + "\\s*=\\s*[\\\"'](#[0-9a-fA-F]{6,8})[\\\"']", "m");
         const match = source.match(pattern);
         return match ? match[1] : fallback;
     }
@@ -57,11 +62,13 @@ QtObject {
                 "warning": readColor(source, "color3", palette.warning)
             };
         } catch (error) {
-            // Keep the last valid palette.
         }
     }
 
-    property FileView themeFile: FileView {
+    i18n: I18n {
+    }
+
+    themeFile: FileView {
         path: root.themePath
         watchChanges: true
         blockAllReads: true
@@ -69,11 +76,12 @@ QtObject {
         onFileChanged: root.refresh()
     }
 
-    property Timer refreshTimer: Timer {
+    refreshTimer: Timer {
         interval: 1500
         running: true
         repeat: true
         triggeredOnStart: true
         onTriggered: root.refresh()
     }
+
 }

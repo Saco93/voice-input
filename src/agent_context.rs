@@ -381,12 +381,12 @@ fn latest_codex_assistant(path: &Path, session_id: &str) -> Result<Option<String
     }
 
     for value in values.iter().rev() {
-        if value["type"] == "event_msg" && value["payload"]["type"] == "task_complete" {
-            if let Some(text) = value["payload"]["last_agent_message"].as_str() {
-                if !text.trim().is_empty() {
-                    return Ok(Some(text.to_string()));
-                }
-            }
+        if value["type"] == "event_msg"
+            && value["payload"]["type"] == "task_complete"
+            && let Some(text) = value["payload"]["last_agent_message"].as_str()
+            && !text.trim().is_empty()
+        {
+            return Ok(Some(text.to_string()));
         }
     }
 

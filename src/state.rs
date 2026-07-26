@@ -199,13 +199,13 @@ impl StateHandle {
         let runtime_path = paths::runtime_dir()?.join("state.json");
         self.write_snapshot(&runtime_path, &snapshot)?;
 
-        if let Some(custom_state_path) = self.inner.config.state_path()? {
-            if custom_state_path != runtime_path {
-                if let Some(parent) = custom_state_path.parent() {
-                    fs::create_dir_all(parent)?;
-                }
-                self.write_snapshot(&custom_state_path, &snapshot)?;
+        if let Some(custom_state_path) = self.inner.config.state_path()?
+            && custom_state_path != runtime_path
+        {
+            if let Some(parent) = custom_state_path.parent() {
+                fs::create_dir_all(parent)?;
             }
+            self.write_snapshot(&custom_state_path, &snapshot)?;
         }
 
         Ok(())

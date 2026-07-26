@@ -10,7 +10,7 @@ pub fn write_pcm16_wav(path: &Path, sample_rate: u32, samples: &[i16]) -> Result
     let file =
         File::create(path).with_context(|| format!("failed to create {}", path.display()))?;
     let mut writer = BufWriter::new(file);
-    let data_len = (samples.len() * std::mem::size_of::<i16>()) as u32;
+    let data_len = std::mem::size_of_val(samples) as u32;
     let chunk_size = 36 + data_len;
 
     writer.write_all(b"RIFF")?;

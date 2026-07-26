@@ -20,7 +20,7 @@ ColumnLayout {
     spacing: 4
 
     Label {
-        text: root.label
+        text: root.theme.tr(root.label)
         color: root.theme.foreground
         font.pixelSize: 12
         font.weight: Font.Medium
@@ -30,7 +30,7 @@ ColumnLayout {
 
     Label {
         visible: root.help.length > 0
-        text: root.help
+        text: root.theme.tr(root.help)
         color: root.theme.subtle
         font.pixelSize: 10
         wrapMode: Text.WordWrap
@@ -42,14 +42,14 @@ ColumnLayout {
 
         Layout.fillWidth: true
         text: String(root.value === undefined || root.value === null ? "" : root.value)
-        placeholderText: root.placeholderText
+        placeholderText: root.theme.tr(root.placeholderText)
         echoMode: root.password ? TextInput.Password : TextInput.Normal
         enabled: root.enabled
         selectByMouse: true
         color: root.theme.foreground
         placeholderTextColor: root.theme.subtle
-        Accessible.name: root.label
-        Accessible.description: root.help
+        Accessible.name: root.theme.tr(root.label)
+        Accessible.description: root.theme.tr(root.help)
         onTextEdited: root.edited(text)
 
         background: Rectangle {
@@ -64,7 +64,7 @@ ColumnLayout {
 
     Label {
         visible: root.error.length > 0
-        text: root.error
+        text: root.theme.tr(root.error)
         color: root.theme.error
         font.pixelSize: 11
         wrapMode: Text.WordWrap

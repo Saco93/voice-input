@@ -28,7 +28,7 @@ Rectangle {
             Layout.fillWidth: true
 
             Label {
-                text: root.title
+                text: root.theme.tr(root.title)
                 color: root.theme.foreground
                 font.pixelSize: 13
                 font.weight: Font.DemiBold
@@ -37,7 +37,7 @@ Rectangle {
 
             Label {
                 visible: root.pending
-                text: "Pending"
+                text: root.theme.tr("Pending")
                 color: root.theme.warning
                 font.pixelSize: 10
                 font.weight: Font.DemiBold
@@ -46,7 +46,7 @@ Rectangle {
         }
 
         Label {
-            text: root.summary
+            text: root.theme.tr(root.summary)
             color: root.theme.foreground
             font.pixelSize: 12
             elide: Text.ElideRight
@@ -54,7 +54,7 @@ Rectangle {
         }
 
         Label {
-            text: root.detail
+            text: root.theme.tr(root.detail)
             color: root.theme.subtle
             font.pixelSize: 11
             elide: Text.ElideRight
@@ -63,7 +63,7 @@ Rectangle {
         }
 
         Button {
-            text: "Open " + root.title
+            text: root.theme.tr("Open " + root.title)
             flat: true
             leftPadding: 0
             rightPadding: 0
