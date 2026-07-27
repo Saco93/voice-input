@@ -17,7 +17,7 @@ Voice Input is a resident dictation service with realtime transcription, a nativ
 flowchart LR
     Mic[Microphone<br/>16 kHz PCM] --> RT[Qwen Realtime ASR]
     RT --> Final[Full-audio Final ASR]
-    Final --> LLM[LLM refinement<br/>5 s total budget]
+    Final --> LLM[LLM refinement<br/>15 s default budget]
     LLM --> Out[Wayland / XWayland output]
     RT -. live transcript .-> HUD[Quickshell HUD]
     Agent[Focused Pi / Codex] -. terminology only .-> LLM
@@ -26,7 +26,7 @@ flowchart LR
 1. A persistent PipeWire capture service keeps a short pre-roll buffer, so speech immediately after the hotkey is not lost.
 2. Qwen Realtime streams partial text to the HUD while Server VAD controls waveform visibility.
 3. On toggle-off, the complete recording is optionally recognized again by the final ASR model.
-4. The transcript is lightly cleaned by an OpenAI-compatible LLM. The entire refinement stage has a shared five-second budget and fails open to Final ASR.
+4. The transcript is lightly cleaned by an OpenAI-compatible LLM. Refinement uses the configured timeout (15 seconds by default, capped at 30 seconds); when the budget is at least 10 seconds, contextual requests reserve five seconds for a transcript-only cleanup retry and ultimately fail open to Final ASR.
 5. Short text is typed with `wtype`; long text and XWayland targets use clipboard paste with automatic restoration.
 
 No-speech sessions cancel immediately. Audio capture, ASR, HUD rendering, persistence, and output are isolated so a slow visual or clipboard client cannot block recognition.
@@ -82,7 +82,7 @@ systemctl --user status voice-input.service voice-input-hud.service
 - Realtime Chinese/English mixed dictation with Server VAD
 - Center-symmetric 62.5 FPS PCM waveform, independent of ASR packet cadence
 - Complete realtime transcript plus optional full-audio final pass
-- Conservative LLM refinement with a strict shared latency budget
+- Conservative LLM refinement with bounded latency and a transcript-only cleanup fallback
 - Pi/Codex terminology context with validation, redaction, truncation, and prompt-injection isolation
 - Automatic long-text paste and clipboard restoration across Wayland/XWayland
 - Encrypted systemd credentials; no secrets in config, argv, logs, or UI

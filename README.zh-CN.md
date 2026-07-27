@@ -17,7 +17,7 @@ Voice Input 是一个常驻式 dictation 服务，提供实时转写、原生动
 flowchart LR
     Mic[麦克风<br/>16 kHz PCM] --> RT[Qwen 实时 ASR]
     RT --> Final[全音频 Final ASR]
-    Final --> LLM[LLM refinement<br/>总预算 5 秒]
+    Final --> LLM[LLM refinement<br/>默认预算 15 秒]
     LLM --> Out[Wayland / XWayland 输出]
     RT -. 实时文本 .-> HUD[Quickshell HUD]
     Agent[当前 Pi / Codex] -. 仅提供术语 .-> LLM
@@ -26,7 +26,7 @@ flowchart LR
 1. 常驻 PipeWire capture service 保留一小段 pre-roll，避免快捷键按下后最开始的语音被截掉。
 2. Qwen Realtime 持续把 partial transcript 发送到 HUD，Server VAD 控制波形是否可见。
 3. Toggle off 后，可选择让 Final ASR 对完整录音重新识别一次。
-4. OpenAI-compatible LLM 对文本做轻量整理。整个 refinement 共用五秒预算，失败时直接使用 Final ASR。
+4. OpenAI-compatible LLM 对文本做轻量整理。Refinement 使用配置的 timeout（默认 15 秒，最多 30 秒）；预算达到 10 秒时，包含 coding agent 上下文的请求会为纯 transcript 清理重试预留 5 秒，最终失败时使用 Final ASR。
 5. 短文本通过 `wtype` 输入；长文本和 XWayland 窗口自动使用剪贴板粘贴，并在结束后恢复原剪贴板。
 
 没有检测到语音时会立即取消。音频采集、ASR、HUD、状态持久化和文本输出彼此隔离，缓慢的界面或剪贴板客户端不会阻塞识别。
@@ -82,7 +82,7 @@ systemctl --user status voice-input.service voice-input-hud.service
 - 支持中英文混合输入的 Qwen Realtime + Server VAD
 - 与 ASR packet cadence 解耦的 62.5 FPS 中心对称 PCM 波形
 - 完整 Realtime transcript 与可选的全音频 Final ASR
-- 共享严格延迟预算的保守 LLM refinement
+- 延迟受限且支持纯 transcript 清理重试的保守 LLM refinement
 - Pi/Codex 术语上下文：进程验证、脱敏、截断与 prompt-injection 隔离
 - Wayland/XWayland 长文本自动粘贴与剪贴板恢复
 - systemd 加密凭据：配置、argv、日志和 UI 中不保存密钥

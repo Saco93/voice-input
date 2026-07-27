@@ -306,7 +306,7 @@ impl Default for Config {
                 api_base_url: "https://api.openai.com/v1".into(),
                 api_key: String::new(),
                 model: String::new(),
-                timeout_ms: 5_000,
+                timeout_ms: 15_000,
                 provider_sort: String::new(),
                 agent_context_enabled: false,
                 agent_context_max_chars: 6_000,

@@ -3,6 +3,8 @@ import { chmod, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises"
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 
+const MAX_REFERENCE_CHARS = 12_000;
+
 function processStartTicks(stat: string): number {
   const end = stat.lastIndexOf(")");
   if (end < 0) throw new Error("invalid /proc/self/stat");
@@ -10,6 +12,31 @@ function processStartTicks(stat: string): number {
   const value = Number(fields[19]);
   if (!Number.isSafeInteger(value)) throw new Error("invalid process start time");
   return value;
+}
+
+function capReference(value: string): string {
+  const characters = Array.from(value);
+  if (characters.length <= MAX_REFERENCE_CHARS) return value;
+  const headLength = Math.floor(MAX_REFERENCE_CHARS * 2 / 3);
+  const tailLength = MAX_REFERENCE_CHARS - headLength - 3;
+  return `${characters.slice(0, headLength).join("")}\n…\n${characters.slice(-tailLength).join("")}`;
+}
+
+function latestCompletedAssistantMessage(ctx: ExtensionContext): string | undefined {
+  const branch = ctx.sessionManager.getBranch();
+  for (let index = branch.length - 1; index >= 0; index -= 1) {
+    const entry = branch[index];
+    if (entry.type !== "message") continue;
+    const message = entry.message;
+    if (message.role !== "assistant" || message.stopReason !== "stop") continue;
+    const text = message.content
+      .filter((block) => block.type === "text")
+      .map((block) => block.text)
+      .join("\n")
+      .trim();
+    if (text) return capReference(text);
+  }
+  return undefined;
 }
 
 export default function (pi: ExtensionAPI) {
@@ -41,13 +68,14 @@ export default function (pi: ExtensionAPI) {
 
     const startTicks = processStartTicks(await readFile("/proc/self/stat", "utf8"));
     const payload = JSON.stringify({
-      version: 1,
+      version: 2,
       instance_id: instanceId,
       pid: process.pid,
       process_start_ticks: startTicks,
       session_id: ctx.sessionManager.getSessionId(),
       session_file: sessionFile,
       cwd: ctx.cwd,
+      latest_completed_assistant_message: latestCompletedAssistantMessage(ctx),
       updated_at_ms: Date.now(),
     });
     const temporary = `${registry}.tmp-${Date.now()}-${Math.random().toString(16).slice(2)}`;
@@ -79,6 +107,16 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("agent_end", async (_event, ctx) => {
+    currentContext = ctx;
+    await publish(ctx).catch(() => {});
+  });
+
+  pi.on("agent_settled", async (_event, ctx) => {
+    currentContext = ctx;
+    await publish(ctx).catch(() => {});
+  });
+
+  pi.on("session_tree", async (_event, ctx) => {
     currentContext = ctx;
     await publish(ctx).catch(() => {});
   });

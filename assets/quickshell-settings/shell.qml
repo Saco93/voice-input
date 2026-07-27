@@ -1291,7 +1291,7 @@ ShellRoot {
                                             SettingTextField {
                                                 theme: theme
                                                 label: "Timeout"
-                                                value: controller.value("llm.timeout_ms", 5000)
+                                                value: controller.value("llm.timeout_ms", 15000)
                                                 help: "Milliseconds."
                                                 error: controller.errorFor("llm.timeout_ms")
                                                 enabled: !controller.busy

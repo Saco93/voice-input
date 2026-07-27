@@ -38,6 +38,7 @@ pub struct AgentSessionLocator {
     session_path: PathBuf,
     device: u64,
     inode: u64,
+    pi_registry_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -81,7 +82,14 @@ pub fn load_reference(
     }
 
     let text = match locator.kind {
-        AgentKind::Pi => latest_pi_assistant(&locator.session_path, &locator.session_id)?,
+        AgentKind::Pi => {
+            let published_reference = current_pi_published_reference(locator)?;
+            latest_pi_reference(
+                &locator.session_path,
+                &locator.session_id,
+                published_reference.as_deref(),
+            )?
+        }
         AgentKind::Codex => latest_codex_assistant(&locator.session_path, &locator.session_id)?,
     };
 
@@ -199,6 +207,8 @@ struct PiRegistry {
     process_start_ticks: u64,
     session_id: String,
     session_file: PathBuf,
+    #[serde(default)]
+    latest_completed_assistant_message: Option<String>,
 }
 
 fn resolve_pi_session(pid: u32) -> Result<Option<AgentSessionLocator>> {
@@ -208,11 +218,11 @@ fn resolve_pi_session(pid: u32) -> Result<Option<AgentSessionLocator>> {
         .join("voice-input/agent-sessions")
         .join(&registry_name);
     let legacy_registry_path = runtime.join("voxtype/agent-sessions").join(&registry_name);
-    let source = match fs::read(&registry_path) {
-        Ok(source) => source,
+    let (source, active_registry_path) = match fs::read(&registry_path) {
+        Ok(source) => (source, registry_path),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             match fs::read(&legacy_registry_path) {
-                Ok(source) => source,
+                Ok(source) => (source, legacy_registry_path),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
                 Err(error) => {
                     return Err(error).context("failed to read legacy Pi session registry");
@@ -223,7 +233,7 @@ fn resolve_pi_session(pid: u32) -> Result<Option<AgentSessionLocator>> {
     };
     let registry: PiRegistry =
         serde_json::from_slice(&source).context("failed to parse Pi session registry")?;
-    if registry.version != 1
+    if !matches!(registry.version, 1 | 2)
         || registry.pid != pid
         || registry.process_start_ticks != process_start_ticks(pid)?
     {
@@ -257,6 +267,7 @@ fn resolve_pi_session(pid: u32) -> Result<Option<AgentSessionLocator>> {
         session_path: canonical,
         device: metadata.dev(),
         inode: metadata.ino(),
+        pi_registry_path: Some(active_registry_path),
     }))
 }
 
@@ -317,7 +328,49 @@ fn resolve_codex_session(pid: u32) -> Result<Option<AgentSessionLocator>> {
         session_path,
         device: metadata.dev(),
         inode: metadata.ino(),
+        pi_registry_path: None,
     }))
+}
+
+fn current_pi_published_reference(locator: &AgentSessionLocator) -> Result<Option<String>> {
+    let Some(registry_path) = &locator.pi_registry_path else {
+        return Ok(None);
+    };
+    let source = match fs::read(registry_path) {
+        Ok(source) => source,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).context("failed to refresh Pi session registry"),
+    };
+    let registry: PiRegistry = match serde_json::from_slice(&source) {
+        Ok(registry) => registry,
+        Err(_) => return Ok(None),
+    };
+    if registry.version != 2
+        || registry.pid != locator.pid
+        || registry.process_start_ticks != locator.process_start_ticks
+        || registry.session_id != locator.session_id
+    {
+        return Ok(None);
+    }
+    let session_path = match registry.session_file.canonicalize() {
+        Ok(path) => path,
+        Err(_) => return Ok(None),
+    };
+    if session_path != locator.session_path {
+        return Ok(None);
+    }
+    Ok(registry.latest_completed_assistant_message)
+}
+
+fn latest_pi_reference(
+    path: &Path,
+    session_id: &str,
+    published_reference: Option<&str>,
+) -> Result<Option<String>> {
+    if let Some(text) = published_reference {
+        return Ok(Some(text.to_string()));
+    }
+    latest_pi_assistant(path, session_id)
 }
 
 fn latest_pi_assistant(path: &Path, session_id: &str) -> Result<Option<String>> {
@@ -548,7 +601,10 @@ mod tests {
 
     use serde_json::json;
 
-    use super::{cap_text, latest_codex_assistant, latest_pi_assistant, sanitize_reference};
+    use super::{
+        AgentKind, AgentSessionLocator, PiRegistry, cap_text, current_pi_published_reference,
+        latest_codex_assistant, latest_pi_assistant, latest_pi_reference, sanitize_reference,
+    };
 
     #[test]
     fn reads_latest_pi_assistant_on_active_branch() {
@@ -566,6 +622,70 @@ mod tests {
         assert_eq!(
             latest_pi_assistant(file.path(), "session-1").unwrap(),
             Some("latest".into())
+        );
+    }
+
+    #[test]
+    fn parses_pi_registry_with_published_reference() {
+        let registry: PiRegistry = serde_json::from_value(json!({
+            "version": 2,
+            "pid": 123,
+            "process_start_ticks": 456,
+            "session_id": "session-1",
+            "session_file": "/tmp/session.jsonl",
+            "latest_completed_assistant_message": "latest active-branch answer"
+        }))
+        .unwrap();
+        assert_eq!(
+            registry.latest_completed_assistant_message.as_deref(),
+            Some("latest active-branch answer")
+        );
+    }
+
+    #[test]
+    fn refreshes_pi_reference_after_session_capture() {
+        let directory = tempfile::tempdir().unwrap();
+        let session_path = directory.path().join("session.jsonl");
+        std::fs::write(&session_path, "{}\n").unwrap();
+        let session_path = session_path.canonicalize().unwrap();
+        let metadata = std::fs::metadata(&session_path).unwrap();
+        let registry_path = directory.path().join("registry.json");
+        let locator = AgentSessionLocator {
+            kind: AgentKind::Pi,
+            pid: 123,
+            process_start_ticks: 456,
+            session_id: "session-1".into(),
+            session_path: session_path.clone(),
+            device: std::os::unix::fs::MetadataExt::dev(&metadata),
+            inode: std::os::unix::fs::MetadataExt::ino(&metadata),
+            pi_registry_path: Some(registry_path.clone()),
+        };
+        std::fs::write(
+            &registry_path,
+            json!({
+                "version": 2,
+                "pid": 123,
+                "process_start_ticks": 456,
+                "session_id": "session-1",
+                "session_file": session_path,
+                "latest_completed_assistant_message": "new answer"
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            current_pi_published_reference(&locator).unwrap(),
+            Some("new answer".into())
+        );
+    }
+
+    #[test]
+    fn prefers_pi_reference_published_from_active_branch() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        assert_eq!(
+            latest_pi_reference(file.path(), "session-1", Some("published latest")).unwrap(),
+            Some("published latest".into())
         );
     }
 

@@ -98,7 +98,7 @@ QtObject {
                 "enabled": false,
                 "api_base_url": "https://api.openai.com/v1",
                 "model": "",
-                "timeout_ms": 5000,
+                "timeout_ms": 15000,
                 "provider_sort": "",
                 "agent_context_enabled": false,
                 "agent_context_max_chars": 6000
