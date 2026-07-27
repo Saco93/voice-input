@@ -51,24 +51,26 @@ PanelWindow {
     // (timbre) estimate drives the hue shift.
     readonly property bool arming: store.phase === "arming"
     readonly property bool recording: store.phase === "recording"
+    readonly property bool finalizing: store.phase === "transcribing"
+    readonly property bool refining: store.phase === "refining"
     // Post-recording stages get a quiet breathing glow so the capsule stays
     // visibly alive while the pipeline finishes.
-    readonly property bool processing: store.phase === "transcribing" || store.phase === "refining"
+    readonly property bool processing: finalizing || refining
     property real vizClock: 0
     property real breathCycles: 0
     property real levelSmoothed: 0
     property real pitchSmoothed: 0.35
     property real timbreSmoothed: 0.5
-    readonly property real breathHz: recording ? 0.8 + pitchSmoothed * 3.2 : 1.1
+    // Final ASR breathes more slowly than refinement. Both remain gentler than
+    // the pitch-responsive recording animation.
+    readonly property real breathHz: recording ? 0.8 + pitchSmoothed * 3.2 : finalizing ? 0.36 : refining ? 0.52 : 1.1
     readonly property real breathPhase: 0.5 + 0.5 * Math.sin(breathCycles * 2 * Math.PI)
-    // Post-recording stages use a heartbeat double pulse (lub-dub) instead of
-    // the recording sine breathing, so the phases are distinguishable at a
-    // glance. Colors stay fixed per phase via `phaseColor`.
+    // Both envelopes have zero slope at their dim and bright endpoints. Refine
+    // uses a softer exponent so it dwells near peak brightness a little longer.
     readonly property real processingPulse: {
         const cycle = breathCycles - Math.floor(breathCycles);
-        const lub = Math.exp(-Math.pow((cycle - 0.12) / 0.07, 2));
-        const dub = 0.65 * Math.exp(-Math.pow((cycle - 0.42) / 0.07, 2));
-        return Math.min(1, lub + dub);
+        const cosine = 0.5 - 0.5 * Math.cos(cycle * 2 * Math.PI);
+        return refining ? Math.pow(cosine, 0.72) : cosine;
     }
     readonly property real glowStrength: {
         if (arming)
@@ -77,8 +79,11 @@ PanelWindow {
         if (recording)
             return (0.1 + 0.9 * levelSmoothed) * (0.55 + 0.45 * breathPhase);
 
-        if (processing)
-            return 0.22 + 0.28 * processingPulse;
+        if (finalizing)
+            return 0.38 + 0.32 * processingPulse;
+
+        if (refining)
+            return 0.42 + 0.34 * processingPulse;
 
         return 0;
     }
@@ -103,12 +108,17 @@ PanelWindow {
         if (store.phase === "arming" || store.phase === "recording")
             return store.themeAccent;
 
-        if (store.phase === "transcribing")
-            return store.themeWarning;
+        if (finalizing || refining) {
+            const accent = store.themeAccent;
+            if (accent.hslHue < 0)
+                return accent;
 
-        if (store.phase === "refining")
-            return store.themeRefining;
-
+            // Both processing stages use the theme accent hue. Final ASR is
+            // quieter and less saturated; refinement is the stronger variant.
+            const saturationScale = finalizing ? 0.58 : 1;
+            const lightnessOffset = finalizing ? 0.05 : 0;
+            return Qt.hsla(accent.hslHue, Math.min(1, accent.hslSaturation * saturationScale), Math.min(1, accent.hslLightness + lightnessOffset), 1);
+        }
         if (store.phase === "error")
             return store.themeError;
 
