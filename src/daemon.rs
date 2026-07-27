@@ -1162,8 +1162,8 @@ fn run_capture_service(
                 .lock()
                 .expect("waveform analyzer mutex poisoned")
                 .push(&chunk, active.voice_active.load(Ordering::Relaxed));
-            for bars in frames {
-                active.waveform.try_publish(active.session_id, bars);
+            for frame in frames {
+                active.waveform.try_publish(active.session_id, frame);
             }
         }
     }
@@ -1264,8 +1264,8 @@ fn spawn_reader_thread(
                 .lock()
                 .expect("waveform analyzer mutex poisoned")
                 .push(&chunk, voice_active.load(Ordering::Relaxed));
-            for bars in frames {
-                waveform.try_publish(session_id, bars);
+            for frame in frames {
+                waveform.try_publish(session_id, frame);
             }
 
             if started.elapsed() >= Duration::from_secs(config.audio.max_duration_secs) {

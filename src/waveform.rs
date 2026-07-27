@@ -22,9 +22,42 @@ pub const ASR_PACKET_SAMPLES: usize = 2_048;
 
 const ATTACK_SECONDS: f32 = 0.040;
 const RELEASE_SECONDS: f32 = 0.190;
+const PITCH_ATTACK_SECONDS: f32 = 0.120;
+const PITCH_RELEASE_SECONDS: f32 = 0.250;
+const TIMBRE_ATTACK_SECONDS: f32 = 0.100;
+const TIMBRE_RELEASE_SECONDS: f32 = 0.300;
 const INPUT_GAIN: f32 = 8.0;
 const VISIBLE_FLOOR: f32 = 0.0;
 const MAX_CLIENTS: usize = 8;
+// Autocorrelation-based pitch estimation over the voiced speech range.
+const PITCH_MIN_FREQUENCY: f32 = 75.0;
+const PITCH_MAX_FREQUENCY: f32 = 450.0;
+const PITCH_CORRELATION_THRESHOLD: f32 = 0.35;
+const PITCH_NEUTRAL: f32 = 0.35;
+// One-pole low-pass split for the brightness (high-band energy ratio) timbre
+// estimate, plus the ratio range mapped onto the normalized 0..1 scale.
+const TIMBRE_CUTOFF_HZ: f32 = 1_400.0;
+const TIMBRE_MIN_RATIO: f32 = 0.08;
+const TIMBRE_MAX_RATIO: f32 = 0.65;
+// Below this RMS the window is treated as silence and pitch/timbre estimates
+// are discarded, because measurements of background noise are meaningless.
+const ANALYSIS_MIN_RMS: f32 = 0.005;
+
+/// One analysis frame: the legacy mirrored bar envelope plus aggregate voice
+/// metrics used by glow-style HUD visualizations.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct WaveformFrame {
+    pub bars: [f32; WAVEFORM_BAR_COUNT],
+    /// Overall smoothed loudness of the window, 0..1.
+    pub level: f32,
+    /// Normalized fundamental-frequency estimate, 0..1. Low values correspond
+    /// to a deep voice, high values to a high-pitched voice. The estimate is
+    /// held while speech is unvoiced or silent so visuals stay stable.
+    pub pitch: f32,
+    /// Normalized brightness (high-band energy ratio), 0..1. Low values are
+    /// muffled/voiced content, high values are bright or fricative content.
+    pub timbre: f32,
+}
 
 #[derive(Debug)]
 pub struct WaveformAnalyzer {
@@ -32,6 +65,9 @@ pub struct WaveformAnalyzer {
     window: VecDeque<i16>,
     samples_since_frame: usize,
     half_levels: [f32; WAVEFORM_BAR_COUNT / 2],
+    overall_level: f32,
+    pitch_level: f32,
+    timbre_level: f32,
 }
 
 impl WaveformAnalyzer {
@@ -41,10 +77,13 @@ impl WaveformAnalyzer {
             window: VecDeque::with_capacity(ANALYSIS_WINDOW_SAMPLES),
             samples_since_frame: 0,
             half_levels: [VISIBLE_FLOOR; WAVEFORM_BAR_COUNT / 2],
+            overall_level: VISIBLE_FLOOR,
+            pitch_level: PITCH_NEUTRAL,
+            timbre_level: 0.0,
         }
     }
 
-    pub fn push(&mut self, samples: &[i16], voice_active: bool) -> Vec<[f32; WAVEFORM_BAR_COUNT]> {
+    pub fn push(&mut self, samples: &[i16], voice_active: bool) -> Vec<WaveformFrame> {
         let mut frames = Vec::new();
         for sample in samples {
             if self.window.len() == ANALYSIS_WINDOW_SAMPLES {
@@ -77,10 +116,121 @@ impl WaveformAnalyzer {
                     let alpha = 1.0 - (-frame_seconds / time_constant).exp();
                     *level += (target - *level) * alpha;
                 }
-                frames.push(mirrored_bars(&self.half_levels));
+
+                let window_rms = rms_level(window.iter().copied());
+                let level_target = if voice_active {
+                    (window_rms * INPUT_GAIN).clamp(0.0, 1.0).powf(0.65)
+                } else {
+                    0.0
+                };
+                smooth(
+                    &mut self.overall_level,
+                    level_target,
+                    frame_seconds,
+                    ATTACK_SECONDS,
+                    RELEASE_SECONDS,
+                );
+
+                let analyzed = voice_active && window_rms > ANALYSIS_MIN_RMS;
+                if analyzed && let Some(frequency) = estimate_pitch(&window, self.sample_rate) {
+                    let pitch_target = (frequency / PITCH_MIN_FREQUENCY).ln()
+                        / (PITCH_MAX_FREQUENCY / PITCH_MIN_FREQUENCY).ln();
+                    smooth(
+                        &mut self.pitch_level,
+                        pitch_target.clamp(0.0, 1.0),
+                        frame_seconds,
+                        PITCH_ATTACK_SECONDS,
+                        PITCH_RELEASE_SECONDS,
+                    );
+                }
+                // Unvoiced or noisy windows keep the previous pitch so the
+                // breathing rate does not jump on fricatives and pauses.
+
+                let timbre_target = if analyzed {
+                    let ratio = high_band_ratio(&window, self.sample_rate);
+                    ((ratio - TIMBRE_MIN_RATIO) / (TIMBRE_MAX_RATIO - TIMBRE_MIN_RATIO))
+                        .clamp(0.0, 1.0)
+                } else {
+                    0.0
+                };
+                smooth(
+                    &mut self.timbre_level,
+                    timbre_target,
+                    frame_seconds,
+                    TIMBRE_ATTACK_SECONDS,
+                    TIMBRE_RELEASE_SECONDS,
+                );
+
+                frames.push(WaveformFrame {
+                    bars: mirrored_bars(&self.half_levels),
+                    level: self.overall_level,
+                    pitch: self.pitch_level,
+                    timbre: self.timbre_level,
+                });
             }
         }
         frames
+    }
+}
+
+fn smooth(value: &mut f32, target: f32, frame_seconds: f32, attack: f32, release: f32) {
+    let time_constant = if target > *value { attack } else { release };
+    let alpha = 1.0 - (-frame_seconds / time_constant).exp();
+    *value += (target - *value) * alpha;
+}
+
+/// Fundamental-frequency estimate from the autocorrelation peak inside the
+/// voiced-speech lag range. Returns `None` when the window has no clear
+/// periodicity (silence, fricatives, noise).
+fn estimate_pitch(window: &[i16], sample_rate: u32) -> Option<f32> {
+    let min_lag = (sample_rate as f32 / PITCH_MAX_FREQUENCY) as usize;
+    let max_lag = ((sample_rate as f32 / PITCH_MIN_FREQUENCY) as usize).min(window.len() - 1);
+    if min_lag >= max_lag {
+        return None;
+    }
+
+    let energy: f32 = window.iter().map(|sample| (*sample as f32).powi(2)).sum();
+    if energy <= f32::EPSILON {
+        return None;
+    }
+
+    let mut best_lag = 0_usize;
+    let mut best_correlation = 0.0_f32;
+    for lag in min_lag..=max_lag {
+        let correlation: f32 = window[..window.len() - lag]
+            .iter()
+            .zip(&window[lag..])
+            .map(|(a, b)| *a as f32 * *b as f32)
+            .sum();
+        let normalized = correlation / energy;
+        if normalized > best_correlation {
+            best_correlation = normalized;
+            best_lag = lag;
+        }
+    }
+
+    (best_correlation >= PITCH_CORRELATION_THRESHOLD)
+        .then_some(sample_rate as f32 / best_lag as f32)
+}
+
+/// Brightness estimate: energy ratio of a one-pole high band (signal minus
+/// its low-passed copy) to the total signal energy.
+fn high_band_ratio(window: &[i16], sample_rate: u32) -> f32 {
+    let alpha = 1.0 - (-2.0 * std::f32::consts::PI * TIMBRE_CUTOFF_HZ / sample_rate as f32).exp();
+    let mut low_passed = 0.0_f32;
+    let mut total_power = 0.0_f32;
+    let mut high_power = 0.0_f32;
+    for sample in window {
+        let value = *sample as f32 / i16::MAX as f32;
+        low_passed += alpha * (value - low_passed);
+        let high = value - low_passed;
+        total_power += value * value;
+        high_power += high * high;
+    }
+    if total_power <= f32::EPSILON {
+        0.0
+    } else {
+        (high_power / total_power).sqrt()
     }
 }
 
@@ -113,7 +263,7 @@ pub struct WaveformPublisher {
 enum PublisherMessage {
     Frame {
         session_id: u64,
-        bars: [f32; WAVEFORM_BAR_COUNT],
+        frame: WaveformFrame,
     },
     Reset {
         session_id: u64,
@@ -128,6 +278,12 @@ struct WireMessage<'a> {
     sequence: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     bars: Option<&'a [f32; WAVEFORM_BAR_COUNT]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    level: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pitch: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    timbre: Option<f32>,
 }
 
 impl WaveformPublisher {
@@ -198,12 +354,15 @@ impl WaveformPublisher {
                     };
                     sequence = sequence.wrapping_add(1);
                     let payload = match &next {
-                        PublisherMessage::Frame { session_id, bars } => {
+                        PublisherMessage::Frame { session_id, frame } => {
                             serde_json::to_vec(&WireMessage {
                                 kind: "waveform",
                                 session_id: *session_id,
                                 sequence,
-                                bars: Some(bars),
+                                bars: Some(&frame.bars),
+                                level: Some(frame.level),
+                                pitch: Some(frame.pitch),
+                                timbre: Some(frame.timbre),
                             })
                         }
                         PublisherMessage::Reset { session_id } => {
@@ -212,6 +371,9 @@ impl WaveformPublisher {
                                 session_id: *session_id,
                                 sequence,
                                 bars: None,
+                                level: None,
+                                pitch: None,
+                                timbre: None,
                             })
                         }
                     };
@@ -228,8 +390,8 @@ impl WaveformPublisher {
         Ok(Self { sender })
     }
 
-    pub fn try_publish(&self, session_id: u64, bars: [f32; WAVEFORM_BAR_COUNT]) {
-        let _ = self.try_send(PublisherMessage::Frame { session_id, bars });
+    pub fn try_publish(&self, session_id: u64, frame: WaveformFrame) {
+        let _ = self.try_send(PublisherMessage::Frame { session_id, frame });
     }
 
     pub fn try_reset(&self, session_id: u64) {
@@ -307,7 +469,7 @@ mod tests {
 
     use super::{
         ANALYSIS_HOP_SAMPLES, ANALYSIS_WINDOW_SAMPLES, ASR_PACKET_SAMPLES, AsrPacketizer,
-        VISIBLE_FLOOR, WAVEFORM_BAR_COUNT, WaveformAnalyzer, WaveformPublisher,
+        VISIBLE_FLOOR, WAVEFORM_BAR_COUNT, WaveformAnalyzer, WaveformFrame, WaveformPublisher,
     };
 
     #[test]
@@ -328,7 +490,11 @@ mod tests {
             actual.len(),
             1 + (samples.len() - ANALYSIS_WINDOW_SAMPLES) / ANALYSIS_HOP_SAMPLES
         );
-        assert!(actual.iter().all(|frame| frame.len() == WAVEFORM_BAR_COUNT));
+        assert!(
+            actual
+                .iter()
+                .all(|frame| frame.bars.len() == WAVEFORM_BAR_COUNT)
+        );
     }
 
     #[test]
@@ -339,7 +505,10 @@ mod tests {
         let mut analyzer = WaveformAnalyzer::new(16_000);
         let frame = analyzer.push(&samples, true).pop().unwrap();
         for index in 0..WAVEFORM_BAR_COUNT / 2 {
-            assert_eq!(frame[index], frame[WAVEFORM_BAR_COUNT - 1 - index]);
+            assert_eq!(
+                frame.bars[index],
+                frame.bars[WAVEFORM_BAR_COUNT - 1 - index]
+            );
         }
     }
 
@@ -350,8 +519,54 @@ mod tests {
         assert_eq!(frames.len(), 1);
         assert!(
             frames[0]
+                .bars
                 .iter()
                 .all(|bar| (*bar - VISIBLE_FLOOR).abs() < f32::EPSILON)
+        );
+        assert!(frames[0].level.abs() < f32::EPSILON);
+        // Pitch holds its neutral value during silence so the breathing rate
+        // does not jump when speech starts.
+        assert!((frames[0].pitch - 0.35).abs() < f32::EPSILON);
+        assert!(frames[0].timbre.abs() < f32::EPSILON);
+    }
+
+    fn sine_wave(frequency_hz: f32, amplitude: i16, sample_rate: u32, count: usize) -> Vec<i16> {
+        (0..count)
+            .map(|index| {
+                let phase =
+                    2.0 * std::f32::consts::PI * frequency_hz * index as f32 / sample_rate as f32;
+                (phase.sin() * amplitude as f32) as i16
+            })
+            .collect()
+    }
+
+    #[test]
+    fn analyzer_tracks_level_pitch_and_timbre() {
+        let sample_rate = 16_000;
+        let deep = sine_wave(150.0, 12_000, sample_rate, 8_192);
+        let high_pitch = sine_wave(350.0, 12_000, sample_rate, 8_192);
+        let bright = sine_wave(2_800.0, 12_000, sample_rate, 8_192);
+
+        let mut deep_analyzer = WaveformAnalyzer::new(sample_rate);
+        let deep_frame = *deep_analyzer.push(&deep, true).last().unwrap();
+        let mut high_analyzer = WaveformAnalyzer::new(sample_rate);
+        let high_frame = *high_analyzer.push(&high_pitch, true).last().unwrap();
+        let mut bright_analyzer = WaveformAnalyzer::new(sample_rate);
+        let bright_frame = *bright_analyzer.push(&bright, true).last().unwrap();
+
+        assert!(deep_frame.level > 0.3, "voiced audio must raise the level");
+        assert!(
+            high_frame.pitch > deep_frame.pitch + 0.3,
+            "a higher fundamental must raise the pitch estimate: deep={} high={}",
+            deep_frame.pitch,
+            high_frame.pitch
+        );
+        assert!(deep_frame.pitch < 0.5);
+        assert!(
+            bright_frame.timbre > deep_frame.timbre + 0.5,
+            "bright content must raise the timbre estimate: deep={} bright={}",
+            deep_frame.timbre,
+            bright_frame.timbre
         );
     }
 
@@ -365,7 +580,15 @@ mod tests {
             .set_read_timeout(Some(Duration::from_secs(1)))
             .unwrap();
         thread::sleep(Duration::from_millis(20));
-        publisher.try_publish(7, [0.42; WAVEFORM_BAR_COUNT]);
+        publisher.try_publish(
+            7,
+            WaveformFrame {
+                bars: [0.42; WAVEFORM_BAR_COUNT],
+                level: 0.5,
+                pitch: 0.4,
+                timbre: 0.25,
+            },
+        );
 
         let mut line = String::new();
         BufReader::new(stream).read_line(&mut line).unwrap();
@@ -376,6 +599,9 @@ mod tests {
             payload["bars"].as_array().unwrap().len(),
             WAVEFORM_BAR_COUNT
         );
+        assert_eq!(payload["level"].as_f64().unwrap(), 0.5);
+        assert_eq!(payload["pitch"].as_f64().unwrap(), 0.4);
+        assert_eq!(payload["timbre"].as_f64().unwrap(), 0.25);
     }
 
     #[test]
