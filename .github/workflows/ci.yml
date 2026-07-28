@@ -21,19 +21,28 @@ jobs:
         with:
           components: rustfmt
 
-      - name: Install Qt Shader Tools
-        run: |
-          sudo apt-get update
-          sudo apt-get install --yes qt6-shader-baker
+      - name: Install Qt 6.8.3 Shader Tools
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: '6.8.3'
+          host: linux
+          target: desktop
+          arch: linux_gcc_64
+          modules: qtshadertools
+          cache: true
 
       - name: Validate HUD shader assets
         run: |
+          qsb_path=$(command -v qsb)
+          qsb --help | grep -q -- '--qt6'
           stage="$RUNNER_TEMP/quickshell"
-          make install-hud-assets QSB=/usr/lib/qt6/bin/qsb QUICKSHELL_DIR="$stage"
+          make install-hud-assets QSB="$qsb_path" QUICKSHELL_DIR="$stage"
           test -s "$stage/WavyHalo.qml"
           test -s "$stage/shaders/wavy-halo.frag.qsb"
-          shader_dump=$(/usr/lib/qt6/bin/qsb --dump "$stage/shaders/wavy-halo.frag.qsb")
+          shader_dump=$(qsb --dump "$stage/shaders/wavy-halo.frag.qsb")
           grep -q 'GLSL' <<<"$shader_dump"
+          grep -q 'HLSL' <<<"$shader_dump"
+          grep -q 'MSL' <<<"$shader_dump"
 
       - name: Cache Rust build
         uses: Swatinem/rust-cache@v2
