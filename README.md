@@ -38,6 +38,7 @@ No-speech sessions cancel immediately. Audio capture, ASR, HUD rendering, persis
 - Arch Linux / Omarchy with Hyprland and Wayland
 - Rust toolchain, PipeWire (`pw-record`), `wtype`, and `wl-clipboard`
 - [Quickshell](https://quickshell.org/) for the HUD and Settings
+- Qt Shader Tools (`qt6-shadertools` on Arch) to compile the HUD halo during installation; set `QSB=/path/to/qsb` for a nonstandard Qt installation
 - Optional: `/usr/bin/voxtype` for local fallback; `xclip` + `xdotool` for XWayland
 
 ### Install

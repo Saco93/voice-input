@@ -17,8 +17,17 @@ QtObject {
     readonly property string waveformPath: runtimeDirectory + "/voice-input/waveform.sock"
     readonly property string themePath: Quickshell.env("HOME") + "/.config/omarchy/current/theme/colors.toml"
     readonly property int waveformBarCount: 30
+    readonly property int spectrumBandCount: 12
     readonly property var emptyWaveform: new Array(waveformBarCount).fill(0)
+    readonly property var emptySpectrum: new Array(spectrumBandCount).fill(0)
     property var waveformBars: emptyWaveform
+    property var voiceSpectrum: emptySpectrum
+    property vector4d voiceSpectrum0: Qt.vector4d(0, 0, 0, 0)
+    property vector4d voiceSpectrum1: Qt.vector4d(0, 0, 0, 0)
+    property vector4d voiceSpectrum2: Qt.vector4d(0, 0, 0, 0)
+    property real voiceSpectralFlux: 0
+    property real voiceSpectralCentroid: 0.5
+    property real voiceSpeechPace: 0
     // Aggregate voice metrics published alongside the bars. The glow-style HUD
     // visualization is driven by these; level falls back to the bar average
     // when an older daemon does not send it.
@@ -124,6 +133,13 @@ QtObject {
         voiceLevel = 0;
         voicePitch = 0.35;
         voiceTimbre = 0.5;
+        voiceSpectrum = emptySpectrum.slice();
+        voiceSpectrum0 = Qt.vector4d(0, 0, 0, 0);
+        voiceSpectrum1 = Qt.vector4d(0, 0, 0, 0);
+        voiceSpectrum2 = Qt.vector4d(0, 0, 0, 0);
+        voiceSpectralFlux = 0;
+        voiceSpectralCentroid = 0.5;
+        voiceSpeechPace = 0;
         waveformFrameCount = 0;
     }
 
@@ -158,11 +174,37 @@ QtObject {
             voiceLevel = Number.isFinite(level) ? clamp01(level) : average;
             voicePitch = Number.isFinite(pitch) ? clamp01(pitch) : 0.35;
             voiceTimbre = Number.isFinite(timbre) ? clamp01(timbre) : 0.5;
+            const spectrum = emptySpectrum.slice();
+            if (Array.isArray(message.spectrum) && message.spectrum.length === spectrumBandCount) {
+                for (let index = 0; index < spectrumBandCount; index++) {
+                    const value = Number(message.spectrum[index]);
+                    if (Number.isFinite(value))
+                        spectrum[index] = clamp01(value);
+
+                }
+            }
+            voiceSpectrum = spectrum;
+            voiceSpectrum0 = Qt.vector4d(spectrum[0], spectrum[1], spectrum[2], spectrum[3]);
+            voiceSpectrum1 = Qt.vector4d(spectrum[4], spectrum[5], spectrum[6], spectrum[7]);
+            voiceSpectrum2 = Qt.vector4d(spectrum[8], spectrum[9], spectrum[10], spectrum[11]);
+            const spectralFlux = Number(message.spectral_flux);
+            const spectralCentroid = Number(message.spectral_centroid);
+            const speechPace = Number(message.speech_pace);
+            voiceSpectralFlux = Number.isFinite(spectralFlux) ? clamp01(spectralFlux) : 0;
+            voiceSpectralCentroid = Number.isFinite(spectralCentroid) ? clamp01(spectralCentroid) : 0.5;
+            voiceSpeechPace = Number.isFinite(speechPace) ? clamp01(speechPace) : 0;
             waveformFrameCount++;
             if (waveformFrameCount === 30) {
-                const minimum = Math.min(next).toFixed(3);
-                const maximum = Math.max(next).toFixed(3);
-                console.info("Voice Input HUD waveform connected:", minimum, "..", maximum);
+                const minimum = next.reduce((result, value) => {
+                    return Math.min(result, value);
+                }, 1).toFixed(3);
+                const maximum = next.reduce((result, value) => {
+                    return Math.max(result, value);
+                }, 0).toFixed(3);
+                const spectrumMaximum = spectrum.reduce((result, value) => {
+                    return Math.max(result, value);
+                }, 0).toFixed(3);
+                console.info("Voice Input HUD waveform connected: bars", minimum, "..", maximum, "level", voiceLevel.toFixed(3), "pitch", voicePitch.toFixed(3), "timbre", voiceTimbre.toFixed(3), "spectrum max", spectrumMaximum, "flux", voiceSpectralFlux.toFixed(3), "centroid", voiceSpectralCentroid.toFixed(3), "pace", voiceSpeechPace.toFixed(3));
             }
         } catch (error) {
         }

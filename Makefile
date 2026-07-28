@@ -8,8 +8,11 @@ PI_EXTENSIONS_DIR ?= $(HOME)/.pi/agent/extensions
 CONFIG_HOME ?= $(HOME)/.config
 CONFIG_DIR ?= $(CONFIG_HOME)/voice-input
 CREDENTIAL_STORE_DIR ?= $(CONFIG_HOME)/credstore.encrypted
+QSB ?= $(shell command -v qsb 2>/dev/null || command -v qsb6 2>/dev/null || if [ -x /usr/lib/qt6/bin/qsb ]; then printf '%s' /usr/lib/qt6/bin/qsb; fi)
+HUD_SHADER_SOURCE := assets/quickshell/shaders/wavy-halo.frag
+HUD_SHADER_OUTPUT := target/quickshell/shaders/wavy-halo.frag.qsb
 
-.PHONY: build run install clean enable-service disable-service
+.PHONY: build run install install-hud-assets hud-shaders clean enable-service disable-service
 
 build:
 	cargo build --release --offline
@@ -17,11 +20,20 @@ build:
 run:
 	cargo run --offline -- daemon
 
-install: build
-	install -Dm755 target/release/voice-input $(BIN_DIR)/voice-input
+hud-shaders:
+	@test -n "$(QSB)" || { printf '%s\n' 'Qt Shader Tools are required; install qt6-shadertools or set QSB=/path/to/qsb' >&2; exit 1; }
+	mkdir -p $(dir $(HUD_SHADER_OUTPUT))
+	"$(QSB)" --qt6 -o $(HUD_SHADER_OUTPUT) $(HUD_SHADER_SOURCE)
+
+install-hud-assets: hud-shaders
 	install -Dm644 assets/quickshell/shell.qml $(QUICKSHELL_DIR)/shell.qml
 	install -Dm644 assets/quickshell/StateStore.qml $(QUICKSHELL_DIR)/StateStore.qml
 	install -Dm644 assets/quickshell/HudSurface.qml $(QUICKSHELL_DIR)/HudSurface.qml
+	install -Dm644 assets/quickshell/WavyHalo.qml $(QUICKSHELL_DIR)/WavyHalo.qml
+	install -Dm644 $(HUD_SHADER_OUTPUT) $(QUICKSHELL_DIR)/shaders/wavy-halo.frag.qsb
+
+install: build install-hud-assets
+	install -Dm755 target/release/voice-input $(BIN_DIR)/voice-input
 	rm -rf $(QUICKSHELL_SETTINGS_DIR)
 	install -d -m755 $(QUICKSHELL_SETTINGS_DIR)
 	cp -a assets/quickshell-settings/. $(QUICKSHELL_SETTINGS_DIR)/

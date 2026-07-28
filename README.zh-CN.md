@@ -38,6 +38,7 @@ flowchart LR
 - 使用 Hyprland 与 Wayland 的 Arch Linux / Omarchy
 - Rust toolchain、PipeWire（`pw-record`）、`wtype`、`wl-clipboard`
 - HUD 和 Settings 使用 [Quickshell](https://quickshell.org/)
+- 安装时使用 Qt Shader Tools（Arch 软件包为 `qt6-shadertools`）编译 HUD 光晕；非标准 Qt 安装可通过 `QSB=/path/to/qsb` 指定工具
 - 可选：本地 fallback 使用 `/usr/bin/voxtype`；XWayland 使用 `xclip` + `xdotool`
 
 ### 安装

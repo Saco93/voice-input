@@ -1,7 +1,7 @@
 use std::{
     collections::VecDeque,
     fs,
-    io::{ErrorKind, Write},
+    io::{ErrorKind, Read, Write},
     os::unix::{
         fs::PermissionsExt,
         net::{UnixListener, UnixStream},
@@ -16,6 +16,7 @@ use anyhow::{Context, Result};
 use serde::Serialize;
 
 pub const WAVEFORM_BAR_COUNT: usize = 30;
+pub const SPECTRUM_BAND_COUNT: usize = 12;
 pub const ANALYSIS_WINDOW_SAMPLES: usize = 512;
 pub const ANALYSIS_HOP_SAMPLES: usize = 256;
 pub const ASR_PACKET_SAMPLES: usize = 2_048;
@@ -39,6 +40,20 @@ const PITCH_NEUTRAL: f32 = 0.35;
 const TIMBRE_CUTOFF_HZ: f32 = 1_400.0;
 const TIMBRE_MIN_RATIO: f32 = 0.08;
 const TIMBRE_MAX_RATIO: f32 = 0.65;
+const SPECTRUM_MIN_FREQUENCY: f32 = 80.0;
+const SPECTRUM_MAX_FREQUENCY: f32 = 6_000.0;
+const SPECTRUM_DYNAMIC_RANGE_DB: f32 = 36.0;
+const SPECTRUM_ATTACK_SECONDS: f32 = 0.14;
+const SPECTRUM_RELEASE_SECONDS: f32 = 0.5;
+const SPECTRAL_FLUX_ATTACK_SECONDS: f32 = 0.12;
+const SPECTRAL_FLUX_RELEASE_SECONDS: f32 = 0.5;
+const SPECTRAL_CENTROID_ATTACK_SECONDS: f32 = 0.18;
+const SPECTRAL_CENTROID_RELEASE_SECONDS: f32 = 0.55;
+const SPEECH_PACE_DECAY_SECONDS: f32 = 1.2;
+const SPEECH_PACE_ONSET_THRESHOLD: f32 = 0.12;
+const SPEECH_PACE_REARM_THRESHOLD: f32 = 0.084;
+const SPEECH_PACE_ONSET_INCREMENT: f32 = 0.32;
+const SPEECH_PACE_REFRACTORY_SECONDS: f32 = 0.12;
 // Below this RMS the window is treated as silence and pitch/timbre estimates
 // are discarded, because measurements of background noise are meaningless.
 const ANALYSIS_MIN_RMS: f32 = 0.005;
@@ -57,6 +72,18 @@ pub struct WaveformFrame {
     /// Normalized brightness (high-band energy ratio), 0..1. Low values are
     /// muffled/voiced content, high values are bright or fricative content.
     pub timbre: f32,
+    /// Smoothed relative energy in twelve logarithmic bands from roughly
+    /// 80 Hz to 6 kHz. The strongest active band approaches one.
+    pub spectrum: [f32; SPECTRUM_BAND_COUNT],
+    /// Positive frame-to-frame spectrum change, normalized to 0..1. This
+    /// captures onsets and articulation independently of the speaker's voice.
+    pub spectral_flux: f32,
+    /// Display-envelope-weighted position across the log-frequency bands,
+    /// normalized to 0..1 for visual color mapping.
+    pub spectral_centroid: f32,
+    /// Leaky density of distinct spectral onsets. Unlike average flux, this
+    /// separates sparse slow articulation from dense fast speech.
+    pub speech_pace: f32,
 }
 
 #[derive(Debug)]
@@ -68,6 +95,13 @@ pub struct WaveformAnalyzer {
     overall_level: f32,
     pitch_level: f32,
     timbre_level: f32,
+    spectrum_levels: [f32; SPECTRUM_BAND_COUNT],
+    previous_spectrum: [f32; SPECTRUM_BAND_COUNT],
+    spectral_flux_level: f32,
+    spectral_centroid_level: f32,
+    speech_pace_level: f32,
+    speech_pace_onset_armed: bool,
+    seconds_since_pace_onset: f32,
 }
 
 impl WaveformAnalyzer {
@@ -80,6 +114,13 @@ impl WaveformAnalyzer {
             overall_level: VISIBLE_FLOOR,
             pitch_level: PITCH_NEUTRAL,
             timbre_level: 0.0,
+            spectrum_levels: [0.0; SPECTRUM_BAND_COUNT],
+            previous_spectrum: [0.0; SPECTRUM_BAND_COUNT],
+            spectral_flux_level: 0.0,
+            spectral_centroid_level: 0.5,
+            speech_pace_level: 0.0,
+            speech_pace_onset_armed: true,
+            seconds_since_pace_onset: SPEECH_PACE_REFRACTORY_SECONDS,
         }
     }
 
@@ -161,11 +202,85 @@ impl WaveformAnalyzer {
                     TIMBRE_RELEASE_SECONDS,
                 );
 
+                let spectrum_target = if analyzed {
+                    spectrum_profile(&window, self.sample_rate)
+                } else {
+                    [0.0; SPECTRUM_BAND_COUNT]
+                };
+                let flux_target = if analyzed {
+                    spectrum_target
+                        .iter()
+                        .zip(self.previous_spectrum.iter())
+                        .map(|(current, previous)| (current - previous).max(0.0))
+                        .sum::<f32>()
+                        / SPECTRUM_BAND_COUNT as f32
+                        * 3.5
+                } else {
+                    0.0
+                }
+                .clamp(0.0, 1.0);
+                let spectrum_sum = spectrum_target.iter().sum::<f32>();
+                let centroid_target = if analyzed && spectrum_sum > f32::EPSILON {
+                    spectrum_target
+                        .iter()
+                        .enumerate()
+                        .map(|(index, energy)| {
+                            *energy * index as f32 / (SPECTRUM_BAND_COUNT - 1) as f32
+                        })
+                        .sum::<f32>()
+                        / spectrum_sum
+                } else {
+                    0.5
+                };
+                self.previous_spectrum = spectrum_target;
+                smooth(
+                    &mut self.spectral_flux_level,
+                    flux_target,
+                    frame_seconds,
+                    SPECTRAL_FLUX_ATTACK_SECONDS,
+                    SPECTRAL_FLUX_RELEASE_SECONDS,
+                );
+                smooth(
+                    &mut self.spectral_centroid_level,
+                    centroid_target,
+                    frame_seconds,
+                    SPECTRAL_CENTROID_ATTACK_SECONDS,
+                    SPECTRAL_CENTROID_RELEASE_SECONDS,
+                );
+                self.speech_pace_level *= (-frame_seconds / SPEECH_PACE_DECAY_SECONDS).exp();
+                self.seconds_since_pace_onset += frame_seconds;
+                if self.spectral_flux_level < SPEECH_PACE_REARM_THRESHOLD {
+                    self.speech_pace_onset_armed = true;
+                }
+                if analyzed
+                    && self.speech_pace_onset_armed
+                    && self.spectral_flux_level >= SPEECH_PACE_ONSET_THRESHOLD
+                    && self.seconds_since_pace_onset >= SPEECH_PACE_REFRACTORY_SECONDS
+                {
+                    self.speech_pace_level =
+                        (self.speech_pace_level + SPEECH_PACE_ONSET_INCREMENT).min(1.0);
+                    self.speech_pace_onset_armed = false;
+                    self.seconds_since_pace_onset = 0.0;
+                }
+                for (level, target) in self.spectrum_levels.iter_mut().zip(spectrum_target.iter()) {
+                    smooth(
+                        level,
+                        *target,
+                        frame_seconds,
+                        SPECTRUM_ATTACK_SECONDS,
+                        SPECTRUM_RELEASE_SECONDS,
+                    );
+                }
+
                 frames.push(WaveformFrame {
                     bars: mirrored_bars(&self.half_levels),
                     level: self.overall_level,
                     pitch: self.pitch_level,
                     timbre: self.timbre_level,
+                    spectrum: self.spectrum_levels,
+                    spectral_flux: self.spectral_flux_level,
+                    spectral_centroid: self.spectral_centroid_level,
+                    speech_pace: self.speech_pace_level,
                 });
             }
         }
@@ -234,6 +349,67 @@ fn high_band_ratio(window: &[i16], sample_rate: u32) -> f32 {
     }
 }
 
+/// Relative energy in logarithmically spaced voice bands. Three Goertzel
+/// probes per band capture broad formants without adding an FFT dependency.
+fn spectrum_profile(window: &[i16], sample_rate: u32) -> [f32; SPECTRUM_BAND_COUNT] {
+    let mut profile = [0.0_f32; SPECTRUM_BAND_COUNT];
+    if window.len() < 2 || sample_rate == 0 {
+        return profile;
+    }
+
+    let denominator = (window.len() - 1) as f32;
+    let windowed = window
+        .iter()
+        .enumerate()
+        .map(|(index, sample)| {
+            let hann = 0.5 - 0.5 * (2.0 * std::f32::consts::PI * index as f32 / denominator).cos();
+            *sample as f32 / i16::MAX as f32 * hann
+        })
+        .collect::<Vec<_>>();
+    let maximum_frequency = SPECTRUM_MAX_FREQUENCY
+        .min(sample_rate as f32 * 0.45)
+        .max(SPECTRUM_MIN_FREQUENCY * 1.01);
+    let octave_ratio = maximum_frequency / SPECTRUM_MIN_FREQUENCY;
+
+    for (band, power) in profile.iter_mut().enumerate() {
+        let lower =
+            SPECTRUM_MIN_FREQUENCY * octave_ratio.powf(band as f32 / SPECTRUM_BAND_COUNT as f32);
+        let upper = SPECTRUM_MIN_FREQUENCY
+            * octave_ratio.powf((band + 1) as f32 / SPECTRUM_BAND_COUNT as f32);
+        let band_ratio = upper / lower;
+        for probe in 0..3 {
+            let frequency = lower * band_ratio.powf((probe as f32 + 0.5) / 3.0);
+            *power += goertzel_power(&windowed, sample_rate, frequency);
+        }
+        *power /= 3.0;
+    }
+
+    let maximum_power = profile.iter().copied().fold(0.0_f32, f32::max);
+    if maximum_power <= f32::EPSILON {
+        return [0.0; SPECTRUM_BAND_COUNT];
+    }
+    for power in &mut profile {
+        let relative_db = 10.0 * ((*power + 1.0e-12) / maximum_power).log10();
+        *power = (1.0 + relative_db / SPECTRUM_DYNAMIC_RANGE_DB).clamp(0.0, 1.0);
+    }
+    profile
+}
+
+fn goertzel_power(samples: &[f32], sample_rate: u32, frequency: f32) -> f32 {
+    let omega = 2.0 * std::f32::consts::PI * frequency / sample_rate as f32;
+    let coefficient = 2.0 * omega.cos();
+    let mut previous = 0.0_f32;
+    let mut previous_two = 0.0_f32;
+    for sample in samples {
+        let current = *sample + coefficient * previous - previous_two;
+        previous_two = previous;
+        previous = current;
+    }
+    let power =
+        previous * previous + previous_two * previous_two - coefficient * previous * previous_two;
+    power.max(0.0) / (samples.len() * samples.len()) as f32
+}
+
 #[derive(Debug, Default)]
 pub struct AsrPacketizer {
     pending: Vec<i16>,
@@ -284,6 +460,14 @@ struct WireMessage<'a> {
     pitch: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     timbre: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    spectrum: Option<&'a [f32; SPECTRUM_BAND_COUNT]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    spectral_flux: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    spectral_centroid: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    speech_pace: Option<f32>,
 }
 
 impl WaveformPublisher {
@@ -363,6 +547,10 @@ impl WaveformPublisher {
                                 level: Some(frame.level),
                                 pitch: Some(frame.pitch),
                                 timbre: Some(frame.timbre),
+                                spectrum: Some(&frame.spectrum),
+                                spectral_flux: Some(frame.spectral_flux),
+                                spectral_centroid: Some(frame.spectral_centroid),
+                                speech_pace: Some(frame.speech_pace),
                             })
                         }
                         PublisherMessage::Reset { session_id } => {
@@ -374,6 +562,10 @@ impl WaveformPublisher {
                                 level: None,
                                 pitch: None,
                                 timbre: None,
+                                spectrum: None,
+                                spectral_flux: None,
+                                spectral_centroid: None,
+                                speech_pace: None,
                             })
                         }
                     };
@@ -407,6 +599,16 @@ impl WaveformPublisher {
 }
 
 fn accept_clients(listener: &UnixListener, clients: &mut Vec<UnixStream>) {
+    // A disconnected nonblocking client was previously retained until the next
+    // waveform broadcast. Repeated HUD restarts while idle could therefore fill
+    // every slot and leave the current HUD without live voice metrics.
+    let mut probe = [0_u8; 1];
+    clients.retain_mut(|client| match client.read(&mut probe) {
+        Ok(0) => false,
+        Ok(_) => true,
+        Err(error) => error.kind() == ErrorKind::WouldBlock,
+    });
+
     loop {
         match listener.accept() {
             Ok((stream, _)) => {
@@ -469,7 +671,8 @@ mod tests {
 
     use super::{
         ANALYSIS_HOP_SAMPLES, ANALYSIS_WINDOW_SAMPLES, ASR_PACKET_SAMPLES, AsrPacketizer,
-        VISIBLE_FLOOR, WAVEFORM_BAR_COUNT, WaveformAnalyzer, WaveformFrame, WaveformPublisher,
+        SPECTRUM_BAND_COUNT, VISIBLE_FLOOR, WAVEFORM_BAR_COUNT, WaveformAnalyzer, WaveformFrame,
+        WaveformPublisher, spectrum_profile,
     };
 
     #[test]
@@ -528,6 +731,12 @@ mod tests {
         // does not jump when speech starts.
         assert!((frames[0].pitch - 0.35).abs() < f32::EPSILON);
         assert!(frames[0].timbre.abs() < f32::EPSILON);
+        assert!(
+            frames[0]
+                .spectrum
+                .iter()
+                .all(|band| band.abs() < f32::EPSILON)
+        );
     }
 
     fn sine_wave(frequency_hz: f32, amplitude: i16, sample_rate: u32, count: usize) -> Vec<i16> {
@@ -568,6 +777,41 @@ mod tests {
             deep_frame.timbre,
             bright_frame.timbre
         );
+        assert!(
+            deep_frame.spectrum.iter().copied().fold(0.0, f32::max) > 0.8,
+            "voiced audio must produce a normalized spectrum"
+        );
+        assert!(
+            bright_frame.spectral_centroid > deep_frame.spectral_centroid + 0.25,
+            "bright content must raise spectral centroid: deep={} bright={}",
+            deep_frame.spectral_centroid,
+            bright_frame.spectral_centroid
+        );
+    }
+
+    #[test]
+    fn spectrum_tracks_low_and_high_frequency_regions() {
+        let sample_rate = 16_000;
+        let low = sine_wave(140.0, 12_000, sample_rate, ANALYSIS_WINDOW_SAMPLES);
+        let high = sine_wave(3_200.0, 12_000, sample_rate, ANALYSIS_WINDOW_SAMPLES);
+        let low_profile = spectrum_profile(&low, sample_rate);
+        let high_profile = spectrum_profile(&high, sample_rate);
+        let peak_index = |profile: &[f32; SPECTRUM_BAND_COUNT]| {
+            profile
+                .iter()
+                .enumerate()
+                .max_by(|(_, left), (_, right)| left.total_cmp(right))
+                .map(|(index, _)| index)
+                .unwrap()
+        };
+        let low_peak = peak_index(&low_profile);
+        let high_peak = peak_index(&high_profile);
+
+        assert!(low_peak <= 3, "140 Hz peak landed in band {low_peak}");
+        assert!(high_peak >= 8, "3.2 kHz peak landed in band {high_peak}");
+        assert!(high_peak >= low_peak + 6);
+        assert!(low_profile.iter().all(|value| value.is_finite()));
+        assert!(high_profile.iter().all(|value| value.is_finite()));
     }
 
     #[test]
@@ -587,6 +831,10 @@ mod tests {
                 level: 0.5,
                 pitch: 0.4,
                 timbre: 0.25,
+                spectrum: [0.75; SPECTRUM_BAND_COUNT],
+                spectral_flux: 0.6,
+                spectral_centroid: 0.7,
+                speech_pace: 0.4,
             },
         );
 
@@ -602,6 +850,13 @@ mod tests {
         assert_eq!(payload["level"].as_f64().unwrap(), 0.5);
         assert_eq!(payload["pitch"].as_f64().unwrap(), 0.4);
         assert_eq!(payload["timbre"].as_f64().unwrap(), 0.25);
+        assert_eq!(
+            payload["spectrum"].as_array().unwrap().len(),
+            SPECTRUM_BAND_COUNT
+        );
+        assert!((payload["spectral_flux"].as_f64().unwrap() - 0.6).abs() < 1.0e-6);
+        assert!((payload["spectral_centroid"].as_f64().unwrap() - 0.7).abs() < 1.0e-6);
+        assert!((payload["speech_pace"].as_f64().unwrap() - 0.4).abs() < 1.0e-6);
     }
 
     #[test]
