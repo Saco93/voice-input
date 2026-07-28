@@ -286,7 +286,6 @@ struct ActiveCaptureSession {
     audio_buffer: Arc<Mutex<Vec<i16>>>,
     capture_ready: Arc<AtomicBool>,
     asr_ready: Arc<AtomicBool>,
-    voice_active: Arc<AtomicBool>,
     asr_control_tx: Option<mpsc::Sender<backend::AsrControl>>,
     asr_packetizer: Option<Arc<Mutex<AsrPacketizer>>>,
     waveform_analyzer: Arc<Mutex<WaveformAnalyzer>>,
@@ -554,7 +553,6 @@ impl Daemon {
                 audio_buffer: audio_buffer.clone(),
                 capture_ready: capture_ready.clone(),
                 asr_ready: asr_ready.clone(),
-                voice_active: voice_active.clone(),
                 asr_control_tx,
                 asr_packetizer: asr_packetizer.clone(),
                 waveform_analyzer: waveform_analyzer.clone(),
@@ -581,7 +579,6 @@ impl Daemon {
                     audio_buffer: audio_buffer.clone(),
                     capture_ready,
                     asr_ready,
-                    voice_active,
                     asr_control_tx,
                     asr_packetizer: asr_packetizer.clone(),
                     waveform_analyzer,
@@ -1161,7 +1158,10 @@ fn run_capture_service(
                 .waveform_analyzer
                 .lock()
                 .expect("waveform analyzer mutex poisoned")
-                .push(&chunk, active.voice_active.load(Ordering::Relaxed));
+                // HUD analysis is local and must remain responsive even when
+                // the remote server VAD misses a new speech-start event after
+                // a pause or an external desktop interaction.
+                .push(&chunk, true);
             for frame in frames {
                 active.waveform.try_publish(active.session_id, frame);
             }
@@ -1181,7 +1181,6 @@ struct ReaderThreadContext {
     audio_buffer: Arc<Mutex<Vec<i16>>>,
     capture_ready: Arc<AtomicBool>,
     asr_ready: Arc<AtomicBool>,
-    voice_active: Arc<AtomicBool>,
     asr_control_tx: Option<mpsc::Sender<backend::AsrControl>>,
     asr_packetizer: Option<Arc<Mutex<AsrPacketizer>>>,
     waveform_analyzer: Arc<Mutex<WaveformAnalyzer>>,
@@ -1202,7 +1201,6 @@ fn spawn_reader_thread(
             audio_buffer,
             capture_ready,
             asr_ready,
-            voice_active,
             asr_control_tx,
             asr_packetizer,
             waveform_analyzer,
@@ -1263,7 +1261,9 @@ fn spawn_reader_thread(
             let frames = waveform_analyzer
                 .lock()
                 .expect("waveform analyzer mutex poisoned")
-                .push(&chunk, voice_active.load(Ordering::Relaxed));
+                // Keep visual analysis independent of remote VAD state. The
+                // analyzer's RMS floor suppresses silence locally.
+                .push(&chunk, true);
             for frame in frames {
                 waveform.try_publish(session_id, frame);
             }

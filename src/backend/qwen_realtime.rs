@@ -280,17 +280,21 @@ fn run_session(
             }
         }
 
-        // Qwen's server VAD occasionally accepts audio without emitting any
-        // speech or transcription events. Commit a buffered chunk after three
-        // seconds of transcription inactivity so the HUD still receives
-        // incremental segment results while preserving normal server-VAD flow.
+        // Qwen's server VAD occasionally accepts initial audio without any
+        // speech or transcription event. Allow one recovery commit only before
+        // the server has demonstrated normal VAD/transcription activity. A
+        // commit after an established segment can prevent a later speech turn
+        // from producing partials until session.finish.
         let forced_commit_min_samples = (spec.sample_rate_hz as usize) * 3;
-        if !finish_requested
-            && matches!(config.asr.alibaba.turn_mode, AlibabaTurnMode::ServerVad)
-            && !forced_commit_in_flight
-            && samples_since_commit >= forced_commit_min_samples
-            && last_transcription_activity.elapsed() >= Duration::from_secs(3)
-        {
+        if should_force_initial_commit(
+            finish_requested,
+            matches!(config.asr.alibaba.turn_mode, AlibabaTurnMode::ServerVad),
+            forced_commit_in_flight,
+            forced_commit_count > 0,
+            speech_started_count > 0 || partial_event_count > 0 || completed_event_count > 0,
+            samples_since_commit >= forced_commit_min_samples,
+            last_transcription_activity.elapsed() >= Duration::from_secs(3),
+        ) {
             send_json(
                 &mut socket,
                 json!({
@@ -317,6 +321,24 @@ fn run_session(
             thread::sleep(Duration::from_millis(10));
         }
     }
+}
+
+fn should_force_initial_commit(
+    finish_requested: bool,
+    server_vad: bool,
+    forced_commit_in_flight: bool,
+    has_forced_commit: bool,
+    has_server_activity: bool,
+    has_minimum_audio: bool,
+    inactive_long_enough: bool,
+) -> bool {
+    !finish_requested
+        && server_vad
+        && !forced_commit_in_flight
+        && !has_forced_commit
+        && !has_server_activity
+        && has_minimum_audio
+        && inactive_long_enough
 }
 
 fn send_json(socket: &mut QwenSocket, payload: Value) -> Result<()> {
@@ -581,7 +603,29 @@ fn push_transcript_piece(target: &mut String, piece: &str) {
 
 #[cfg(test)]
 mod tests {
-    use super::{Message, TranscriptAssembler, parse_server_event, push_transcript_piece};
+    use super::{
+        Message, TranscriptAssembler, parse_server_event, push_transcript_piece,
+        should_force_initial_commit,
+    };
+
+    #[test]
+    fn forced_commit_is_only_an_initial_no_event_recovery() {
+        let eligible = |has_server_activity, has_forced_commit| {
+            should_force_initial_commit(
+                false,
+                true,
+                false,
+                has_forced_commit,
+                has_server_activity,
+                true,
+                true,
+            )
+        };
+
+        assert!(eligible(false, false));
+        assert!(!eligible(true, false));
+        assert!(!eligible(false, true));
+    }
 
     #[test]
     fn parses_partial_event() {
