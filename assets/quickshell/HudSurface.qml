@@ -53,23 +53,27 @@ PanelWindow {
     readonly property bool recording: store.phase === "recording"
     readonly property bool finalizing: store.phase === "transcribing"
     readonly property bool refining: store.phase === "refining"
+    readonly property bool outputting: store.phase === "outputting"
     // Post-recording stages get a quiet breathing glow so the capsule stays
-    // visibly alive while the pipeline finishes.
-    readonly property bool processing: finalizing || refining
+    // visibly alive while the pipeline finishes and sends the result.
+    readonly property bool processing: finalizing || refining || outputting
     property real vizClock: 0
     property real breathCycles: 0
     property real levelSmoothed: 0
     property real pitchSmoothed: 0.35
     property real timbreSmoothed: 0.5
-    // Final ASR breathes more slowly than refinement. Both remain gentler than
-    // the pitch-responsive recording animation.
-    readonly property real breathHz: recording ? 0.8 + pitchSmoothed * 3.2 : finalizing ? 0.36 : refining ? 0.52 : 1.1
+    // Final ASR breathes more slowly than refinement; the usually brief output
+    // stage is quicker but still gentler than the recording animation.
+    readonly property real breathHz: recording ? 0.8 + pitchSmoothed * 3.2 : finalizing ? 0.36 : refining ? 0.52 : outputting ? 0.7 : 1.1
     readonly property real breathPhase: 0.5 + 0.5 * Math.sin(breathCycles * 2 * Math.PI)
-    // Both envelopes have zero slope at their dim and bright endpoints. Refine
-    // uses a softer exponent so it dwells near peak brightness a little longer.
+    // All envelopes have zero slope at their dim and bright endpoints. Refine
+    // and output dwell near peak brightness so short phases remain legible.
     readonly property real processingPulse: {
         const cycle = breathCycles - Math.floor(breathCycles);
         const cosine = 0.5 - 0.5 * Math.cos(cycle * 2 * Math.PI);
+        if (outputting)
+            return Math.pow(cosine, 0.5);
+
         return refining ? Math.pow(cosine, 0.72) : cosine;
     }
     readonly property real glowStrength: {
@@ -85,6 +89,9 @@ PanelWindow {
         if (refining)
             return 0.42 + 0.34 * processingPulse;
 
+        if (outputting)
+            return 0.48 + 0.3 * processingPulse;
+
         return 0;
     }
     readonly property color glowColor: {
@@ -98,7 +105,10 @@ PanelWindow {
         const hue = ((shifted % 1) + 1) % 1;
         return Qt.hsla(hue, accent.hslSaturation, accent.hslLightness, 1);
     }
-    readonly property int maxTranscriptHeight: 88
+    // Keep a four-line viewport anchored to the newest text. Only the oldest
+    // visible row enters the top fade; the three rows below remain clear.
+    readonly property int transcriptViewportHeight: 68
+    readonly property int transcriptEdgeFadeHeight: 16
     readonly property int cardWidth: expanded ? 600 : 300
     // A newly mapped layer surface starts with a temporary 0x0 geometry until
     // Hyprland sends its configure event. Keep the capsule transparent during
@@ -108,14 +118,14 @@ PanelWindow {
         if (store.phase === "arming" || store.phase === "recording")
             return store.themeAccent;
 
-        if (finalizing || refining) {
+        if (processing) {
             const accent = store.themeAccent;
             if (accent.hslHue < 0)
                 return accent;
 
-            // Both processing stages use the theme accent hue. Final ASR is
-            // quieter and less saturated; refinement is the stronger variant.
-            const saturationScale = finalizing ? 0.58 : 1;
+            // Every processing stage uses the theme accent hue. Saturation and
+            // cadence distinguish Final ASR, refinement, and text delivery.
+            const saturationScale = finalizing ? 0.58 : outputting ? 0.8 : 1;
             const lightnessOffset = finalizing ? 0.05 : 0;
             return Qt.hsla(accent.hslHue, Math.min(1, accent.hslSaturation * saturationScale), Math.min(1, accent.hslLightness + lightnessOffset), 1);
         }
@@ -223,7 +233,7 @@ PanelWindow {
             id: transcriptViewport
 
             width: capsule.width - 40
-            height: Math.min(transcriptLabel.implicitHeight, panel.maxTranscriptHeight)
+            height: panel.transcriptViewportHeight
             anchors.centerIn: parent
             clip: true
 
@@ -238,10 +248,10 @@ PanelWindow {
                 // Gentle breathing on the status text reinforces that the
                 // pipeline is still preparing rather than listening.
                 opacity: panel.arming ? 0.7 + 0.3 * (0.5 + 0.5 * Math.sin(panel.vizClock * 3.2)) : 1
-                // Once the five-line viewport is full, keep the newest text
-                // visible by moving the complete transcript upward instead
-                // of eliding its tail.
-                y: Math.min(0, parent.height - implicitHeight)
+                // Center short transcripts in the clear middle area. Once the
+                // viewport fills, keep the newest text visible by moving the
+                // complete transcript upward instead of eliding its tail.
+                y: implicitHeight <= parent.height ? (parent.height - implicitHeight) / 2 : parent.height - implicitHeight
                 text: panel.displayText
                 color: "#eef2ff"
                 font.family: "Inter"
@@ -260,15 +270,13 @@ PanelWindow {
 
             }
 
-            // The capsule is a pill while this viewport is a rectangle, so the
-            // top and bottom text rows would poke past the curved border at
-            // the corners. Fade the text into the capsule background near
-            // those edges instead of clipping it hard.
+            // Fade only the oldest visible row near the top edge. The newest
+            // three rows, including the bottom row, remain fully unobscured.
             Rectangle {
                 anchors.left: parent.left
                 anchors.right: parent.right
                 anchors.top: parent.top
-                height: Math.max(0, Math.min(20, (parent.height - 20) / 2))
+                height: panel.transcriptEdgeFadeHeight
                 visible: height > 0
 
                 gradient: Gradient {
@@ -280,28 +288,6 @@ PanelWindow {
                     GradientStop {
                         position: 1
                         color: Qt.rgba(0.067, 0.078, 0.106, 0)
-                    }
-
-                }
-
-            }
-
-            Rectangle {
-                anchors.left: parent.left
-                anchors.right: parent.right
-                anchors.bottom: parent.bottom
-                height: Math.max(0, Math.min(20, (parent.height - 20) / 2))
-                visible: height > 0
-
-                gradient: Gradient {
-                    GradientStop {
-                        position: 0
-                        color: Qt.rgba(0.067, 0.078, 0.106, 0)
-                    }
-
-                    GradientStop {
-                        position: 1
-                        color: Qt.rgba(0.067, 0.078, 0.106, 1)
                     }
 
                 }
