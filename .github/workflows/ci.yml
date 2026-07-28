@@ -32,7 +32,8 @@ jobs:
           make install-hud-assets QSB=/usr/lib/qt6/bin/qsb QUICKSHELL_DIR="$stage"
           test -s "$stage/WavyHalo.qml"
           test -s "$stage/shaders/wavy-halo.frag.qsb"
-          /usr/lib/qt6/bin/qsb --dump "$stage/shaders/wavy-halo.frag.qsb" >/dev/null
+          shader_dump=$(/usr/lib/qt6/bin/qsb --dump "$stage/shaders/wavy-halo.frag.qsb")
+          grep -q 'GLSL' <<<"$shader_dump"
 
       - name: Cache Rust build
         uses: Swatinem/rust-cache@v2

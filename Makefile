@@ -23,7 +23,7 @@ run:
 hud-shaders:
 	@test -n "$(QSB)" || { printf '%s\n' 'Qt Shader Tools are required; install qt6-shadertools or set QSB=/path/to/qsb' >&2; exit 1; }
 	mkdir -p $(dir $(HUD_SHADER_OUTPUT))
-	"$(QSB)" -o $(HUD_SHADER_OUTPUT) $(HUD_SHADER_SOURCE)
+	"$(QSB)" --glsl "100 es,120,150" -o $(HUD_SHADER_OUTPUT) $(HUD_SHADER_SOURCE)
 
 install-hud-assets: hud-shaders
 	install -Dm644 assets/quickshell/shell.qml $(QUICKSHELL_DIR)/shell.qml
