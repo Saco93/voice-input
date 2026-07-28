@@ -198,10 +198,14 @@ void main()
     float shapedWave = smoothstep(0.04, 0.96, wave);
     float heightWave = clamp(pow(shapedWave, 0.82) * heightEnvelope, 0.0, 1.0);
 
-    // The twelve log-frequency bands replace the evenly spaced synthetic wave
-    // during speech. Quiet bands leave flat regions; energetic bands create
-    // wider local peaks, preserving the actual spectral envelope as it travels.
-    float spectralCoordinate = fract(perimeter - phase / max(perimeterLength, 1.0));
+    // Pin the twelve log-frequency bands to the straight top edge: low bands
+    // remain on the left and high bands on the right. The rounded corners and
+    // other three edges retain only the ambient breathing halo.
+    float topEdgeFraction = straightWidth / max(perimeterLength, 1.0);
+    float topEdgePosition = perimeter / max(topEdgeFraction, 0.00001);
+    float topEdgeMask = smoothstep(0.0, 0.045, topEdgePosition)
+        * (1.0 - smoothstep(0.955, 1.0, topEdgePosition));
+    float spectralCoordinate = clamp(topEdgePosition, 0.0, 1.0);
     float band0 = clamp(spectrum0.x, 0.0, 1.0);
     float band1 = clamp(spectrum0.y, 0.0, 1.0);
     float band2 = clamp(spectrum0.z, 0.0, 1.0);
@@ -214,52 +218,64 @@ void main()
     float band9 = clamp(spectrum2.y, 0.0, 1.0);
     float band10 = clamp(spectrum2.z, 0.0, 1.0);
     float band11 = clamp(spectrum2.w, 0.0, 1.0);
-    float spectralWave = smoothstep(0.06, 0.88, spectrumEnvelope(spectralCoordinate));
+    // Expand the middle of the measured envelope so adjacent quiet and
+    // energetic bands produce a visibly deeper geometric height difference.
+    float spectralWave = smoothstep(0.48, 0.96, spectrumEnvelope(spectralCoordinate));
+    spectralWave = pow(spectralWave, 1.35);
     float spectralPresence = max(max(max(band0, band1), max(band2, band3)),
         max(max(max(band4, band5), max(band6, band7)),
             max(max(band8, band9), max(band10, band11))));
-    float spectralBlend = activity * smoothstep(0.02, 0.25, spectralPresence) * 0.92;
+    // `activity` is already a calibrated nonlinear voice estimate. Turn it
+    // into a presence gate once instead of multiplying the spectrum and reach
+    // by the same small value twice, which flattened ordinary speech.
+    float speechPresence = smoothstep(0.015, 0.18, activity);
+    float spectralBlend = speechPresence
+        * smoothstep(0.02, 0.25, spectralPresence) * 0.98;
     heightWave = mix(heightWave, spectralWave, spectralBlend);
 
-    // The halo always occupies a visible breathing radius. Speech can only
-    // expand from this baseline; the spectrum shapes the additional reach but
-    // never switches the glow between absent and present.
-    float ambientReach = mix(8.0, 15.0, normalizedBreath) + 2.0 * heightWave;
+    // Keep a small uniform breathing radius around the complete capsule. Only
+    // the top-edge mask is allowed to expand into the measured spectrum.
+    float ambientReach = mix(5.0, 9.0, normalizedBreath);
     float reachPulse = clamp(0.55 * activity + 0.75 * normalizedFlux, 0.0, 1.0);
     float maximumActiveReach = max(
         ambientReach + 3.0,
-        mix(24.0, 20.0, normalizedPitch) * mix(0.78, 1.0, reachPulse)
+        mix(50.0, 42.0, normalizedPitch) * mix(0.84, 1.0, reachPulse)
     );
-    float activeReach = mix(ambientReach + 2.0, maximumActiveReach, heightWave);
-    float localReach = mix(ambientReach, activeReach, activity);
+    float activeReach = mix(ambientReach, maximumActiveReach, heightWave);
+    float topSpectrumDrive = topEdgeMask * speechPresence;
+    float localReach = mix(ambientReach, activeReach, topSpectrumDrive);
     float antialias = max(fwidth(distanceToCapsule), 0.5);
     float outside = smoothstep(-antialias, antialias, distanceToCapsule);
     float falloff = 1.0 - smoothstep(0.0, localReach, distanceToCapsule);
     falloff *= falloff;
 
-    float ambientContrast = mix(0.52, 1.0, heightWave);
-    float activeContrast = mix(0.08, 1.0, pow(heightWave, 0.7));
+    // Keep troughs visible enough to read as low waveform regions instead of
+    // flicker, while peak height carries most of the spectral contrast.
+    float activeContrast = mix(0.18, 1.0, pow(heightWave, 0.7));
     float normalizedStrength = clamp(strength, 0.0, 1.0);
-    float brightness = normalizedStrength
+    float ambientBrightness = normalizedStrength
+        * mix(0.28, 0.42, normalizedBreath);
+    float activeBrightness = normalizedStrength
         * mix(0.85, 1.0, activity)
-        * mix(ambientContrast, activeContrast, activity)
+        * activeContrast
         * mix(0.90, 1.0, normalizedFlux);
+    float brightness = mix(ambientBrightness, activeBrightness, topSpectrumDrive);
     float waveAlpha = outside * falloff * brightness * haloColor.a;
 
-    // A narrow continuous foot keeps every moving lobe optically attached to
+    // A narrow continuous foot keeps every spectral lobe optically attached to
     // the capsule even when the local wave contrast reaches a deep trough.
-    float anchorReach = mix(6.0, 10.0, normalizedBreath) + activity;
+    float anchorReach = mix(4.0, 7.0, normalizedBreath) + activity;
     float anchorFalloff = 1.0 - smoothstep(0.0, anchorReach, distanceToCapsule);
     anchorFalloff *= anchorFalloff;
     float anchorAlpha = outside * anchorFalloff * normalizedStrength
-        * mix(0.42, 0.58, activity) * haloColor.a;
+        * mix(0.24, 0.34, activity) * haloColor.a;
     float alpha = max(waveAlpha, anchorAlpha);
 
     // Bright spectral content adds a pale highlight to active peaks while the
     // QML halo color continues to shift hue with the smoothed timbre estimate.
     float spectralTone = mix(normalizedTimbre, normalizedCentroid, 0.55);
-    float spectralHighlight = activity * spectralTone * pow(heightWave, 0.6)
-        + 0.08 * normalizedFlux;
+    float spectralHighlight = topSpectrumDrive * spectralTone * pow(heightWave, 0.6)
+        + 0.08 * normalizedFlux * topEdgeMask;
     vec3 localColor = haloColor.rgb * mix(0.84, 1.0, heightWave);
     localColor = mix(localColor, vec3(1.0), 0.18 * spectralHighlight);
     fragColor = vec4(localColor * alpha, alpha) * qt_Opacity;

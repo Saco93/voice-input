@@ -18,7 +18,7 @@ ShaderEffect {
     required property real spectralFlux
     required property real spectralCentroid
     required property real breath
-    readonly property real haloPadding: 32
+    readonly property real haloPadding: 54
     readonly property real effectWidth: width
     readonly property real effectHeight: height
 

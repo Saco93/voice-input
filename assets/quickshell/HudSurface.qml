@@ -87,7 +87,7 @@ PanelWindow {
     // arrive; acoustic onset density provides immediate fallback at startup.
     readonly property real transcriptPaceConfidence: Math.min(1, lastTranscriptUnits / 6)
     readonly property real effectiveSpeechPace: speechPaceSmoothed * (1 - 0.8 * transcriptPaceConfidence) + transcriptPaceSmoothed * 0.8 * transcriptPaceConfidence
-    readonly property real waveTravelSpeed: recording ? 36 + 12 * voiceActivity + 72 * effectiveSpeechPace : 36
+    readonly property real waveTravelSpeed: recording ? 72 + 12 * voiceActivity + 120 * effectiveSpeechPace : 72
     readonly property real breathPhase: 0.5 + 0.5 * Math.sin(breathCycles * 2 * Math.PI)
     // All envelopes have zero slope at their dim and bright endpoints. Refine
     // and output dwell near peak brightness so short phases remain legible.
@@ -295,9 +295,8 @@ PanelWindow {
         visible: !panel.recording
     }
 
-    // Listening uses a procedural rounded-rectangle distance field. Its local
-    // reach changes continuously around the perimeter instead of stretching a
-    // single ellipse, creating a voice-driven traveling wave.
+    // Listening pins the live spectrum to the straight top edge while the
+    // remaining perimeter keeps only a restrained ambient breathing halo.
     WavyHalo {
         id: recordingHalo
 
@@ -309,9 +308,8 @@ PanelWindow {
         level: panel.voiceActivity
         pitch: panel.pitchSmoothed
         timbre: panel.timbreSmoothed
-        // Pass traveled pixels rather than an angular phase. The shader maps
-        // this distance onto the live capsule perimeter, keeping speed stable
-        // as pitch changes the number of peaks.
+        // Phase shapes only the sub-threshold ambient profile; the visible
+        // speech spectrum itself remains fixed to the top edge.
         phase: panel.waveTravel
         strength: panel.glowStrength
         haloColor: panel.glowColor
@@ -332,8 +330,8 @@ PanelWindow {
         anchors.fill: recordingHalo
         source: recordingHalo
         blurEnabled: true
-        blur: 1
-        blurMax: 8
+        blur: 0.55
+        blurMax: 6
         autoPaddingEnabled: true
         opacity: capsule.opacity
         visible: panel.recording

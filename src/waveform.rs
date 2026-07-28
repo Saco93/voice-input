@@ -41,7 +41,9 @@ const TIMBRE_CUTOFF_HZ: f32 = 1_400.0;
 const TIMBRE_MIN_RATIO: f32 = 0.08;
 const TIMBRE_MAX_RATIO: f32 = 0.65;
 const SPECTRUM_MIN_FREQUENCY: f32 = 80.0;
-const SPECTRUM_MAX_FREQUENCY: f32 = 6_000.0;
+// Concentrate the display bands on the range that carries the visible energy
+// of ordinary speech instead of reserving much of the HUD for sparse highs.
+const SPECTRUM_MAX_FREQUENCY: f32 = 3_200.0;
 const SPECTRUM_DYNAMIC_RANGE_DB: f32 = 36.0;
 const SPECTRUM_ATTACK_SECONDS: f32 = 0.14;
 const SPECTRUM_RELEASE_SECONDS: f32 = 0.5;
@@ -793,7 +795,7 @@ mod tests {
     fn spectrum_tracks_low_and_high_frequency_regions() {
         let sample_rate = 16_000;
         let low = sine_wave(140.0, 12_000, sample_rate, ANALYSIS_WINDOW_SAMPLES);
-        let high = sine_wave(3_200.0, 12_000, sample_rate, ANALYSIS_WINDOW_SAMPLES);
+        let high = sine_wave(2_800.0, 12_000, sample_rate, ANALYSIS_WINDOW_SAMPLES);
         let low_profile = spectrum_profile(&low, sample_rate);
         let high_profile = spectrum_profile(&high, sample_rate);
         let peak_index = |profile: &[f32; SPECTRUM_BAND_COUNT]| {
@@ -808,7 +810,7 @@ mod tests {
         let high_peak = peak_index(&high_profile);
 
         assert!(low_peak <= 3, "140 Hz peak landed in band {low_peak}");
-        assert!(high_peak >= 8, "3.2 kHz peak landed in band {high_peak}");
+        assert!(high_peak >= 8, "2.8 kHz peak landed in band {high_peak}");
         assert!(high_peak >= low_peak + 6);
         assert!(low_profile.iter().all(|value| value.is_finite()));
         assert!(high_profile.iter().all(|value| value.is_finite()));
