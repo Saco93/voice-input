@@ -26,8 +26,11 @@ pub fn run() -> Result<()> {
             daemon::run(config)
         }
         ParsedCommand::Record(action) => {
+            // Capture toggle age before output-target detection, which may
+            // block behind the dictation currently finishing.
+            let requested_at_ms = daemon::control_request_timestamp_ms();
             let command = record_control_command(action);
-            let response = daemon::send_record_command(&command)?;
+            let response = daemon::send_record_command(&command, requested_at_ms)?;
             print!("{response}");
             Ok(())
         }

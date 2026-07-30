@@ -57,6 +57,7 @@ PanelWindow {
     // Post-recording stages get a quiet breathing glow so the capsule stays
     // visibly alive while the pipeline finishes and sends the result.
     readonly property bool processing: finalizing || refining || outputting
+    readonly property real haloStage: arming ? 0 : recording ? 1 : finalizing ? 2 : refining ? 3 : outputting ? 4 : -1
     property real vizClock: 0
     property real paceClock: 0
     property real waveTravel: 0
@@ -129,8 +130,8 @@ PanelWindow {
 
         // Spectral centroid and high-band energy shift hue with the current
         // phoneme; fast spectral change briefly brightens and saturates it.
-        const spectralTone = 0.45 * timbreSmoothed + 0.55 * store.voiceSpectralCentroid;
-        const shifted = accent.hslHue + (spectralTone - 0.5) * 0.28 * voiceActivity;
+        const spectralTone = 0.15 * timbreSmoothed + 0.85 * store.voiceSpectralCentroid;
+        const shifted = accent.hslHue + (spectralTone - 0.5) * 0.38 * voiceActivity;
         const hue = ((shifted % 1) + 1) % 1;
         const saturation = Math.min(1, accent.hslSaturation * (0.9 + 0.1 * store.voiceSpectralFlux));
         const lightness = Math.min(1, accent.hslLightness + 0.06 * store.voiceSpectralFlux);
@@ -283,7 +284,8 @@ PanelWindow {
         layer.enabled: true
     }
 
-    // Arming and post-recording stages retain the uniform blurred capsule.
+    // Errors retain a simple static capsule glow; normal pipeline stages all
+    // use variants of the shared top-edge waveform language below.
     MultiEffect {
         anchors.fill: glowShape
         source: glowShape
@@ -292,7 +294,7 @@ PanelWindow {
         blurMax: 56
         autoPaddingEnabled: true
         opacity: panel.glowStrength * capsule.opacity
-        visible: !panel.recording
+        visible: store.phase === "error"
     }
 
     // Listening pins the live spectrum to the straight top edge while the
@@ -319,13 +321,14 @@ PanelWindow {
         spectralFlux: store.voiceSpectralFlux
         spectralCentroid: store.voiceSpectralCentroid
         breath: panel.breathPhase
+        stage: panel.haloStage
         visible: false
         layer.enabled: true
     }
 
-    // A small isotropic blur rounds the procedural lobes in the tangential
-    // direction, removing the detached horizontal-strip appearance without
-    // materially increasing their distance from the capsule.
+    // One renderer carries the complete active pipeline: preparation,
+    // frequency-responsive recording, consolidation, refinement, and output.
+    // A small isotropic blur keeps every variant optically attached.
     MultiEffect {
         anchors.fill: recordingHalo
         source: recordingHalo
@@ -334,7 +337,7 @@ PanelWindow {
         blurMax: 6
         autoPaddingEnabled: true
         opacity: capsule.opacity
-        visible: panel.recording
+        visible: panel.arming || panel.recording || panel.processing
     }
 
     Rectangle {

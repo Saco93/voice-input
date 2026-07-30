@@ -101,7 +101,9 @@ fn run_session(
     let mut speech_started_count = 0_u64;
     let mut speech_stopped_count = 0_u64;
     let mut appended_sample_count = 0_u64;
+    let mut noise_gate = PcmNoiseGate::new((spec.sample_rate_hz as usize) / 2);
     let mut samples_since_commit = 0_usize;
+    let mut locally_voiced_samples_since_commit = 0_usize;
     let mut forced_commit_count = 0_u64;
     let mut forced_commit_in_flight = false;
     let mut last_transcription_activity = Instant::now();
@@ -113,16 +115,21 @@ fn run_session(
                     if finish_requested {
                         continue;
                     }
+                    let has_local_speech = pcm_chunk_has_local_speech(&samples);
+                    let filtered_samples = noise_gate.filter(samples);
                     send_json(
                         &mut socket,
                         json!({
                             "event_id": format!("event-{}", next_event_id),
                             "type": "input_audio_buffer.append",
-                            "audio": encode_pcm16_chunk(&samples),
+                            "audio": encode_pcm16_chunk(&filtered_samples),
                         }),
                     )?;
-                    appended_sample_count += samples.len() as u64;
-                    samples_since_commit += samples.len();
+                    appended_sample_count += filtered_samples.len() as u64;
+                    samples_since_commit += filtered_samples.len();
+                    if has_local_speech {
+                        locally_voiced_samples_since_commit += filtered_samples.len();
+                    }
                     next_event_id += 1;
                 }
                 AsrControl::Finish => {
@@ -182,15 +189,20 @@ fn run_session(
                             }
                         }
                         ServerEvent::SpeechStarted => {
-                            speech_started_count += 1;
-                            let _ = event_tx.send(AsrEvent::SpeechStarted);
+                            if noise_gate.speech_observed() {
+                                speech_started_count += 1;
+                                let _ = event_tx.send(AsrEvent::SpeechStarted);
+                            }
                         }
                         ServerEvent::SpeechStopped => {
-                            speech_stopped_count += 1;
-                            let _ = event_tx.send(AsrEvent::SpeechStopped);
+                            if noise_gate.speech_observed() {
+                                speech_stopped_count += 1;
+                                let _ = event_tx.send(AsrEvent::SpeechStopped);
+                            }
                         }
                         ServerEvent::InputCommitted => {
                             samples_since_commit = 0;
+                            locally_voiced_samples_since_commit = 0;
                             forced_commit_in_flight = false;
                             if waiting_for_commit {
                                 waiting_for_commit = false;
@@ -209,29 +221,33 @@ fn run_session(
                             text,
                             stash,
                         } => {
-                            partial_event_count += 1;
-                            last_transcription_activity = Instant::now();
-                            if partial_event_count == 1 {
-                                eprintln!(
-                                    "voice-input realtime ASR: first partial after {} ms",
-                                    session_started.elapsed().as_millis()
-                                );
+                            if noise_gate.speech_observed() {
+                                partial_event_count += 1;
+                                last_transcription_activity = Instant::now();
+                                if partial_event_count == 1 {
+                                    eprintln!(
+                                        "voice-input realtime ASR: first partial after {} ms",
+                                        session_started.elapsed().as_millis()
+                                    );
+                                }
+                                let (committed, unstable) =
+                                    assembler.apply_partial(item_id, text, stash);
+                                let _ = event_tx.send(AsrEvent::Partial {
+                                    committed,
+                                    unstable,
+                                });
                             }
-                            let (committed, unstable) =
-                                assembler.apply_partial(item_id, text, stash);
-                            let _ = event_tx.send(AsrEvent::Partial {
-                                committed,
-                                unstable,
-                            });
                         }
                         ServerEvent::Completed {
                             item_id,
                             transcript,
                         } => {
-                            completed_event_count += 1;
-                            last_transcription_activity = Instant::now();
-                            let text = assembler.apply_completed(item_id, transcript);
-                            let _ = event_tx.send(AsrEvent::SegmentFinal { text });
+                            if noise_gate.speech_observed() {
+                                completed_event_count += 1;
+                                last_transcription_activity = Instant::now();
+                                let text = assembler.apply_completed(item_id, transcript);
+                                let _ = event_tx.send(AsrEvent::SegmentFinal { text });
+                            }
                         }
                         ServerEvent::TranscriptionFailed { message } => {
                             let _ = event_tx.send(AsrEvent::Error {
@@ -247,7 +263,9 @@ fn run_session(
                         }
                         ServerEvent::SessionFinished => {
                             eprintln!(
-                                "voice-input realtime ASR: session finished with {partial_event_count} partial, {completed_event_count} completed, {speech_started_count} speech-started, {speech_stopped_count} speech-stopped, {forced_commit_count} forced-commit events, and {appended_sample_count} appended samples"
+                                "voice-input realtime ASR: session finished with {partial_event_count} partial, {completed_event_count} completed, {speech_started_count} speech-started, {speech_stopped_count} speech-stopped, {forced_commit_count} forced-commit events, {appended_sample_count} appended samples, {} noise-gate openings, and {} suppressed samples",
+                                noise_gate.reopen_count(),
+                                noise_gate.suppressed_sample_count()
                             );
                             let final_text = assembler.final_text();
                             if !final_text.is_empty() {
@@ -264,7 +282,9 @@ fn run_session(
                     || error.kind() == std::io::ErrorKind::TimedOut => {}
             Err(tungstenite::Error::ConnectionClosed) | Err(tungstenite::Error::AlreadyClosed) => {
                 eprintln!(
-                    "voice-input realtime ASR: connection closed with {partial_event_count} partial, {completed_event_count} completed, {speech_started_count} speech-started, {speech_stopped_count} speech-stopped, {forced_commit_count} forced-commit events, and {appended_sample_count} appended samples"
+                    "voice-input realtime ASR: connection closed with {partial_event_count} partial, {completed_event_count} completed, {speech_started_count} speech-started, {speech_stopped_count} speech-stopped, {forced_commit_count} forced-commit events, {appended_sample_count} appended samples, {} noise-gate openings, and {} suppressed samples",
+                    noise_gate.reopen_count(),
+                    noise_gate.suppressed_sample_count()
                 );
                 let final_text = assembler.final_text();
                 if finish_requested && !final_text.is_empty() {
@@ -286,13 +306,15 @@ fn run_session(
         // commit after an established segment can prevent a later speech turn
         // from producing partials until session.finish.
         let forced_commit_min_samples = (spec.sample_rate_hz as usize) * 3;
+        let forced_commit_min_voiced_samples = (spec.sample_rate_hz as usize) / 2;
         if should_force_initial_commit(
             finish_requested,
             matches!(config.asr.alibaba.turn_mode, AlibabaTurnMode::ServerVad),
             forced_commit_in_flight,
             forced_commit_count > 0,
             speech_started_count > 0 || partial_event_count > 0 || completed_event_count > 0,
-            samples_since_commit >= forced_commit_min_samples,
+            samples_since_commit >= forced_commit_min_samples
+                && locally_voiced_samples_since_commit >= forced_commit_min_voiced_samples,
             last_transcription_activity.elapsed() >= Duration::from_secs(3),
         ) {
             send_json(
@@ -323,13 +345,86 @@ fn run_session(
     }
 }
 
+struct PcmNoiseGate {
+    hangover_samples: usize,
+    remaining_hangover_samples: usize,
+    speech_observed: bool,
+    reopen_count: u64,
+    suppressed_sample_count: u64,
+}
+
+impl PcmNoiseGate {
+    fn new(hangover_samples: usize) -> Self {
+        Self {
+            hangover_samples,
+            remaining_hangover_samples: 0,
+            speech_observed: false,
+            reopen_count: 0,
+            suppressed_sample_count: 0,
+        }
+    }
+
+    fn filter(&mut self, mut samples: Vec<i16>) -> Vec<i16> {
+        // The measured idle microphone RMS peaks around 0.0015 of full scale
+        // on the target hardware. Open at roughly 0.0022 so quiet speech after
+        // a long pause can restart realtime ASR, then retain half a second of
+        // quiet audio for soft endings and server-VAD stop detection.
+        const NOISE_GATE_OPEN_RMS: i64 = 72;
+        if pcm_chunk_exceeds_rms(&samples, NOISE_GATE_OPEN_RMS) {
+            if self.remaining_hangover_samples == 0 {
+                self.reopen_count += 1;
+            }
+            self.remaining_hangover_samples = self.hangover_samples;
+            self.speech_observed = true;
+        } else if self.remaining_hangover_samples > 0 {
+            self.remaining_hangover_samples = self
+                .remaining_hangover_samples
+                .saturating_sub(samples.len());
+        } else {
+            self.suppressed_sample_count += samples.len() as u64;
+            samples.fill(0);
+        }
+        samples
+    }
+
+    fn speech_observed(&self) -> bool {
+        self.speech_observed
+    }
+
+    fn reopen_count(&self) -> u64 {
+        self.reopen_count
+    }
+
+    fn suppressed_sample_count(&self) -> u64 {
+        self.suppressed_sample_count
+    }
+}
+
+fn pcm_chunk_exceeds_rms(samples: &[i16], minimum_rms: i64) -> bool {
+    if samples.is_empty() {
+        return false;
+    }
+
+    // Integer squared energy avoids an extra normalization pass over every ASR
+    // chunk and remains well within i64 for the capture packet sizes in use.
+    let squared_energy: i64 = samples.iter().map(|sample| i64::from(*sample).pow(2)).sum();
+    squared_energy >= minimum_rms.pow(2) * samples.len() as i64
+}
+
+fn pcm_chunk_has_local_speech(samples: &[i16]) -> bool {
+    // This stricter threshold gates forced-commit recovery; opening the audio
+    // noise gate itself uses a lower threshold to preserve quiet speech.
+    const LOCAL_SPEECH_RMS: i64 = 197; // approximately 0.006 of i16 full scale
+    pcm_chunk_exceeds_rms(samples, LOCAL_SPEECH_RMS)
+}
+
 fn should_force_initial_commit(
     finish_requested: bool,
     server_vad: bool,
     forced_commit_in_flight: bool,
     has_forced_commit: bool,
     has_server_activity: bool,
-    has_minimum_audio: bool,
+    has_recovery_audio: bool,
     inactive_long_enough: bool,
 ) -> bool {
     !finish_requested
@@ -337,7 +432,7 @@ fn should_force_initial_commit(
         && !forced_commit_in_flight
         && !has_forced_commit
         && !has_server_activity
-        && has_minimum_audio
+        && has_recovery_audio
         && inactive_long_enough
 }
 
@@ -604,27 +699,51 @@ fn push_transcript_piece(target: &mut String, piece: &str) {
 #[cfg(test)]
 mod tests {
     use super::{
-        Message, TranscriptAssembler, parse_server_event, push_transcript_piece,
-        should_force_initial_commit,
+        Message, PcmNoiseGate, TranscriptAssembler, parse_server_event, pcm_chunk_has_local_speech,
+        push_transcript_piece, should_force_initial_commit,
     };
 
     #[test]
+    fn noise_gate_zeros_idle_noise_and_preserves_speech_with_hangover() {
+        let mut gate = PcmNoiseGate::new(4);
+
+        assert_eq!(gate.filter(vec![40; 4]), vec![0; 4]);
+        assert!(!gate.speech_observed());
+        assert_eq!(gate.suppressed_sample_count(), 4);
+        assert_eq!(gate.filter(vec![300; 4]), vec![300; 4]);
+        assert!(gate.speech_observed());
+        assert_eq!(gate.reopen_count(), 1);
+        assert_eq!(gate.filter(vec![40; 4]), vec![40; 4]);
+        assert_eq!(gate.filter(vec![40; 4]), vec![0; 4]);
+        assert_eq!(gate.suppressed_sample_count(), 8);
+    }
+
+    #[test]
+    fn local_speech_gate_rejects_silence_and_accepts_voice_energy() {
+        assert!(!pcm_chunk_has_local_speech(&[]));
+        assert!(!pcm_chunk_has_local_speech(&[0; 320]));
+        assert!(!pcm_chunk_has_local_speech(&[120; 320]));
+        assert!(pcm_chunk_has_local_speech(&[600; 320]));
+    }
+
+    #[test]
     fn forced_commit_is_only_an_initial_no_event_recovery() {
-        let eligible = |has_server_activity, has_forced_commit| {
+        let eligible = |has_server_activity, has_forced_commit, has_recovery_audio| {
             should_force_initial_commit(
                 false,
                 true,
                 false,
                 has_forced_commit,
                 has_server_activity,
-                true,
+                has_recovery_audio,
                 true,
             )
         };
 
-        assert!(eligible(false, false));
-        assert!(!eligible(true, false));
-        assert!(!eligible(false, true));
+        assert!(eligible(false, false, true));
+        assert!(!eligible(false, false, false));
+        assert!(!eligible(true, false, true));
+        assert!(!eligible(false, true, true));
     }
 
     #[test]

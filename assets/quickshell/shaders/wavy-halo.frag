@@ -23,7 +23,25 @@ layout(std140, binding = 0) uniform buf {
     float spectralFlux;
     float spectralCentroid;
     float breath;
+    float stage;
 };
+
+vec3 rgbToHsv(vec3 color)
+{
+    vec4 k = vec4(0.0, -0.3333333333, 0.6666666667, -1.0);
+    vec4 p = mix(vec4(color.bg, k.wz), vec4(color.gb, k.xy), step(color.b, color.g));
+    vec4 q = mix(vec4(p.xyw, color.r), vec4(color.r, p.yzx), step(p.x, color.r));
+    float delta = q.x - min(q.w, q.y);
+    float epsilon = 1.0e-10;
+    return vec3(abs(q.z + (q.w - q.y) / (6.0 * delta + epsilon)),
+        delta / (q.x + epsilon), q.x);
+}
+
+vec3 hsvToRgb(vec3 color)
+{
+    vec3 p = abs(fract(color.xxx + vec3(0.0, 0.6666666667, 0.3333333333)) * 6.0 - 3.0);
+    return color.z * mix(vec3(1.0), clamp(p - 1.0, 0.0, 1.0), color.y);
+}
 
 float roundedBoxDistance(vec2 point, vec2 halfSize, float radius)
 {
@@ -31,30 +49,36 @@ float roundedBoxDistance(vec2 point, vec2 halfSize, float radius)
     return length(max(q, vec2(0.0))) + min(max(q.x, q.y), 0.0) - radius;
 }
 
+float smootherStep(float edge0, float edge1, float value)
+{
+    float t = clamp((value - edge0) / max(edge1 - edge0, 0.00001), 0.0, 1.0);
+    return t * t * t * (t * (t * 6.0 - 15.0) + 10.0);
+}
+
 float spectrumBand(float index)
 {
-    float wrapped = mod(index + 12.0, 12.0);
-    if (wrapped < 1.0)
+    float bounded = clamp(index, 0.0, 11.0);
+    if (bounded < 1.0)
         return spectrum0.x;
-    if (wrapped < 2.0)
+    if (bounded < 2.0)
         return spectrum0.y;
-    if (wrapped < 3.0)
+    if (bounded < 3.0)
         return spectrum0.z;
-    if (wrapped < 4.0)
+    if (bounded < 4.0)
         return spectrum0.w;
-    if (wrapped < 5.0)
+    if (bounded < 5.0)
         return spectrum1.x;
-    if (wrapped < 6.0)
+    if (bounded < 6.0)
         return spectrum1.y;
-    if (wrapped < 7.0)
+    if (bounded < 7.0)
         return spectrum1.z;
-    if (wrapped < 8.0)
+    if (bounded < 8.0)
         return spectrum1.w;
-    if (wrapped < 9.0)
+    if (bounded < 9.0)
         return spectrum2.x;
-    if (wrapped < 10.0)
+    if (bounded < 10.0)
         return spectrum2.y;
-    if (wrapped < 11.0)
+    if (bounded < 11.0)
         return spectrum2.z;
     return spectrum2.w;
 }
@@ -64,7 +88,7 @@ float spectrumBand(float index)
 // emerge from the current audio values themselves.
 float spectrumEnvelope(float coordinate)
 {
-    float position = fract(coordinate) * 12.0;
+    float position = clamp(coordinate, 0.0, 1.0) * 11.0;
     float base = floor(position);
     float t = fract(position);
     float t2 = t * t;
@@ -198,13 +222,28 @@ void main()
     float shapedWave = smoothstep(0.04, 0.96, wave);
     float heightWave = clamp(pow(shapedWave, 0.82) * heightEnvelope, 0.0, 1.0);
 
-    // Pin the twelve log-frequency bands to the straight top edge: low bands
-    // remain on the left and high bands on the right. The rounded corners and
-    // other three edges retain only the ambient breathing halo.
-    float topEdgeFraction = straightWidth / max(perimeterLength, 1.0);
-    float topEdgePosition = perimeter / max(topEdgeFraction, 0.00001);
-    float topEdgeMask = smoothstep(0.0, 0.045, topEdgePosition)
-        * (1.0 - smoothstep(0.955, 1.0, topEdgePosition));
+    // Run the crest through the upper part of both rounded corners as well as
+    // the straight top edge. Its normal therefore rotates with the capsule and
+    // makes the Anchor Glow look as though it grows naturally out of each arc.
+    float quarterArcLength = 1.5707963268 * radius;
+    float cornerGrowthLength = 0.72 * quarterArcLength;
+    float topPathLength = straightWidth + 2.0 * cornerGrowthLength;
+    float perimeterDistance = perimeter * perimeterLength;
+    float topPathDistance = -1.0;
+    if (perimeterDistance >= perimeterLength - cornerGrowthLength) {
+        topPathDistance = perimeterDistance - (perimeterLength - cornerGrowthLength);
+    } else if (perimeterDistance <= straightWidth + cornerGrowthLength) {
+        topPathDistance = cornerGrowthLength + perimeterDistance;
+    }
+    float topEdgePosition = topPathDistance / max(topPathLength, 1.0);
+    float topPathMask = step(0.0, topPathDistance)
+        * step(topPathDistance, topPathLength);
+    // Give the complete arc-to-arc path a pixel-bounded quintic taper. Zero
+    // first and second derivatives make both endpoint tangencies continuous.
+    float endpointRamp = clamp(32.0 / max(topPathLength, 1.0), 0.06, 0.13);
+    float topEdgeMask = topPathMask
+        * smootherStep(0.0, endpointRamp, topEdgePosition)
+        * (1.0 - smootherStep(1.0 - endpointRamp, 1.0, topEdgePosition));
     float spectralCoordinate = clamp(topEdgePosition, 0.0, 1.0);
     float band0 = clamp(spectrum0.x, 0.0, 1.0);
     float band1 = clamp(spectrum0.y, 0.0, 1.0);
@@ -231,19 +270,62 @@ void main()
     float speechPresence = smoothstep(0.015, 0.18, activity);
     float spectralBlend = speechPresence
         * smoothstep(0.02, 0.25, spectralPresence) * 0.98;
-    heightWave = mix(heightWave, spectralWave, spectralBlend);
+
+    // Every normal pipeline stage uses the same top-edge relief language. The
+    // stage only changes the source profile and its emphasis: preparation is
+    // sparse, final transcription consolidates, refinement interferes, and
+    // output sweeps in one direction. Recording remains the live spectrum.
+    float topTravel = phase / max(straightWidth, 1.0);
+    float stageDrive = speechPresence;
+    if (stage < 0.5) {
+        float preparation = 0.5 + 0.5
+            * sin(12.5663706144 * spectralCoordinate - 3.2 * topTravel);
+        heightWave = 0.16 + 0.24 * preparation * (0.72 + 0.28 * normalizedBreath);
+        stageDrive = 0.44;
+    } else if (stage < 1.5) {
+        // Silent Listening has a restrained traveling ripple instead of a
+        // static outline. Live speech smoothly replaces it with the measured
+        // frequency envelope as soon as local activity appears.
+        float listeningRipple = 0.5 + 0.5
+            * sin(12.5663706144 * spectralCoordinate - 2.6 * topTravel);
+        float standbyHeight = 0.10 + 0.42 * listeningRipple;
+        float liveHeight = mix(heightWave, spectralWave, spectralBlend);
+        heightWave = mix(standbyHeight, liveHeight, speechPresence);
+        stageDrive = mix(0.90, 1.0, speechPresence);
+    } else if (stage < 2.5) {
+        float centerDistance = spectralCoordinate - 0.5;
+        float consolidation = exp(-14.0 * centerDistance * centerDistance);
+        heightWave = 0.16 + 0.48 * consolidation
+            * (0.72 + 0.28 * normalizedBreath);
+        stageDrive = 0.58;
+    } else if (stage < 3.5) {
+        float primary = sin(18.8495559215 * spectralCoordinate + 5.0 * topTravel);
+        float secondary = sin(31.4159265359 * spectralCoordinate - 3.0 * topTravel + 1.3);
+        float interferenceProfile = clamp(0.5 + 0.34 * primary + 0.16 * secondary, 0.0, 1.0);
+        heightWave = 0.14 + 0.54 * interferenceProfile;
+        stageDrive = 0.70;
+    } else {
+        float sweepCenter = fract(3.0 * topTravel);
+        float sweepDistance = spectralCoordinate - sweepCenter;
+        float sweep = exp(-72.0 * sweepDistance * sweepDistance);
+        heightWave = 0.10 + 0.72 * sweep;
+        stageDrive = 0.82;
+    }
 
     // Keep a small uniform breathing radius around the complete capsule. Only
-    // the top-edge mask is allowed to expand into the measured spectrum.
+    // the shared top-edge profile is allowed to expand beyond it.
     float ambientReach = mix(5.0, 9.0, normalizedBreath);
     float reachPulse = clamp(0.55 * activity + 0.75 * normalizedFlux, 0.0, 1.0);
     float maximumActiveReach = max(
         ambientReach + 3.0,
         mix(50.0, 42.0, normalizedPitch) * mix(0.84, 1.0, reachPulse)
     );
-    float activeReach = mix(ambientReach, maximumActiveReach, heightWave);
-    float topSpectrumDrive = topEdgeMask * speechPresence;
-    float localReach = mix(ambientReach, activeReach, topSpectrumDrive);
+    // Taper geometric height itself toward the ambient Anchor Glow. Fading
+    // only opacity leaves a tall translucent wall at each endpoint.
+    float taperedHeightWave = heightWave * topEdgeMask;
+    float activeReach = mix(ambientReach, maximumActiveReach, taperedHeightWave);
+    float topSpectrumDrive = topEdgeMask * stageDrive;
+    float localReach = mix(ambientReach, activeReach, stageDrive);
     float antialias = max(fwidth(distanceToCapsule), 0.5);
     float outside = smoothstep(-antialias, antialias, distanceToCapsule);
     float falloff = 1.0 - smoothstep(0.0, localReach, distanceToCapsule);
@@ -270,13 +352,35 @@ void main()
     float anchorAlpha = outside * anchorFalloff * normalizedStrength
         * mix(0.24, 0.34, activity) * haloColor.a;
     float alpha = max(waveAlpha, anchorAlpha);
+    float recordingStage = 1.0 - smoothstep(0.20, 0.45, abs(stage - 1.0));
+    float silentListening = recordingStage * (1.0 - speechPresence);
+    float standbyFalloff = 1.0 - smoothstep(0.0, localReach, distanceToCapsule);
+    float standbyAlpha = silentListening * topEdgeMask * outside * standbyFalloff
+        * mix(0.65, 0.90, normalizedStrength) * mix(0.45, 1.0, heightWave);
+    alpha = max(alpha, standbyAlpha);
 
-    // Bright spectral content adds a pale highlight to active peaks while the
-    // QML halo color continues to shift hue with the smoothed timbre estimate.
-    float spectralTone = mix(normalizedTimbre, normalizedCentroid, 0.55);
+    // Frequency position controls local hue while energy controls saturation
+    // and lightness. As different bands become dominant, the visible peak
+    // colors change even when the speaker's long-term timbre stays constant.
+    float spectralTone = mix(normalizedTimbre, normalizedCentroid, 0.82);
     float spectralHighlight = topSpectrumDrive * spectralTone * pow(heightWave, 0.6)
         + 0.08 * normalizedFlux * topEdgeMask;
     vec3 localColor = haloColor.rgb * mix(0.84, 1.0, heightWave);
-    localColor = mix(localColor, vec3(1.0), 0.18 * spectralHighlight);
+    localColor = mix(localColor, vec3(1.0), 0.14 * spectralHighlight);
+    vec3 baseHsv = rgbToHsv(haloColor.rgb);
+    float frequencyHue = (spectralCoordinate - 0.5) * 0.28;
+    float energyHue = (spectralWave - 0.42) * 0.24
+        * smoothstep(0.04, 0.55, spectralPresence);
+    float transientHue = normalizedFlux
+        * 0.10 * sin(12.5663706144 * spectralCoordinate + 4.0 * topTravel);
+    vec3 frequencyColor = hsvToRgb(vec3(
+        fract(baseHsv.x + frequencyHue + energyHue
+            + (normalizedCentroid - 0.5) * 0.16 + transientHue + 1.0),
+        clamp(baseHsv.y + 0.20 * spectralWave, 0.0, 1.0),
+        clamp(baseHsv.z + 0.13 * spectralWave, 0.0, 1.0)
+    ));
+    float frequencyColorDrive = recordingStage * topEdgeMask * speechPresence
+        * (0.48 + 0.52 * spectralWave);
+    localColor = mix(localColor, frequencyColor, 0.92 * frequencyColorDrive);
     fragColor = vec4(localColor * alpha, alpha) * qt_Opacity;
 }

@@ -80,9 +80,9 @@ pub fn send_control_command(command: &str) -> Result<String> {
     Ok(response)
 }
 
-pub fn send_record_command(command: &str) -> Result<String> {
+pub fn send_record_command(command: &str, requested_at_ms: u128) -> Result<String> {
     if command.split_whitespace().next() == Some("toggle") {
-        send_control_command(&format!("{command} requested_at_ms={}", unix_time_ms()))
+        send_control_command(&format!("{command} requested_at_ms={requested_at_ms}"))
     } else {
         send_control_command(command)
     }
@@ -107,8 +107,10 @@ fn handle_control(daemon: &Arc<Mutex<Daemon>>, command: &str) -> Result<String> 
         "stop" => daemon.finish_recording(false).map(|_| "ok\n".to_string()),
         "toggle" => {
             if daemon.has_session() {
-                daemon.finish_recording(false)?;
-            } else if toggle_request_is_stale(&parts) {
+                let result = daemon.finish_recording(false);
+                daemon.suppress_toggle_start_briefly();
+                result?;
+            } else if daemon.toggle_start_is_suppressed() || toggle_request_is_stale(&parts) {
                 // A second key press can sit in the control socket backlog while
                 // final ASR, refinement, and output are running. Do not turn that
                 // old press into a new recording after processing completes.
@@ -152,6 +154,10 @@ fn toggle_request_is_stale(parts: &[&str]) -> bool {
     requested_at
         .map(|timestamp| unix_time_ms().saturating_sub(timestamp) > MAX_TOGGLE_QUEUE_AGE_MS)
         .unwrap_or(false)
+}
+
+pub(crate) fn control_request_timestamp_ms() -> u128 {
+    unix_time_ms()
 }
 
 fn unix_time_ms() -> u128 {
@@ -247,6 +253,7 @@ struct Daemon {
     capture: CaptureService,
     waveform: WaveformPublisher,
     session: Option<Session>,
+    suppress_toggle_start_until: Option<Instant>,
 }
 
 struct Session {
@@ -401,11 +408,21 @@ impl Daemon {
             capture,
             waveform,
             session: None,
+            suppress_toggle_start_until: None,
         })
     }
 
     fn has_session(&self) -> bool {
         self.session.is_some()
+    }
+
+    fn suppress_toggle_start_briefly(&mut self) {
+        self.suppress_toggle_start_until = Some(Instant::now() + Duration::from_millis(750));
+    }
+
+    fn toggle_start_is_suppressed(&self) -> bool {
+        self.suppress_toggle_start_until
+            .is_some_and(|deadline| Instant::now() < deadline)
     }
 
     fn start_recording(
