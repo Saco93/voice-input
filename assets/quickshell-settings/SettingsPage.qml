@@ -10,7 +10,7 @@ Item {
     property string description: ""
     default property alias content: body.data
 
-    implicitHeight: pageColumn.implicitHeight + 32
+    implicitHeight: pageColumn.implicitHeight + 48
 
     ColumnLayout {
         id: pageColumn
@@ -18,14 +18,15 @@ Item {
         anchors.top: parent.top
         anchors.left: parent.left
         anchors.right: parent.right
-        anchors.margins: 16
-        spacing: 10
+        anchors.margins: 24
+        spacing: 24
 
         Label {
             visible: root.description.length > 0
             text: root.theme.tr(root.description)
             color: root.theme.subtle
-            font.pixelSize: 11
+            font.pixelSize: 12
+            lineHeight: 1.25
             wrapMode: Text.WordWrap
             Layout.fillWidth: true
         }
@@ -34,7 +35,7 @@ Item {
             id: body
 
             Layout.fillWidth: true
-            spacing: 10
+            spacing: 24
         }
 
     }

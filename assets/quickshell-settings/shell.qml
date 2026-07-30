@@ -8,23 +8,17 @@ ShellRoot {
     id: shell
 
     readonly property var destinations: [{
-        "title": "Overview",
-        "glyph": "⌂"
+        "title": "Overview"
     }, {
-        "title": "Speech",
-        "glyph": "◉"
+        "title": "Speech"
     }, {
-        "title": "Refinement",
-        "glyph": "✦"
+        "title": "Refinement"
     }, {
-        "title": "Output",
-        "glyph": "→"
+        "title": "Output"
     }, {
-        "title": "Appearance",
-        "glyph": "◇"
+        "title": "Appearance"
     }, {
-        "title": "Advanced",
-        "glyph": "⚙"
+        "title": "Hotkey & state"
     }]
 
     function destinationIndex(title) {

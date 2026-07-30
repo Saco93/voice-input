@@ -9,64 +9,52 @@ Rectangle {
     property string title: ""
     property string summary: ""
     property string detail: ""
-    property bool pending: false
+    property bool showDivider: true
 
     signal activated()
 
     Layout.fillWidth: true
-    implicitHeight: 116
-    radius: 10
-    color: root.theme.surface
-    border.color: root.theme.border
+    implicitHeight: 58
+    color: "transparent"
 
-    ColumnLayout {
+    RowLayout {
         anchors.fill: parent
-        anchors.margins: 12
-        spacing: 4
+        spacing: 16
 
-        RowLayout {
+        Label {
+            text: root.theme.tr(root.title)
+            color: root.theme.foreground
+            font.pixelSize: 12
+            font.weight: Font.Medium
+            Layout.preferredWidth: 110
+        }
+
+        ColumnLayout {
             Layout.fillWidth: true
+            spacing: 2
 
             Label {
-                text: root.theme.tr(root.title)
+                text: root.theme.tr(root.summary)
                 color: root.theme.foreground
-                font.pixelSize: 13
-                font.weight: Font.DemiBold
+                font.pixelSize: 12
+                elide: Text.ElideRight
                 Layout.fillWidth: true
             }
 
             Label {
-                visible: root.pending
-                text: root.theme.tr("Pending")
-                color: root.theme.warning
-                font.pixelSize: 10
-                font.weight: Font.DemiBold
+                text: root.theme.tr(root.detail)
+                color: root.theme.subtle
+                font.pixelSize: 11
+                elide: Text.ElideRight
+                Layout.fillWidth: true
             }
 
-        }
-
-        Label {
-            text: root.theme.tr(root.summary)
-            color: root.theme.foreground
-            font.pixelSize: 12
-            elide: Text.ElideRight
-            Layout.fillWidth: true
-        }
-
-        Label {
-            text: root.theme.tr(root.detail)
-            color: root.theme.subtle
-            font.pixelSize: 11
-            elide: Text.ElideRight
-            Layout.fillWidth: true
-            Layout.fillHeight: true
         }
 
         Button {
             text: root.theme.tr("Open " + root.title)
             flat: true
-            leftPadding: 0
-            rightPadding: 0
+            Accessible.name: text
             onClicked: root.activated()
 
             contentItem: Text {
@@ -77,8 +65,23 @@ Rectangle {
                 verticalAlignment: Text.AlignVCenter
             }
 
+            background: Rectangle {
+                color: parent.hovered ? Qt.alpha(root.theme.elevated, 0.55) : "transparent"
+                border.width: parent.activeFocus ? 1 : 0
+                border.color: root.theme.accent
+            }
+
         }
 
+    }
+
+    Rectangle {
+        visible: root.showDivider
+        anchors.left: parent.left
+        anchors.right: parent.right
+        anchors.bottom: parent.bottom
+        height: 1
+        color: root.theme.border
     }
 
 }

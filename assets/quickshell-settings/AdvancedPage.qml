@@ -7,7 +7,7 @@ SettingsPage {
 
     required property SettingsController controller
 
-    title: "Advanced"
+    title: "Hotkey & state"
     description: "Configure the global trigger and state storage."
 
     SettingsGrid {

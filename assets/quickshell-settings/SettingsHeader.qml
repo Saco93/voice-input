@@ -12,20 +12,26 @@ Rectangle {
     signal closeRequested()
 
     Layout.fillWidth: true
-    Layout.preferredHeight: 54
+    Layout.preferredHeight: 58
     color: root.theme.surface
-    border.color: root.theme.border
+
+    Rectangle {
+        anchors.bottom: parent.bottom
+        width: parent.width
+        height: 1
+        color: root.theme.border
+    }
 
     RowLayout {
         anchors.fill: parent
-        anchors.leftMargin: 16
-        anchors.rightMargin: 10
+        anchors.leftMargin: 24
+        anchors.rightMargin: 12
         spacing: 8
 
         Label {
             text: root.theme.tr(root.title)
             color: root.theme.foreground
-            font.pixelSize: 16
+            font.pixelSize: 20
             font.weight: Font.DemiBold
             Layout.fillWidth: true
         }
@@ -34,79 +40,51 @@ Rectangle {
             visible: root.controller.dirty
             text: root.theme.tr("Unsaved")
             color: root.theme.warning
-            font.pixelSize: 10
+            font.pixelSize: 11
         }
 
-        Rectangle {
-            Layout.preferredWidth: 88
-            Layout.preferredHeight: 30
-            radius: 7
-            color: root.theme.elevated
-            border.color: root.theme.border
+        ToolButton {
+            id: languageButton
 
-            RowLayout {
-                anchors.fill: parent
-                anchors.margins: 2
-                spacing: 2
+            text: root.theme.i18n.locale === "zh-CN" ? "中文" : "EN"
+            Accessible.name: root.theme.tr("Change settings language")
+            onClicked: languageMenu.open()
 
-                Button {
-                    Layout.fillWidth: true
-                    Layout.fillHeight: true
-                    text: "EN"
-                    flat: true
-                    Accessible.name: root.theme.tr("Switch settings language to English")
-                    onClicked: root.theme.i18n.setLocale("en")
+            Menu {
+                id: languageMenu
 
-                    contentItem: Text {
-                        text: parent.text
-                        color: root.theme.i18n.locale === "en" ? root.theme.background : root.theme.subtle
-                        font.pixelSize: 10
-                        font.weight: Font.DemiBold
-                        horizontalAlignment: Text.AlignHCenter
-                        verticalAlignment: Text.AlignVCenter
-                    }
+                y: languageButton.height
 
-                    background: Rectangle {
-                        radius: 5
-                        color: root.theme.i18n.locale === "en" ? root.theme.accent : (parent.hovered ? Qt.alpha(root.theme.accent, 0.12) : "transparent")
-                        border.width: parent.activeFocus ? 1 : 0
-                        border.color: root.theme.accent
-                    }
-
+                MenuItem {
+                    text: "English"
+                    checkable: true
+                    checked: root.theme.i18n.locale === "en"
+                    onTriggered: root.theme.i18n.setLocale("en")
                 }
 
-                Label {
-                    text: "/"
-                    color: root.theme.subtle
-                    font.pixelSize: 9
+                MenuItem {
+                    text: "简体中文"
+                    checkable: true
+                    checked: root.theme.i18n.locale === "zh-CN"
+                    onTriggered: root.theme.i18n.setLocale("zh-CN")
                 }
 
-                Button {
-                    Layout.fillWidth: true
-                    Layout.fillHeight: true
-                    text: "中文"
-                    flat: true
-                    Accessible.name: root.theme.tr("Switch settings language to Simplified Chinese")
-                    onClicked: root.theme.i18n.setLocale("zh-CN")
+            }
 
-                    contentItem: Text {
-                        text: parent.text
-                        color: root.theme.i18n.locale === "zh-CN" ? root.theme.background : root.theme.subtle
-                        font.pixelSize: 10
-                        font.weight: Font.DemiBold
-                        horizontalAlignment: Text.AlignHCenter
-                        verticalAlignment: Text.AlignVCenter
-                    }
+            contentItem: Text {
+                text: parent.text
+                color: root.theme.subtle
+                font.pixelSize: 11
+                font.weight: Font.Medium
+                horizontalAlignment: Text.AlignHCenter
+                verticalAlignment: Text.AlignVCenter
+            }
 
-                    background: Rectangle {
-                        radius: 5
-                        color: root.theme.i18n.locale === "zh-CN" ? root.theme.accent : (parent.hovered ? Qt.alpha(root.theme.accent, 0.12) : "transparent")
-                        border.width: parent.activeFocus ? 1 : 0
-                        border.color: root.theme.accent
-                    }
-
-                }
-
+            background: Rectangle {
+                radius: 4
+                color: parent.hovered ? root.theme.elevated : "transparent"
+                border.width: parent.activeFocus ? 1 : 0
+                border.color: root.theme.accent
             }
 
         }
@@ -133,15 +111,17 @@ Rectangle {
 
             contentItem: Text {
                 text: parent.text
-                color: root.theme.foreground
-                font.pixelSize: 19
+                color: root.theme.subtle
+                font.pixelSize: 18
                 horizontalAlignment: Text.AlignHCenter
                 verticalAlignment: Text.AlignVCenter
             }
 
             background: Rectangle {
                 color: parent.hovered ? root.theme.elevated : "transparent"
-                radius: 7
+                radius: 4
+                border.width: parent.activeFocus ? 1 : 0
+                border.color: root.theme.accent
             }
 
         }

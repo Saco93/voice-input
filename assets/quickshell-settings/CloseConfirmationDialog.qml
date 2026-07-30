@@ -19,7 +19,7 @@ Dialog {
     background: Rectangle {
         color: root.theme.surface
         border.color: root.theme.border
-        radius: 12
+        radius: 8
     }
 
     contentItem: ColumnLayout {

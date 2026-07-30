@@ -213,7 +213,7 @@ QtObject {
 
     function pageForField(path) {
         if (path === "state_file" || path.indexOf("hotkey.") === 0)
-            return "Advanced";
+            return "Hotkey & state";
 
         if (path.indexOf("audio.") === 0 || path.indexOf("asr.") === 0 || path === "credentials.alibaba-api-key")
             return "Speech";
@@ -227,7 +227,7 @@ QtObject {
         if (path.indexOf("hud.") === 0)
             return "Appearance";
 
-        return "Advanced";
+        return "Hotkey & state";
     }
 
     function fieldNeedsAdvanced(path) {

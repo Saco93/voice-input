@@ -11,21 +11,25 @@ Rectangle {
     default property alias content: body.data
 
     Layout.fillWidth: true
-    implicitHeight: sectionColumn.implicitHeight + 24
-    radius: 10
-    color: root.theme.surface
-    border.color: root.expanded ? Qt.alpha(root.theme.accent, 0.35) : root.theme.border
+    implicitHeight: sectionColumn.implicitHeight
+    color: "transparent"
 
     ColumnLayout {
         id: sectionColumn
 
-        anchors.fill: parent
-        anchors.margins: 12
-        spacing: 9
+        anchors.left: parent.left
+        anchors.right: parent.right
+        spacing: 12
+
+        Rectangle {
+            Layout.fillWidth: true
+            Layout.preferredHeight: 1
+            color: root.theme.border
+        }
 
         ItemDelegate {
             Layout.fillWidth: true
-            implicitHeight: 42
+            implicitHeight: 48
             leftPadding: 0
             rightPadding: 0
             Accessible.name: root.theme.tr((root.expanded ? "Hide " : "Show ") + "advanced settings")
@@ -58,24 +62,18 @@ Rectangle {
                 Label {
                     text: root.theme.tr(root.expanded ? "Hide" : "Show")
                     color: root.theme.accent
-                    font.pixelSize: 12
+                    font.pixelSize: 11
                     font.weight: Font.Medium
                 }
 
             }
 
             background: Rectangle {
-                color: parent.hovered ? root.theme.elevated : "transparent"
-                radius: 8
+                color: parent.hovered ? Qt.alpha(root.theme.elevated, 0.55) : "transparent"
+                border.width: parent.activeFocus ? 1 : 0
+                border.color: root.theme.accent
             }
 
-        }
-
-        Rectangle {
-            visible: root.expanded
-            Layout.fillWidth: true
-            Layout.preferredHeight: 1
-            color: root.theme.border
         }
 
         ColumnLayout {
@@ -83,7 +81,8 @@ Rectangle {
 
             visible: root.expanded
             Layout.fillWidth: true
-            spacing: 10
+            Layout.topMargin: 4
+            spacing: 24
         }
 
     }

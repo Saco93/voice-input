@@ -33,7 +33,7 @@ RowLayout {
             visible: root.help.length > 0
             text: root.theme.tr(root.help)
             color: root.theme.subtle
-            font.pixelSize: 10
+            font.pixelSize: 11
             wrapMode: Text.WordWrap
             Layout.fillWidth: true
         }

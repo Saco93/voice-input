@@ -2,7 +2,7 @@ import QtQuick
 import QtQuick.Controls
 import QtQuick.Layouts
 
-ColumnLayout {
+GridLayout {
     id: root
 
     required property QtObject theme
@@ -17,93 +17,110 @@ ColumnLayout {
     signal selected(string value)
 
     Layout.fillWidth: true
-    spacing: 4
+    columns: width >= 560 ? 2 : 1
+    columnSpacing: 24
+    rowSpacing: 6
 
-    Label {
-        text: root.theme.tr(root.label)
-        color: root.theme.foreground
-        font.pixelSize: 12
-        font.weight: Font.Medium
-        wrapMode: Text.WordWrap
+    ColumnLayout {
         Layout.fillWidth: true
-    }
+        Layout.preferredWidth: 240
+        Layout.alignment: Qt.AlignTop
+        spacing: 3
 
-    Label {
-        visible: root.help.length > 0
-        text: root.theme.tr(root.help)
-        color: root.theme.subtle
-        font.pixelSize: 10
-        wrapMode: Text.WordWrap
-        Layout.fillWidth: true
-    }
-
-    ComboBox {
-        id: combo
-
-        Layout.fillWidth: true
-        model: root.labels
-        currentIndex: Math.max(0, root.values.indexOf(root.value))
-        enabled: root.enabled
-        Accessible.name: root.theme.tr(root.label)
-        Accessible.description: root.theme.tr(root.help)
-        onActivated: (index) => {
-            return root.selected(root.values[index]);
-        }
-
-        contentItem: Text {
-            leftPadding: 11
-            rightPadding: combo.indicator.width + 11
-            text: root.theme.tr(combo.currentText)
+        Label {
+            text: root.theme.tr(root.label)
             color: root.theme.foreground
-            verticalAlignment: Text.AlignVCenter
-            elide: Text.ElideRight
+            font.pixelSize: 12
+            font.weight: Font.Medium
+            wrapMode: Text.WordWrap
+            Layout.fillWidth: true
         }
 
-        background: Rectangle {
-            implicitHeight: 36
-            radius: 7
-            color: root.theme.elevated
-            border.width: combo.activeFocus || root.error.length > 0 ? 2 : 1
-            border.color: root.error.length > 0 ? root.theme.error : (combo.activeFocus ? root.theme.accent : root.theme.border)
+        Label {
+            visible: root.help.length > 0
+            text: root.theme.tr(root.help)
+            color: root.theme.subtle
+            font.pixelSize: 11
+            lineHeight: 1.15
+            wrapMode: Text.WordWrap
+            Layout.fillWidth: true
         }
 
-        popup.background: Rectangle {
-            color: root.theme.elevated
-            border.color: root.theme.border
-            radius: 8
-        }
+    }
 
-        delegate: ItemDelegate {
-            required property var modelData
-            required property int index
+    ColumnLayout {
+        Layout.fillWidth: true
+        Layout.preferredWidth: 320
+        spacing: 4
 
-            width: combo.width
-            text: root.theme.tr(modelData)
-            highlighted: combo.highlightedIndex === index
+        ComboBox {
+            id: combo
+
+            Layout.fillWidth: true
+            model: root.labels
+            currentIndex: Math.max(0, root.values.indexOf(root.value))
+            enabled: root.enabled
+            Accessible.name: root.theme.tr(root.label)
+            Accessible.description: root.theme.tr(root.help)
+            onActivated: (index) => {
+                return root.selected(root.values[index]);
+            }
 
             contentItem: Text {
-                text: parent.text
+                leftPadding: 11
+                rightPadding: combo.indicator.width + 11
+                text: root.theme.tr(combo.currentText)
                 color: root.theme.foreground
                 verticalAlignment: Text.AlignVCenter
+                elide: Text.ElideRight
             }
 
             background: Rectangle {
-                color: parent.highlighted ? Qt.alpha(root.theme.accent, 0.18) : "transparent"
-                radius: 6
+                implicitHeight: 34
+                radius: 4
+                color: root.theme.elevated
+                border.width: combo.activeFocus || root.error.length > 0 ? 2 : 1
+                border.color: root.error.length > 0 ? root.theme.error : (combo.activeFocus ? root.theme.accent : root.theme.border)
+            }
+
+            popup.background: Rectangle {
+                color: root.theme.elevated
+                border.color: root.theme.border
+                radius: 4
+            }
+
+            delegate: ItemDelegate {
+                required property var modelData
+                required property int index
+
+                width: combo.width
+                text: root.theme.tr(modelData)
+                highlighted: combo.highlightedIndex === index
+
+                contentItem: Text {
+                    text: parent.text
+                    color: root.theme.foreground
+                    verticalAlignment: Text.AlignVCenter
+                }
+
+                background: Rectangle {
+                    color: parent.highlighted ? root.theme.surface : "transparent"
+                }
+
             }
 
         }
 
-    }
+        Label {
+            visible: root.error.length > 0
+            text: root.theme.tr(root.error)
+            color: root.theme.error
+            font.pixelSize: 11
+            wrapMode: Text.WordWrap
+            Layout.fillWidth: true
+            Accessible.role: Accessible.AlertMessage
+        }
 
-    Label {
-        visible: root.error.length > 0
-        text: root.theme.tr(root.error)
-        color: root.theme.error
-        font.pixelSize: 11
-        wrapMode: Text.WordWrap
-        Layout.fillWidth: true
-        Accessible.role: Accessible.AlertMessage
     }
 
 }
