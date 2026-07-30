@@ -31,6 +31,13 @@ jobs:
           modules: qtshadertools
           cache: true
 
+      - name: Parse QML assets
+        run: |
+          qmlformat_path=$(command -v qmlformat)
+          while IFS= read -r -d '' file; do
+            "$qmlformat_path" "$file" >/dev/null
+          done < <(find assets/quickshell assets/quickshell-settings -name '*.qml' -print0)
+
       - name: Validate HUD shader assets
         run: |
           qsb_path=$(command -v qsb)

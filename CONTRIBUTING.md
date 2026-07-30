@@ -76,15 +76,14 @@ Run the standard checks before submitting a change:
 
 ```sh
 make validate
-qmllint -I /usr/lib/qt6/qml assets/quickshell/*.qml
-qmllint -I /usr/lib/qt6/qml assets/quickshell-settings/*.qml
 make hud-shaders QSB=/usr/lib/qt6/bin/qsb
 git diff --check
 ```
 
-`qmllint` must run with the Qt and Quickshell import paths from a complete local
-installation. Unresolved imports make a lint result incomplete and must not be
-silently ignored.
+`make validate` runs `qmllint` with the import paths from the active Qt and
+Quickshell installation. Set `QMLLINT` when the executable is outside `PATH`.
+Unresolved imports make a lint result incomplete and must not be silently
+ignored.
 
 Tests should cover normal behavior and the relevant boundary: malformed input,
 maximum size, timeout, disconnect, stale state, or concurrent access. Prefer a

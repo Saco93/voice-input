@@ -645,7 +645,6 @@ QtObject {
                 root.backendRestartTimer.restart();
             else if (root.globalError.length === 0)
                 root.globalError = "Settings backend exited (code " + exitCode + ").";
-
         }
 
         // stdout is exclusively versioned, newline-delimited JSON. SplitParser
@@ -692,7 +691,6 @@ QtObject {
                 root.backendProcess.running = true;
             else
                 root.backendRestarting = false;
-
         }
     }
 

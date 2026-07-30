@@ -5,7 +5,7 @@ import QtQuick.Layouts
 Item {
     id: root
 
-    required property QtObject theme
+    required property Theme theme
     property string title: ""
     property string description: ""
     default property alias content: body.data

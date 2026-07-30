@@ -18,6 +18,9 @@ QtObject {
     readonly property string themePath: Quickshell.env("HOME") + "/.config/omarchy/current/theme/colors.toml"
     readonly property int waveformBarCount: 30
     readonly property int spectrumBandCount: 12
+    readonly property int maximumTranscriptLength: 1024 * 1024
+    readonly property var snapshotPhases: ["idle", "arming", "recording", "transcribing", "refining", "outputting", "error"]
+    readonly property var hudPositions: ["bottom-center", "bottom-left", "bottom-right"]
     readonly property var emptyWaveform: new Array(waveformBarCount).fill(0)
     readonly property var emptySpectrum: new Array(spectrumBandCount).fill(0)
     property var waveformBars: emptyWaveform
@@ -84,14 +87,98 @@ QtObject {
     // arrive independently over QLocalSocket and never trigger file polling.
     property FileView stateFile
     property Timer refreshTimer
+    property int invalidSnapshotCount: 0
+
+    function boundedString(value, maximumLength) {
+        return typeof value === "string" && value.length <= maximumLength;
+    }
+
+    function optionalString(value, maximumLength) {
+        return value === undefined || value === null || boundedString(value, maximumLength);
+    }
+
+    function optionalBoolean(value) {
+        return value === undefined || value === null || typeof value === "boolean";
+    }
+
+    function optionalBoundedInteger(value, minimum, maximum) {
+        return value === undefined || Number.isInteger(value) && value >= minimum && value <= maximum;
+    }
+
+    function snapshotValidationError(candidate) {
+        if (!candidate || typeof candidate !== "object" || Array.isArray(candidate))
+            return "snapshot is not an object";
+
+        if (typeof candidate.phase !== "string" || snapshotPhases.indexOf(candidate.phase) < 0)
+            return "phase is invalid";
+
+        if (!Number.isFinite(candidate.updated_at_ms) || candidate.updated_at_ms < 0)
+            return "updated_at_ms is invalid";
+
+        const requiredStrings = [["class", 64], ["icon", 64], ["text", 1024], ["tooltip", maximumTranscriptLength], ["transcript", maximumTranscriptLength], ["language", 256], ["engine", 2048], ["model", 2048]];
+        for (let index = 0; index < requiredStrings.length; index++) {
+            const field = requiredStrings[index][0];
+            if (!boundedString(candidate[field], requiredStrings[index][1]))
+                return field + " is invalid";
+
+        }
+        if (!Array.isArray(candidate.bars) || candidate.bars.length !== waveformBarCount)
+            return "bars are invalid";
+
+        for (let index = 0; index < candidate.bars.length; index++) {
+            const value = candidate.bars[index];
+            if (!Number.isFinite(value) || value < 0 || value > 1)
+                return "bars contain an invalid value";
+
+        }
+        if (candidate.hud_enabled !== undefined && typeof candidate.hud_enabled !== "boolean")
+            return "hud_enabled is invalid";
+
+        if (!optionalBoundedInteger(candidate.hud_margin_bottom, -10000, 10000))
+            return "hud_margin_bottom is invalid";
+
+        if (!optionalBoundedInteger(candidate.hud_height, 16, 1000))
+            return "hud_height is invalid";
+
+        if (candidate.hud_position !== undefined && hudPositions.indexOf(candidate.hud_position) < 0)
+            return "hud_position is invalid";
+
+        if (!optionalBoundedInteger(candidate.hud_offset_x, -10000, 10000) || !optionalBoundedInteger(candidate.hud_offset_y, -10000, 10000))
+            return "HUD offset is invalid";
+
+        const optionalStrings = [["raw_transcript", maximumTranscriptLength], ["refined_transcript", maximumTranscriptLength], ["refinement_status", 4096], ["output_target_hint", 256], ["output_target_resolved", 256], ["output_mode", 256], ["output_driver", 256], ["error", 16384]];
+        for (let index = 0; index < optionalStrings.length; index++) {
+            const field = optionalStrings[index][0];
+            if (!optionalString(candidate[field], optionalStrings[index][1]))
+                return field + " is invalid";
+
+        }
+        if (!optionalBoolean(candidate.refinement_changed))
+            return "refinement_changed is invalid";
+
+        return "";
+    }
+
+    function reportInvalidSnapshot(reason) {
+        invalidSnapshotCount++;
+        if (invalidSnapshotCount === 1 || invalidSnapshotCount % 100 === 0)
+            console.warn("Voice Input HUD ignored invalid state snapshot:", reason, "count", invalidSnapshotCount);
+
+    }
 
     function refreshSnapshot() {
         try {
             stateFile.reload();
             const parsed = JSON.parse(stateFile.text());
-            if (parsed && parsed.phase && parsed.updated_at_ms !== snapshot.updated_at_ms) {
+            const validationError = snapshotValidationError(parsed);
+            if (validationError.length > 0) {
+                reportInvalidSnapshot(validationError);
+                return ;
+            }
+            if (parsed.updated_at_ms !== snapshot.updated_at_ms) {
                 const previousPhase = snapshot.phase;
                 snapshot = parsed;
+                invalidSnapshotCount = 0;
                 if (parsed.phase !== previousPhase) {
                     console.info("Voice Input HUD state:", previousPhase, "->", parsed.phase);
                     if (parsed.phase === "idle")
@@ -100,6 +187,7 @@ QtObject {
                 }
             }
         } catch (error) {
+            reportInvalidSnapshot("state JSON could not be parsed");
         }
     }
 
