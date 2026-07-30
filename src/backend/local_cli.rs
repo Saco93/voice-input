@@ -1,7 +1,8 @@
 use std::{
     io::Read,
+    os::unix::process::CommandExt,
     path::Path,
-    process::{Command, Output, Stdio},
+    process::{Child, Command, Output, Stdio},
     sync::mpsc,
     thread,
     time::{Duration, Instant},
@@ -90,6 +91,10 @@ fn local_backend_timeout(config: &Config) -> Duration {
 }
 
 fn run_command_with_timeout(command: &mut Command, timeout: Duration) -> Result<Output> {
+    // Put the backend in its own process group so a timeout also terminates
+    // descendants that inherited stdout or stderr. Otherwise pipe readers can
+    // remain blocked after the direct child has been killed.
+    command.process_group(0);
     let mut child = command
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -112,15 +117,13 @@ fn run_command_with_timeout(command: &mut Command, timeout: Duration) -> Result<
             Ok(Some(status)) => break status,
             Ok(None) if started.elapsed() < timeout => thread::sleep(BACKEND_POLL_INTERVAL),
             Ok(None) => {
-                let _ = child.kill();
-                let _ = child.wait();
+                terminate_process_group(&mut child);
                 let _ = join_output_reader(stdout_handle, "stdout");
                 let _ = join_output_reader(stderr_handle, "stderr");
                 bail!("ASR backend timed out after {} seconds", timeout.as_secs());
             }
             Err(error) => {
-                let _ = child.kill();
-                let _ = child.wait();
+                terminate_process_group(&mut child);
                 let _ = join_output_reader(stdout_handle, "stdout");
                 let _ = join_output_reader(stderr_handle, "stderr");
                 return Err(error).context("failed to poll backend process");
@@ -141,6 +144,16 @@ fn run_command_with_timeout(command: &mut Command, timeout: Duration) -> Result<
         stdout,
         stderr,
     })
+}
+
+fn terminate_process_group(child: &mut Child) {
+    if let Ok(process_group) = i32::try_from(child.id()) {
+        // SAFETY: process_group is the positive PID assigned to the child and
+        // negating it asks kill(2) to signal only that child's process group.
+        let _ = unsafe { libc::kill(-process_group, libc::SIGKILL) };
+    }
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 fn read_output_bounded(
