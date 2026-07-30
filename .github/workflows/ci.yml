@@ -19,7 +19,7 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt
+          components: rustfmt, clippy
 
       - name: Install Qt 6.8.3 Shader Tools
         uses: jurplel/install-qt-action@v4
@@ -55,6 +55,9 @@ jobs:
 
       - name: Run tests
         run: cargo test --locked
+
+      - name: Lint Rust
+        run: cargo clippy --locked --all-targets -- -D warnings
 
       - name: Reject legacy GTK runtime assets
         run: |

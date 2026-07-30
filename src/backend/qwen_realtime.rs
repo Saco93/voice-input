@@ -328,6 +328,11 @@ fn run_session(
             forced_commit_count += 1;
             forced_commit_in_flight = true;
             last_transcription_activity = Instant::now();
+            // The local gate has observed sustained speech even though the
+            // server has emitted no VAD or transcript event. Preserve that
+            // fact so stopping the session performs full-audio recovery
+            // instead of discarding it as empty.
+            let _ = event_tx.send(AsrEvent::RealtimeTranscriptDelayed);
             eprintln!(
                 "voice-input realtime ASR: forced buffered-audio commit after transcription inactivity"
             );

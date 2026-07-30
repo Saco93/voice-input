@@ -33,6 +33,7 @@ pub enum AsrEvent {
     Ready,
     SpeechStarted,
     SpeechStopped,
+    RealtimeTranscriptDelayed,
     Partial { committed: String, unstable: String },
     SegmentFinal { text: String },
     Final { text: String },

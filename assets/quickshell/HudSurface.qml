@@ -10,8 +10,8 @@ PanelWindow {
 
     id: panel
 
-    required property var screenModel
-    required property var store
+    required property ShellScreen screenModel
+    required property StateStore store
     readonly property bool isFocusedScreen: {
         const focused = Hyprland.focusedMonitor;
         const monitor = Hyprland.monitorFor(screenModel);
@@ -27,8 +27,12 @@ PanelWindow {
         if (store.phase === "arming")
             return store.tooltip.trim().length > 0 ? store.tooltip.trim() : "Arming microphone…";
 
-        if (store.phase === "recording")
+        if (store.phase === "recording") {
+            if (store.tooltip.includes("Realtime transcript delayed"))
+                return "Realtime transcript delayed — audio will recover when stopped";
+
             return "Listening…";
+        }
 
         if (store.phase === "transcribing")
             return "Transcribing…";
@@ -68,7 +72,9 @@ PanelWindow {
     property real transcriptSessionStart: 0
     property real lastTranscriptGrowthClock: 0
     property int lastTranscriptUnits: 0
+    property string lastMeasuredTranscript: ""
     property var transcriptUnitTimes: []
+    property int transcriptUnitStartIndex: 0
     property bool paceWasRecording: false
     property real pitchSmoothed: 0.35
     property real timbreSmoothed: 0.5
@@ -205,7 +211,9 @@ PanelWindow {
                 panel.transcriptPaceSmoothed = 0;
                 panel.levelSmoothed = 0;
                 panel.transcriptUnitTimes = [];
+                panel.transcriptUnitStartIndex = 0;
                 panel.lastTranscriptUnits = 0;
+                panel.lastMeasuredTranscript = "";
                 panel.paceWasRecording = false;
             }
         }
@@ -217,7 +225,9 @@ PanelWindow {
                 panel.transcriptSessionStart = panel.paceClock;
                 panel.lastTranscriptGrowthClock = panel.paceClock;
                 panel.lastTranscriptUnits = panel.transcriptUnits(store.transcript);
+                panel.lastMeasuredTranscript = store.transcript;
                 panel.transcriptUnitTimes = [];
+                panel.transcriptUnitStartIndex = 0;
                 panel.transcriptPaceSmoothed = 0;
             }
             panel.paceWasRecording = panel.recording;
@@ -230,27 +240,39 @@ PanelWindow {
             // the previous partial, then counted in a 2.5-second rolling window.
             let transcriptPaceTarget = 0;
             if (panel.recording) {
-                const currentUnits = panel.transcriptUnits(store.transcript);
-                let unitTimes = panel.transcriptUnitTimes.slice();
-                if (currentUnits < panel.lastTranscriptUnits) {
-                    // A partial-ASR revision must not let restored units count
-                    // a second time inside the same rolling pace window.
-                    unitTimes = [];
-                    panel.lastTranscriptGrowthClock = panel.paceClock;
-                } else if (currentUnits > panel.lastTranscriptUnits) {
-                    const added = Math.min(32, currentUnits - panel.lastTranscriptUnits);
-                    const intervalStart = Math.max(panel.lastTranscriptGrowthClock, panel.paceClock - 2.5);
-                    const interval = Math.max(0.1, panel.paceClock - intervalStart);
-                    for (let index = 0; index < added; index++) unitTimes.push(intervalStart + interval * (index + 1) / added)
-                    panel.lastTranscriptGrowthClock = panel.paceClock;
+                // ASR text changes much less often than frames render. Parse
+                // transcript units only after a changed partial instead of
+                // running two regular expressions and cloning arrays at 60 Hz.
+                if (store.transcript !== panel.lastMeasuredTranscript) {
+                    const currentUnits = panel.transcriptUnits(store.transcript);
+                    let unitTimes = panel.transcriptUnitTimes.slice();
+                    if (currentUnits < panel.lastTranscriptUnits) {
+                        // A partial-ASR revision must not let restored units count
+                        // a second time inside the same rolling pace window.
+                        unitTimes = [];
+                        panel.transcriptUnitStartIndex = 0;
+                        panel.lastTranscriptGrowthClock = panel.paceClock;
+                    } else if (currentUnits > panel.lastTranscriptUnits) {
+                        const added = Math.min(32, currentUnits - panel.lastTranscriptUnits);
+                        const intervalStart = Math.max(panel.lastTranscriptGrowthClock, panel.paceClock - 2.5);
+                        const interval = Math.max(0.1, panel.paceClock - intervalStart);
+                        for (let index = 0; index < added; index++) unitTimes.push(intervalStart + interval * (index + 1) / added)
+                        panel.lastTranscriptGrowthClock = panel.paceClock;
+                    }
+                    panel.lastTranscriptUnits = currentUnits;
+                    panel.lastMeasuredTranscript = store.transcript;
+                    panel.transcriptUnitTimes = unitTimes;
                 }
-                panel.lastTranscriptUnits = currentUnits;
-                unitTimes = unitTimes.filter((timestamp) => {
-                    return timestamp >= panel.paceClock - 2.5;
-                });
-                panel.transcriptUnitTimes = unitTimes;
+                const cutoff = panel.paceClock - 2.5;
+                let startIndex = panel.transcriptUnitStartIndex;
+                while (startIndex < panel.transcriptUnitTimes.length && panel.transcriptUnitTimes[startIndex] < cutoff) startIndex++
+                if (startIndex > 64) {
+                    panel.transcriptUnitTimes = panel.transcriptUnitTimes.slice(startIndex);
+                    startIndex = 0;
+                }
+                panel.transcriptUnitStartIndex = startIndex;
                 const observedWindow = Math.max(0.75, Math.min(2.5, panel.paceClock - panel.transcriptSessionStart));
-                const unitsPerSecond = unitTimes.length / observedWindow;
+                const unitsPerSecond = (panel.transcriptUnitTimes.length - startIndex) / observedWindow;
                 const normalizedRate = Math.max(0, Math.min(1, (unitsPerSecond - 1.5) / 8.5));
                 transcriptPaceTarget = normalizedRate * normalizedRate * (3 - 2 * normalizedRate);
             }

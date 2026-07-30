@@ -90,12 +90,12 @@ pub fn parse() -> Result<Command> {
     match first.as_str() {
         "-h" | "--help" | "help" => Ok(Command::Help),
         "-V" | "--version" | "version" => Ok(Command::Version),
-        "daemon" => Ok(Command::Daemon),
+        "daemon" => require_no_args(args, "daemon").map(|()| Command::Daemon),
         "record" => parse_record(args.collect()),
         "hud" => parse_hud(args.collect()),
         "status" => parse_status(args.collect()),
         "config" => parse_config(args.collect()),
-        "settings" => Ok(Command::Settings),
+        "settings" => require_no_args(args, "settings").map(|()| Command::Settings),
         "settings-backend" => parse_settings_backend(args.collect()),
         "setup" => parse_setup(args.collect()),
         "llm" => parse_llm(args.collect()),
@@ -103,7 +103,22 @@ pub fn parse() -> Result<Command> {
     }
 }
 
+fn require_no_args(mut args: impl Iterator<Item = String>, command: &str) -> Result<()> {
+    if let Some(extra) = args.next() {
+        bail!("{command} does not accept argument `{extra}`");
+    }
+    Ok(())
+}
+
+fn require_arg_count(args: &[String], expected: usize, usage: &str) -> Result<()> {
+    if args.len() != expected {
+        bail!("expected `{usage}`");
+    }
+    Ok(())
+}
+
 fn parse_record(args: Vec<String>) -> Result<Command> {
+    require_arg_count(&args, 1, "record <start|stop|toggle|cancel>")?;
     let Some(action) = args.first() else {
         bail!("record requires start|stop|toggle|cancel");
     };
@@ -126,6 +141,9 @@ fn parse_hud(args: Vec<String>) -> Result<Command> {
 
     match action.as_str() {
         "move" => {
+            if !(2..=3).contains(&args.len()) {
+                bail!("expected `hud move <left|right|up|down> [amount]`");
+            }
             let direction = match args.get(1).map(String::as_str) {
                 Some("left") => HudMoveDirection::Left,
                 Some("right") => HudMoveDirection::Right,
@@ -147,6 +165,11 @@ fn parse_hud(args: Vec<String>) -> Result<Command> {
             Ok(Command::Hud(HudCommand::Move { direction, amount }))
         }
         "position" => {
+            require_arg_count(
+                &args,
+                2,
+                "hud position <bottom-center|bottom-left|bottom-right>",
+            )?;
             let position = match args.get(1).map(String::as_str) {
                 Some("bottom-center") | Some("center") => HudPositionCommand::Center,
                 Some("bottom-left") | Some("left") => HudPositionCommand::Left,
@@ -156,8 +179,14 @@ fn parse_hud(args: Vec<String>) -> Result<Command> {
             };
             Ok(Command::Hud(HudCommand::Position(position)))
         }
-        "center" => Ok(Command::Hud(HudCommand::Center)),
-        "reset" => Ok(Command::Hud(HudCommand::Reset)),
+        "center" => {
+            require_arg_count(&args, 1, "hud center")?;
+            Ok(Command::Hud(HudCommand::Center))
+        }
+        "reset" => {
+            require_arg_count(&args, 1, "hud reset")?;
+            Ok(Command::Hud(HudCommand::Reset))
+        }
         other => bail!("unknown hud command `{other}`"),
     }
 }
@@ -222,10 +251,16 @@ fn parse_setup(args: Vec<String>) -> Result<Command> {
     };
 
     let command = match subcommand.as_str() {
-        "model" => SetupCommand::Model,
-        "waybar" => SetupCommand::Waybar,
-        "hyprland" => SetupCommand::Hyprland,
-        "systemd" => SetupCommand::Systemd,
+        "model" | "waybar" | "hyprland" | "systemd" => {
+            require_arg_count(&args, 1, "setup <model|waybar|hyprland|systemd>")?;
+            match subcommand.as_str() {
+                "model" => SetupCommand::Model,
+                "waybar" => SetupCommand::Waybar,
+                "hyprland" => SetupCommand::Hyprland,
+                "systemd" => SetupCommand::Systemd,
+                _ => unreachable!(),
+            }
+        }
         "gpu" | "onnx" => SetupCommand::Backend(args),
         other => bail!("unknown setup command `{other}`"),
     };
@@ -234,6 +269,7 @@ fn parse_setup(args: Vec<String>) -> Result<Command> {
 }
 
 fn parse_llm(args: Vec<String>) -> Result<Command> {
+    require_arg_count(&args, 1, "llm test")?;
     let Some(subcommand) = args.first() else {
         bail!("llm requires a subcommand");
     };
@@ -273,4 +309,30 @@ COMPATIBILITY:
   `voice-input record toggle` remains available as the fallback path for compositor setups where
   press-and-release is not robust.
 "#
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn strings(values: &[&str]) -> Vec<String> {
+        values.iter().map(ToString::to_string).collect()
+    }
+
+    #[test]
+    fn fixed_arity_commands_reject_trailing_arguments() {
+        assert!(parse_record(strings(&["toggle", "extra"])).is_err());
+        assert!(parse_hud(strings(&["center", "extra"])).is_err());
+        assert!(parse_hud(strings(&["position", "left", "extra"])).is_err());
+        assert!(parse_llm(strings(&["test", "extra"])).is_err());
+        assert!(parse_setup(strings(&["systemd", "extra"])).is_err());
+    }
+
+    #[test]
+    fn backend_setup_preserves_forwarded_arguments() {
+        assert_eq!(
+            parse_setup(strings(&["gpu", "--device", "cuda"])).unwrap(),
+            Command::Setup(SetupCommand::Backend(strings(&["gpu", "--device", "cuda"])))
+        );
+    }
 }

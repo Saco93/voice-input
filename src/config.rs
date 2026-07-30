@@ -9,7 +9,7 @@ use std::{
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use tempfile::NamedTempFile;
-use url::Url;
+use url::{Host, Url};
 
 use crate::paths;
 
@@ -702,8 +702,12 @@ impl ConfigStore {
         let raw: RawConfig =
             toml::from_str(std::str::from_utf8(&source).context("config TOML is not valid UTF-8")?)
                 .context("failed to parse config TOML")?;
+        let config = Config::from_raw(raw);
+        config
+            .validate()
+            .context("configuration contains invalid values")?;
         Ok(LoadedConfig {
-            config: Config::from_raw(raw),
+            config,
             revision: revision(&source),
         })
     }
@@ -843,10 +847,24 @@ fn validate_url(
     };
     if !schemes.contains(&url.scheme()) {
         fields.insert(field.into(), format!("must use {}", schemes.join(" or ")));
+    } else if matches!(url.scheme(), "http" | "ws") && !url_host_is_loopback(&url) {
+        fields.insert(
+            field.into(),
+            "must use transport encryption unless the host is loopback".into(),
+        );
     } else if !url.username().is_empty() || url.password().is_some() {
         fields.insert(field.into(), "must not contain embedded credentials".into());
     } else if url.host_str().is_none() {
         fields.insert(field.into(), "must include a host".into());
+    }
+}
+
+fn url_host_is_loopback(url: &Url) -> bool {
+    match url.host() {
+        Some(Host::Ipv4(address)) => address.is_loopback(),
+        Some(Host::Ipv6(address)) => address.is_loopback(),
+        Some(Host::Domain(domain)) => domain.eq_ignore_ascii_case("localhost"),
+        None => false,
     }
 }
 
@@ -981,6 +999,26 @@ mod tests {
     }
 
     #[test]
+    fn plaintext_provider_urls_are_limited_to_loopback_hosts() {
+        let mut config = Config::default();
+        config.llm.enabled = true;
+        config.llm.model = "test-model".into();
+        config.llm.api_base_url = "http://provider.example/v1".into();
+        assert!(
+            config
+                .validate()
+                .expect_err("remote plaintext provider URL must be rejected")
+                .fields
+                .contains_key("llm.api_base_url")
+        );
+
+        config.llm.api_base_url = "http://127.0.0.1:8080/v1".into();
+        config
+            .validate()
+            .expect("loopback HTTP remains available for local development");
+    }
+
+    #[test]
     fn optional_derived_endpoints_and_backend_defaults_validate() {
         let mut config = Config::default();
         config.asr.provider = super::AsrProvider::AlibabaQwenRealtime;
@@ -1035,6 +1073,17 @@ mod tests {
         let path = temp.path().join("config.toml");
         fs::write(&path, "[broken").unwrap();
         assert!(ConfigStore::new(path).load().is_err());
+    }
+
+    #[test]
+    fn manually_edited_invalid_config_is_rejected_on_load() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("config.toml");
+        fs::write(&path, "[audio]\nsample_rate = 1\n").unwrap();
+        let error = ConfigStore::new(path)
+            .load()
+            .expect_err("validation must also apply to configuration loaded from disk");
+        assert!(error.to_string().contains("invalid values"));
     }
 
     #[test]

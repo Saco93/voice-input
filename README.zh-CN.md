@@ -100,6 +100,7 @@ systemctl --user status voice-input.service voice-input-hud.service
 | 安装 | [Installation](https://github.com/Saco93/voice-input/wiki/Installation) | [安装指南](https://github.com/Saco93/voice-input/wiki/Installation.zh-CN) |
 | 配置 | [Configuration](https://github.com/Saco93/voice-input/wiki/Configuration) | [配置参考](https://github.com/Saco93/voice-input/wiki/Configuration.zh-CN) |
 | 故障排查 | [Troubleshooting](https://github.com/Saco93/voice-input/wiki/Troubleshooting) | [故障排查](https://github.com/Saco93/voice-input/wiki/Troubleshooting.zh-CN) |
+| 开发与贡献 | [Contributing](CONTRIBUTING.md) | [工程规范](CONTRIBUTING.md) |
 
 Wiki 还包含 Agent context、桌面集成、安全隐私和开发说明。
 

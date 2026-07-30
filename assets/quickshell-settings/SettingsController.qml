@@ -6,6 +6,7 @@ QtObject {
     id: root
 
     readonly property int protocolVersion: 1
+    readonly property int requestTimeoutMs: 30000
     readonly property string backendBinary: Quickshell.env("VOICE_INPUT_BIN")
     readonly property bool backendConfigured: backendBinary.length > 0
     property int nextRequestId: 1
@@ -39,6 +40,9 @@ QtObject {
     readonly property bool dirty: JSON.stringify(draft) !== JSON.stringify(loadedConfig) || alibabaCredential.length > 0 || openrouterCredential.length > 0
     property Process backendProcess
     property Timer runtimePollTimer
+    property Timer requestTimeoutTimer
+    property Timer backendRestartTimer
+    property bool backendRestarting: false
 
     signal loaded()
     signal saved()
@@ -287,7 +291,8 @@ QtObject {
         const nextPending = clone(pending);
         const requestMetadata = {
             "method": method,
-            "quiet": quiet === true
+            "quiet": quiet === true,
+            "deadlineMs": Date.now() + requestTimeoutMs
         };
         // Pending request metadata must never retain credential request bodies.
         // Save needs only the already-sanitized config as a response fallback.
@@ -473,7 +478,38 @@ QtObject {
         runtimeRefreshPending = false;
         runtimeStatusState = "unavailable";
         runtimeStatusMessage = "Runtime status is unavailable.";
-        globalError = message;
+        if (message && message.length > 0)
+            globalError = message;
+
+    }
+
+    function restartBackend() {
+        if (!backendConfigured || backendRestarting)
+            return ;
+
+        backendRestarting = true;
+        if (backendProcess.running)
+            backendProcess.running = false;
+        else
+            backendRestartTimer.restart();
+    }
+
+    function expireRequests() {
+        const now = Date.now();
+        let expired = false;
+        let userFacing = false;
+        for (const key in pending) {
+            const request = pending[key];
+            if (request.deadlineMs <= now) {
+                expired = true;
+                userFacing = userFacing || !request.quiet;
+            }
+        }
+        if (!expired)
+            return ;
+
+        failProtocol(userFacing ? "The settings backend did not respond in time and is being restarted. The operation may not have completed." : "");
+        restartBackend();
     }
 
     function consumeLine(line) {
@@ -591,8 +627,13 @@ QtObject {
         command: root.backendConfigured ? [root.backendBinary, "settings-backend", "--stdio"] : []
         stdinEnabled: true
         running: root.backendConfigured
-        onStarted: root.reload()
+        onStarted: {
+            root.backendRestarting = false;
+            root.reload();
+        }
         onExited: (exitCode, exitStatus) => {
+            root.pending = ({
+            });
             root.loading = false;
             root.saving = false;
             root.testing = false;
@@ -600,7 +641,9 @@ QtObject {
             root.runtimeRefreshPending = false;
             root.runtimeStatusState = "unavailable";
             root.runtimeStatusMessage = "Runtime status is unavailable.";
-            if (root.globalError.length === 0)
+            if (root.backendRestarting)
+                root.backendRestartTimer.restart();
+            else if (root.globalError.length === 0)
                 root.globalError = "Settings backend exited (code " + exitCode + ").";
 
         }
@@ -632,6 +675,25 @@ QtObject {
         repeat: true
         running: root.backendConfigured
         onTriggered: root.refreshRuntimeStatus()
+    }
+
+    requestTimeoutTimer: Timer {
+        interval: 500
+        repeat: true
+        running: Object.keys(root.pending).length > 0
+        onTriggered: root.expireRequests()
+    }
+
+    backendRestartTimer: Timer {
+        interval: 250
+        repeat: false
+        onTriggered: {
+            if (root.backendConfigured)
+                root.backendProcess.running = true;
+            else
+                root.backendRestarting = false;
+
+        }
     }
 
 }

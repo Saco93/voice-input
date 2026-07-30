@@ -12,13 +12,19 @@ QSB ?= $(shell command -v qsb 2>/dev/null || command -v qsb6 2>/dev/null || if [
 HUD_SHADER_SOURCE := assets/quickshell/shaders/wavy-halo.frag
 HUD_SHADER_OUTPUT := target/quickshell/shaders/wavy-halo.frag.qsb
 
-.PHONY: build run install install-hud-assets hud-shaders clean enable-service disable-service
+.PHONY: build run validate install install-hud-assets hud-shaders clean enable-service disable-service
 
 build:
-	cargo build --release --offline
+	cargo build --release --locked
 
 run:
-	cargo run --offline -- daemon
+	cargo run --locked -- daemon
+
+validate:
+	cargo fmt --all -- --check
+	cargo check --locked --all-targets
+	cargo test --locked
+	cargo clippy --locked --all-targets -- -D warnings
 
 hud-shaders:
 	@test -n "$(QSB)" || { printf '%s\n' 'Qt Shader Tools are required; install qt6-shadertools or set QSB=/path/to/qsb' >&2; exit 1; }
@@ -43,6 +49,8 @@ install: build install-hud-assets
 	rm -f $(SHARE_DIR)/hud.py $(SHARE_DIR)/settings.py
 	install -Dm644 assets/pi/voice-input-session-registry.ts $(PI_EXTENSIONS_DIR)/voice-input-session-registry.ts
 	install -Dm644 assets/config.toml $(SHARE_DIR)/config.toml
+	install -Dm644 assets/voice-input.service $(SHARE_DIR)/voice-input.service
+	install -Dm644 assets/voice-input-hud.service $(SHARE_DIR)/voice-input-hud.service
 	install -Dm644 assets/omarchy-hyprland-snippet.conf $(SHARE_DIR)/omarchy-hyprland-snippet.conf
 	install -Dm644 assets/omarchy-waybar-snippet.jsonc $(SHARE_DIR)/omarchy-waybar-snippet.jsonc
 	mkdir -p $(SYSTEMD_USER_DIR)

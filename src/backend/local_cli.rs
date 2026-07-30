@@ -1,6 +1,13 @@
-use std::{path::Path, process::Command, sync::mpsc, thread};
+use std::{
+    io::Read,
+    path::Path,
+    process::{Command, Output, Stdio},
+    sync::mpsc,
+    thread,
+    time::{Duration, Instant},
+};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 
 use crate::{
     backend::{AsrBackend, AsrEvent, AsrSessionHandle, AudioSpec},
@@ -8,6 +15,9 @@ use crate::{
 };
 
 use super::text::{apply_script_conversion, extract_transcript};
+
+const BACKEND_OUTPUT_MAX_BYTES: u64 = 2 * 1024 * 1024;
+const BACKEND_POLL_INTERVAL: Duration = Duration::from_millis(20);
 
 pub struct LocalCliBackend;
 
@@ -50,13 +60,13 @@ impl AsrBackend for LocalCliBackend {
             .arg("transcribe")
             .arg(wav_path);
 
-        let output = command
-            .output()
+        let output = run_command_with_timeout(&mut command, local_backend_timeout(config))
             .with_context(|| format!("failed to run backend `{}`", config.asr.backend_command))?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            bail!("ASR backend failed: {}", stderr.trim());
+            let summary = stderr.trim().chars().take(4_096).collect::<String>();
+            bail!("ASR backend failed: {summary}");
         }
 
         let transcript = extract_transcript(&String::from_utf8_lossy(&output.stdout));
@@ -65,5 +75,117 @@ impl AsrBackend for LocalCliBackend {
         }
 
         apply_script_conversion(config.asr.language, &transcript)
+    }
+}
+
+fn local_backend_timeout(config: &Config) -> Duration {
+    let finalize_seconds = config.asr.finalize_timeout_ms.div_ceil(1_000);
+    Duration::from_secs(
+        config
+            .audio
+            .max_duration_secs
+            .max(finalize_seconds)
+            .clamp(30, 3_600),
+    )
+}
+
+fn run_command_with_timeout(command: &mut Command, timeout: Duration) -> Result<Output> {
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("failed to start backend process")?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow!("backend process did not provide stdout"))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow!("backend process did not provide stderr"))?;
+    let stdout_handle = read_output_bounded(stdout);
+    let stderr_handle = read_output_bounded(stderr);
+    let started = Instant::now();
+
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if started.elapsed() < timeout => thread::sleep(BACKEND_POLL_INTERVAL),
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = join_output_reader(stdout_handle, "stdout");
+                let _ = join_output_reader(stderr_handle, "stderr");
+                bail!("ASR backend timed out after {} seconds", timeout.as_secs());
+            }
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = join_output_reader(stdout_handle, "stdout");
+                let _ = join_output_reader(stderr_handle, "stderr");
+                return Err(error).context("failed to poll backend process");
+            }
+        }
+    };
+
+    let stdout = join_output_reader(stdout_handle, "stdout")?;
+    let stderr = join_output_reader(stderr_handle, "stderr")?;
+    if stdout.len() as u64 > BACKEND_OUTPUT_MAX_BYTES
+        || stderr.len() as u64 > BACKEND_OUTPUT_MAX_BYTES
+    {
+        bail!("ASR backend output exceeds {BACKEND_OUTPUT_MAX_BYTES} bytes");
+    }
+
+    Ok(Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+fn read_output_bounded(
+    reader: impl Read + Send + 'static,
+) -> thread::JoinHandle<std::io::Result<Vec<u8>>> {
+    thread::spawn(move || {
+        let mut bytes = Vec::new();
+        reader
+            .take(BACKEND_OUTPUT_MAX_BYTES + 1)
+            .read_to_end(&mut bytes)?;
+        Ok(bytes)
+    })
+}
+
+fn join_output_reader(
+    handle: thread::JoinHandle<std::io::Result<Vec<u8>>>,
+    label: &str,
+) -> Result<Vec<u8>> {
+    match handle.join() {
+        Ok(result) => result.with_context(|| format!("failed to read backend {label}")),
+        Err(_) => bail!("backend {label} reader panicked"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn backend_process_timeout_terminates_a_hung_command() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "sleep 2"]);
+        let started = Instant::now();
+        let error = run_command_with_timeout(&mut command, Duration::from_millis(50))
+            .expect_err("sleep must exceed the deadline");
+        assert!(error.to_string().contains("timed out"));
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn backend_process_output_is_collected() {
+        let mut command = Command::new("printf");
+        command.arg("transcript");
+        let output = run_command_with_timeout(&mut command, Duration::from_secs(1)).unwrap();
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"transcript");
     }
 }

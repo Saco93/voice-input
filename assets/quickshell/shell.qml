@@ -12,7 +12,7 @@ ShellRoot {
         model: Quickshell.screens
 
         HudSurface {
-            required property var modelData
+            required property ShellScreen modelData
             screenModel: modelData
             store: stateStore
         }

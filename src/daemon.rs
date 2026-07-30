@@ -2,7 +2,10 @@ use std::{
     collections::VecDeque,
     fs,
     io::{Read, Write},
-    os::unix::net::{UnixListener, UnixStream},
+    os::unix::{
+        fs::PermissionsExt,
+        net::{UnixListener, UnixStream},
+    },
     process::{Child, Command, Stdio},
     sync::{
         Arc, Mutex,
@@ -28,6 +31,8 @@ use anyhow::{Context, Result, anyhow, bail};
 
 const PROCESSING_WAVEFORM: [f32; WAVEFORM_BAR_COUNT] = [0.22; WAVEFORM_BAR_COUNT];
 const SPEECH_EVENT_GRACE_MS: u64 = 350;
+const CONTROL_COMMAND_MAX_BYTES: u64 = 4 * 1024;
+const CONTROL_READ_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub fn run(config: Config) -> Result<()> {
     let runtime_dir = paths::runtime_dir()?;
@@ -43,24 +48,51 @@ pub fn run(config: Config) -> Result<()> {
     let daemon = Arc::new(Mutex::new(Daemon::new(config, state, waveform)?));
     let listener = UnixListener::bind(&socket_path)
         .with_context(|| format!("failed to bind control socket at {}", socket_path.display()))?;
+    fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600)).with_context(|| {
+        format!(
+            "failed to restrict control socket permissions at {}",
+            socket_path.display()
+        )
+    })?;
     println!("Voice Input daemon listening on {}", socket_path.display());
 
     loop {
-        let (mut stream, _) = listener
+        let (stream, _) = listener
             .accept()
             .context("failed to accept control socket")?;
-        let mut buffer = String::new();
-        stream
-            .read_to_string(&mut buffer)
-            .context("failed to read control command")?;
-        let response = match handle_control(&daemon, buffer.trim()) {
-            Ok(response) => response,
-            Err(error) => format!("error: {error:#}\n"),
-        };
-        stream
-            .write_all(response.as_bytes())
-            .context("failed to write control response")?;
+        let daemon = daemon.clone();
+        thread::spawn(move || {
+            if let Err(error) = serve_control_connection(stream, &daemon) {
+                eprintln!("voice-input control connection failed: {error:#}");
+            }
+        });
     }
+}
+
+fn serve_control_connection(mut stream: UnixStream, daemon: &Arc<Mutex<Daemon>>) -> Result<()> {
+    stream
+        .set_read_timeout(Some(CONTROL_READ_TIMEOUT))
+        .context("failed to set control socket read timeout")?;
+    let command = read_control_command(&mut stream)?;
+    let response = match handle_control(daemon, command.trim()) {
+        Ok(response) => response,
+        Err(error) => format!("error: {error:#}\n"),
+    };
+    stream
+        .write_all(response.as_bytes())
+        .context("failed to write control response")
+}
+
+fn read_control_command(reader: &mut impl Read) -> Result<String> {
+    let mut bytes = Vec::new();
+    reader
+        .take(CONTROL_COMMAND_MAX_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .context("failed to read control command")?;
+    if bytes.len() as u64 > CONTROL_COMMAND_MAX_BYTES {
+        bail!("control command exceeds {CONTROL_COMMAND_MAX_BYTES} bytes");
+    }
+    String::from_utf8(bytes).context("control command is not valid UTF-8")
 }
 
 pub fn send_control_command(command: &str) -> Result<String> {
@@ -290,6 +322,7 @@ enum SessionAsrRuntime {
 #[derive(Clone)]
 struct ActiveCaptureSession {
     session_id: u64,
+    stop_flag: Arc<AtomicBool>,
     audio_buffer: Arc<Mutex<Vec<i16>>>,
     capture_ready: Arc<AtomicBool>,
     asr_ready: Arc<AtomicBool>,
@@ -567,6 +600,7 @@ impl Daemon {
         let capture_mode = if self.capture.is_enabled() {
             self.capture.attach_session(ActiveCaptureSession {
                 session_id,
+                stop_flag: stop_flag.clone(),
                 audio_buffer: audio_buffer.clone(),
                 capture_ready: capture_ready.clone(),
                 asr_ready: asr_ready.clone(),
@@ -1083,7 +1117,9 @@ fn spawn_pw_record(config: &Config) -> Result<(Child, std::process::ChildStdout)
 
     let mut child = command
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        // pw-record diagnostics are not part of the protocol. Leaving stderr
+        // piped without a reader can deadlock capture when that pipe fills.
+        .stderr(Stdio::null())
         .spawn()
         .context("failed to start pw-record")?;
     let stdout = child
@@ -1138,13 +1174,25 @@ fn run_capture_service(
             .clone();
 
         if let Some(active) = active {
-            {
+            if active.stop_flag.load(Ordering::SeqCst) {
+                continue;
+            }
+
+            let max_samples = max_recording_samples(&config);
+            let (accepted_samples, total_samples) = {
                 let mut buffer = active
                     .audio_buffer
                     .lock()
                     .expect("audio buffer mutex poisoned");
-                buffer.extend_from_slice(&chunk);
+                let accepted = chunk.len().min(max_samples.saturating_sub(buffer.len()));
+                buffer.extend_from_slice(&chunk[..accepted]);
+                (accepted, buffer.len())
+            };
+            if accepted_samples == 0 {
+                active.stop_flag.store(true, Ordering::SeqCst);
+                continue;
             }
+            let chunk = &chunk[..accepted_samples];
 
             if capture_hot.load(Ordering::SeqCst)
                 && !active.capture_ready.swap(true, Ordering::SeqCst)
@@ -1165,9 +1213,12 @@ fn run_capture_service(
                 let packets = packetizer
                     .lock()
                     .expect("ASR packetizer mutex poisoned")
-                    .push(&chunk);
+                    .push(chunk);
                 for packet in packets {
-                    let _ = tx.send(backend::AsrControl::AppendPcm16(packet));
+                    if tx.send(backend::AsrControl::AppendPcm16(packet)).is_err() {
+                        active.stop_flag.store(true, Ordering::SeqCst);
+                        break;
+                    }
                 }
             }
 
@@ -1178,9 +1229,13 @@ fn run_capture_service(
                 // HUD analysis is local and must remain responsive even when
                 // the remote server VAD misses a new speech-start event after
                 // a pause or an external desktop interaction.
-                .push(&chunk, true);
+                .push(chunk, true);
             for frame in frames {
                 active.waveform.try_publish(active.session_id, frame);
+            }
+
+            if accepted_samples < bytes.len() / 2 || total_samples >= max_samples {
+                active.stop_flag.store(true, Ordering::SeqCst);
             }
         }
     }
@@ -1202,6 +1257,12 @@ struct ReaderThreadContext {
     asr_packetizer: Option<Arc<Mutex<AsrPacketizer>>>,
     waveform_analyzer: Arc<Mutex<WaveformAnalyzer>>,
     waveform: WaveformPublisher,
+}
+
+fn max_recording_samples(config: &Config) -> usize {
+    let samples =
+        u64::from(config.audio.sample_rate).saturating_mul(config.audio.max_duration_secs);
+    usize::try_from(samples).unwrap_or(usize::MAX)
 }
 
 fn spawn_reader_thread(
@@ -1342,6 +1403,16 @@ fn spawn_realtime_event_thread(
                 }
                 backend::AsrEvent::SpeechStopped => {
                     voice_active.store(false, Ordering::Relaxed);
+                }
+                backend::AsrEvent::RealtimeTranscriptDelayed => {
+                    speech_detected.store(true, Ordering::SeqCst);
+                    state.update(|snapshot| {
+                        if matches!(snapshot.phase, Phase::Arming | Phase::Recording)
+                            && snapshot.transcript.is_empty()
+                        {
+                            snapshot.tooltip = "Listening…\nRealtime transcript delayed; full audio will be recovered when stopped".into();
+                        }
+                    })?;
                 }
                 backend::AsrEvent::Partial {
                     committed,
@@ -1505,5 +1576,32 @@ impl Daemon {
         let mut local_config = self.config.clone();
         local_config.asr.provider = AsrProvider::LocalCli;
         backend::transcribe(&local_config, temp_file.path())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Cursor;
+
+    use super::*;
+
+    #[test]
+    fn control_commands_are_bounded_and_require_utf8() {
+        let mut valid = Cursor::new(b"toggle".to_vec());
+        assert_eq!(read_control_command(&mut valid).unwrap(), "toggle");
+
+        let mut oversized = Cursor::new(vec![b'x'; CONTROL_COMMAND_MAX_BYTES as usize + 1]);
+        assert!(read_control_command(&mut oversized).is_err());
+
+        let mut invalid_utf8 = Cursor::new(vec![0xff]);
+        assert!(read_control_command(&mut invalid_utf8).is_err());
+    }
+
+    #[test]
+    fn recording_sample_limit_uses_rate_and_duration() {
+        let mut config = Config::default();
+        config.audio.sample_rate = 16_000;
+        config.audio.max_duration_secs = 90;
+        assert_eq!(max_recording_samples(&config), 1_440_000);
     }
 }
