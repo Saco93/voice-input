@@ -21,18 +21,18 @@ PanelWindow {
         return !focused || !monitor || monitor.name === focused.name;
     }
     readonly property string displayText: {
+        if (store.phase === "recording" && store.tooltip.includes("Realtime transcript delayed")) {
+            const recoveryNotice = "Realtime transcript delayed — audio will recover when stopped";
+            return store.transcript.trim().length > 0 ? store.transcript.trim() + "\n\n" + recoveryNotice : recoveryNotice;
+        }
         if (store.transcript.trim().length > 0)
             return store.transcript.trim();
 
         if (store.phase === "arming")
             return store.tooltip.trim().length > 0 ? store.tooltip.trim() : "Arming microphone…";
 
-        if (store.phase === "recording") {
-            if (store.tooltip.includes("Realtime transcript delayed"))
-                return "Realtime transcript delayed — audio will recover when stopped";
-
+        if (store.phase === "recording")
             return "Listening…";
-        }
 
         if (store.phase === "transcribing")
             return "Transcribing…";
@@ -265,7 +265,7 @@ PanelWindow {
                 }
                 const cutoff = panel.paceClock - 2.5;
                 let startIndex = panel.transcriptUnitStartIndex;
-                while (startIndex < panel.transcriptUnitTimes.length && panel.transcriptUnitTimes[startIndex] < cutoff) startIndex++
+                while (startIndex < panel.transcriptUnitTimes.length && panel.transcriptUnitTimes[startIndex] < cutoff)startIndex++
                 if (startIndex > 64) {
                     panel.transcriptUnitTimes = panel.transcriptUnitTimes.slice(startIndex);
                     startIndex = 0;

@@ -3,7 +3,7 @@ use std::{
     os::unix::process::CommandExt,
     path::Path,
     process::{Child, Command, Output, Stdio},
-    sync::mpsc,
+    sync::{Arc, atomic::AtomicBool, mpsc},
     thread,
     time::{Duration, Instant},
 };
@@ -41,6 +41,7 @@ impl AsrBackend for LocalCliBackend {
 
         Ok(AsrSessionHandle {
             control_tx,
+            abort_flag: Arc::new(AtomicBool::new(false)),
             event_rx,
             join,
         })

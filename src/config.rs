@@ -260,7 +260,7 @@ impl Default for Config {
             audio: AudioConfig {
                 device: "default".into(),
                 sample_rate: 16_000,
-                max_duration_secs: 90,
+                max_duration_secs: 300,
                 partial_interval_ms: 1_500,
                 pre_roll_enabled: false,
                 pre_roll_ms: 500,

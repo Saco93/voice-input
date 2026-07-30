@@ -5,7 +5,11 @@ mod text;
 
 use std::{
     path::Path,
-    sync::mpsc::{Receiver, SyncSender},
+    sync::{
+        Arc,
+        atomic::AtomicBool,
+        mpsc::{Receiver, SyncSender},
+    },
     thread::JoinHandle,
 };
 
@@ -29,7 +33,6 @@ pub const ASR_CONTROL_QUEUE_CAPACITY: usize = 128;
 pub enum AsrControl {
     AppendPcm16(Vec<i16>),
     Finish,
-    Cancel,
 }
 
 #[derive(Debug, Clone)]
@@ -46,6 +49,7 @@ pub enum AsrEvent {
 
 pub struct AsrSessionHandle {
     pub control_tx: SyncSender<AsrControl>,
+    pub abort_flag: Arc<AtomicBool>,
     pub event_rx: Receiver<AsrEvent>,
     pub join: JoinHandle<Result<()>>,
 }

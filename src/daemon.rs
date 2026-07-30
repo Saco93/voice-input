@@ -291,6 +291,7 @@ struct Daemon {
 struct Session {
     stop_flag: Arc<AtomicBool>,
     cancel_flag: Arc<AtomicBool>,
+    realtime_overloaded: Arc<AtomicBool>,
     audio_buffer: Arc<Mutex<Vec<i16>>>,
     output_target_hint: Option<output::OutputTargetHint>,
     agent_context_handle: Option<thread::JoinHandle<Option<agent_context::AgentSessionLocator>>>,
@@ -314,6 +315,7 @@ enum SessionAsrRuntime {
     },
     Realtime {
         control_tx: mpsc::SyncSender<backend::AsrControl>,
+        abort_flag: Arc<AtomicBool>,
         event_handle: thread::JoinHandle<Result<Option<String>>>,
         backend_handle: thread::JoinHandle<Result<()>>,
     },
@@ -323,6 +325,9 @@ enum SessionAsrRuntime {
 struct ActiveCaptureSession {
     session_id: u64,
     stop_flag: Arc<AtomicBool>,
+    automatic_finish_requested: Arc<AtomicBool>,
+    realtime_overloaded: Arc<AtomicBool>,
+    asr_abort_flag: Option<Arc<AtomicBool>>,
     audio_buffer: Arc<Mutex<Vec<i16>>>,
     capture_ready: Arc<AtomicBool>,
     asr_ready: Arc<AtomicBool>,
@@ -499,6 +504,8 @@ impl Daemon {
         self.waveform.try_reset(session_id);
         let stop_flag = Arc::new(AtomicBool::new(false));
         let cancel_flag = Arc::new(AtomicBool::new(false));
+        let automatic_finish_requested = Arc::new(AtomicBool::new(false));
+        let realtime_overloaded = Arc::new(AtomicBool::new(false));
         let audio_buffer = Arc::new(Mutex::new(pre_roll_audio.clone()));
         let partial_transcript = Arc::new(Mutex::new(String::new()));
         let capture_ready = Arc::new(AtomicBool::new(self.capture.is_capture_hot()));
@@ -543,7 +550,7 @@ impl Daemon {
             };
         })?;
 
-        let (asr_control_tx, asr_runtime) = match self.config.asr.provider {
+        let (asr_control_tx, asr_abort_flag, asr_runtime) = match self.config.asr.provider {
             AsrProvider::LocalCli => {
                 let partial_handle = spawn_partial_thread(
                     session_id,
@@ -554,7 +561,7 @@ impl Daemon {
                     audio_buffer.clone(),
                     partial_transcript.clone(),
                 );
-                (None, SessionAsrRuntime::Local { partial_handle })
+                (None, None, SessionAsrRuntime::Local { partial_handle })
             }
             AsrProvider::AlibabaQwenRealtime => {
                 let asr = backend::build(&self.config);
@@ -565,6 +572,7 @@ impl Daemon {
                     },
                 )?;
                 let control_tx = session.control_tx.clone();
+                let abort_flag = session.abort_flag.clone();
                 let event_handle = spawn_realtime_event_thread(RealtimeEventThreadContext {
                     session_id,
                     config: self.config.clone(),
@@ -574,12 +582,15 @@ impl Daemon {
                     asr_ready: asr_ready.clone(),
                     voice_active: voice_active.clone(),
                     speech_detected: speech_detected.clone(),
+                    realtime_overloaded: realtime_overloaded.clone(),
                     event_rx: session.event_rx,
                 });
                 (
                     Some(control_tx),
+                    Some(abort_flag.clone()),
                     SessionAsrRuntime::Realtime {
                         control_tx: session.control_tx,
+                        abort_flag,
                         event_handle,
                         backend_handle: session.join,
                     },
@@ -593,7 +604,15 @@ impl Daemon {
                 .expect("ASR packetizer mutex poisoned")
                 .push(&pre_roll_audio);
             for packet in packets {
-                let _ = tx.send(backend::AsrControl::AppendPcm16(packet));
+                if !try_enqueue_realtime_audio(tx, packet) {
+                    mark_realtime_overloaded(
+                        &realtime_overloaded,
+                        asr_abort_flag.as_deref(),
+                        &self.state,
+                        session_id,
+                    );
+                    break;
+                }
             }
         }
 
@@ -601,6 +620,9 @@ impl Daemon {
             self.capture.attach_session(ActiveCaptureSession {
                 session_id,
                 stop_flag: stop_flag.clone(),
+                automatic_finish_requested: automatic_finish_requested.clone(),
+                realtime_overloaded: realtime_overloaded.clone(),
+                asr_abort_flag: asr_abort_flag.clone(),
                 audio_buffer: audio_buffer.clone(),
                 capture_ready: capture_ready.clone(),
                 asr_ready: asr_ready.clone(),
@@ -627,6 +649,9 @@ impl Daemon {
                     state: self.state.clone(),
                     stop_flag: stop_flag.clone(),
                     cancel_flag: cancel_flag.clone(),
+                    automatic_finish_requested: automatic_finish_requested.clone(),
+                    realtime_overloaded: realtime_overloaded.clone(),
+                    asr_abort_flag,
                     audio_buffer: audio_buffer.clone(),
                     capture_ready,
                     asr_ready,
@@ -645,6 +670,7 @@ impl Daemon {
         self.session = Some(Session {
             stop_flag,
             cancel_flag,
+            realtime_overloaded,
             audio_buffer,
             output_target_hint,
             agent_context_handle,
@@ -710,6 +736,7 @@ impl Daemon {
             return Ok(());
         };
         let output_target_hint = session.output_target_hint;
+        let realtime_overloaded = session.realtime_overloaded.load(Ordering::SeqCst);
 
         if cancel {
             session.cancel_flag.store(true, Ordering::SeqCst);
@@ -729,7 +756,10 @@ impl Daemon {
             }
         }
 
-        if !cancel && matches!(&session.asr_runtime, SessionAsrRuntime::Realtime { .. }) {
+        if !cancel
+            && !realtime_overloaded
+            && matches!(&session.asr_runtime, SessionAsrRuntime::Realtime { .. })
+        {
             // Speech/transcript events can trail the final PCM packet slightly.
             // Give the event pump a brief chance to observe them, then treat a
             // session with no server-detected speech as a cancellation. This
@@ -748,7 +778,7 @@ impl Daemon {
             }
         }
 
-        let final_asr_packet = if cancel {
+        let final_asr_packet = if cancel || realtime_overloaded {
             None
         } else {
             session.asr_packetizer.take().and_then(|packetizer| {
@@ -798,6 +828,7 @@ impl Daemon {
             }
             SessionAsrRuntime::Realtime {
                 control_tx,
+                abort_flag,
                 event_handle,
                 backend_handle,
             } => {
@@ -811,14 +842,14 @@ impl Daemon {
                     })?;
                 }
 
-                if let Some(packet) = final_asr_packet {
-                    let _ = control_tx.send(backend::AsrControl::AppendPcm16(packet));
-                }
-                let _ = control_tx.send(if cancel {
-                    backend::AsrControl::Cancel
+                if cancel || realtime_overloaded {
+                    abort_flag.store(true, Ordering::SeqCst);
                 } else {
-                    backend::AsrControl::Finish
-                });
+                    if let Some(packet) = final_asr_packet {
+                        let _ = control_tx.send(backend::AsrControl::AppendPcm16(packet));
+                    }
+                    let _ = control_tx.send(backend::AsrControl::Finish);
+                }
                 let backend_result = join_session_handle(backend_handle, "realtime ASR worker");
                 let event_result = join_value_handle(event_handle, "realtime ASR event pump");
 
@@ -835,36 +866,52 @@ impl Daemon {
                         return Ok(());
                     }
 
-                    let remote_transcript = match (backend_result, event_result) {
-                        (Ok(()), Ok(Some(text))) if !text.trim().is_empty() => Some(
-                            backend::apply_script_conversion(self.config.asr.language, &text)?,
-                        ),
-                        (Ok(()), Ok(_)) => None,
-                        (Err(_), Ok(Some(text))) if !text.trim().is_empty() => Some(
-                            backend::apply_script_conversion(self.config.asr.language, &text)?,
-                        ),
-                        (Err(error), Ok(_)) | (Ok(()), Err(error)) => {
-                            if self.config.asr.fallback_to_local {
-                                let _ = self.state.update(|snapshot| {
-                                    snapshot.tooltip = format!(
-                                        "Realtime ASR failed, falling back locally…\n{error}"
-                                    );
-                                });
-                                None
-                            } else {
-                                return Err(error);
+                    if realtime_overloaded
+                        && !self.config.asr.alibaba.final_pass_enabled
+                        && !self.config.asr.fallback_to_local
+                    {
+                        bail!(
+                            "realtime audio delivery fell behind and no full-audio recovery is enabled"
+                        );
+                    }
+
+                    let remote_transcript = if realtime_overloaded {
+                        let _ = self.state.update(|snapshot| {
+                            snapshot.tooltip = "Recovering complete audio…".into();
+                        });
+                        None
+                    } else {
+                        match (backend_result, event_result) {
+                            (Ok(()), Ok(Some(text))) if !text.trim().is_empty() => Some(
+                                backend::apply_script_conversion(self.config.asr.language, &text)?,
+                            ),
+                            (Ok(()), Ok(_)) => None,
+                            (Err(_), Ok(Some(text))) if !text.trim().is_empty() => Some(
+                                backend::apply_script_conversion(self.config.asr.language, &text)?,
+                            ),
+                            (Err(error), Ok(_)) | (Ok(()), Err(error)) => {
+                                if self.config.asr.fallback_to_local {
+                                    let _ = self.state.update(|snapshot| {
+                                        snapshot.tooltip = format!(
+                                            "Realtime ASR failed, falling back locally…\n{error}"
+                                        );
+                                    });
+                                    None
+                                } else {
+                                    return Err(error);
+                                }
                             }
-                        }
-                        (Err(error), Err(_)) => {
-                            if self.config.asr.fallback_to_local {
-                                let _ = self.state.update(|snapshot| {
-                                    snapshot.tooltip = format!(
-                                        "Realtime ASR failed, falling back locally…\n{error}"
-                                    );
-                                });
-                                None
-                            } else {
-                                return Err(error);
+                            (Err(error), Err(_)) => {
+                                if self.config.asr.fallback_to_local {
+                                    let _ = self.state.update(|snapshot| {
+                                        snapshot.tooltip = format!(
+                                            "Realtime ASR failed, falling back locally…\n{error}"
+                                        );
+                                    });
+                                    None
+                                } else {
+                                    return Err(error);
+                                }
                             }
                         }
                     };
@@ -1184,12 +1231,15 @@ fn run_capture_service(
                     .audio_buffer
                     .lock()
                     .expect("audio buffer mutex poisoned");
-                let accepted = chunk.len().min(max_samples.saturating_sub(buffer.len()));
-                buffer.extend_from_slice(&chunk[..accepted]);
+                let accepted = append_recording_audio(&mut buffer, &chunk, max_samples);
                 (accepted, buffer.len())
             };
             if accepted_samples == 0 {
                 active.stop_flag.store(true, Ordering::SeqCst);
+                request_automatic_finish(
+                    &active.automatic_finish_requested,
+                    config.audio.max_duration_secs,
+                );
                 continue;
             }
             let chunk = &chunk[..accepted_samples];
@@ -1206,36 +1256,46 @@ fn run_capture_service(
                 )?;
             }
 
-            if let (Some(tx), Some(packetizer)) = (
-                active.asr_control_tx.as_ref(),
-                active.asr_packetizer.as_ref(),
-            ) {
-                let packets = packetizer
-                    .lock()
-                    .expect("ASR packetizer mutex poisoned")
-                    .push(chunk);
-                for packet in packets {
-                    if tx.send(backend::AsrControl::AppendPcm16(packet)).is_err() {
-                        active.stop_flag.store(true, Ordering::SeqCst);
-                        break;
-                    }
-                }
-            }
-
             let frames = active
                 .waveform_analyzer
                 .lock()
                 .expect("waveform analyzer mutex poisoned")
                 // HUD analysis is local and must remain responsive even when
-                // the remote server VAD misses a new speech-start event after
-                // a pause or an external desktop interaction.
+                // realtime network delivery falls behind.
                 .push(chunk, true);
             for frame in frames {
                 active.waveform.try_publish(active.session_id, frame);
             }
 
+            if !active.realtime_overloaded.load(Ordering::SeqCst)
+                && let (Some(tx), Some(packetizer)) = (
+                    active.asr_control_tx.as_ref(),
+                    active.asr_packetizer.as_ref(),
+                )
+            {
+                let packets = packetizer
+                    .lock()
+                    .expect("ASR packetizer mutex poisoned")
+                    .push(chunk);
+                for packet in packets {
+                    if !try_enqueue_realtime_audio(tx, packet) {
+                        mark_realtime_overloaded(
+                            &active.realtime_overloaded,
+                            active.asr_abort_flag.as_deref(),
+                            &state,
+                            active.session_id,
+                        );
+                        break;
+                    }
+                }
+            }
+
             if accepted_samples < bytes.len() / 2 || total_samples >= max_samples {
                 active.stop_flag.store(true, Ordering::SeqCst);
+                request_automatic_finish(
+                    &active.automatic_finish_requested,
+                    config.audio.max_duration_secs,
+                );
             }
         }
     }
@@ -1250,6 +1310,9 @@ struct ReaderThreadContext {
     state: StateHandle,
     stop_flag: Arc<AtomicBool>,
     cancel_flag: Arc<AtomicBool>,
+    automatic_finish_requested: Arc<AtomicBool>,
+    realtime_overloaded: Arc<AtomicBool>,
+    asr_abort_flag: Option<Arc<AtomicBool>>,
     audio_buffer: Arc<Mutex<Vec<i16>>>,
     capture_ready: Arc<AtomicBool>,
     asr_ready: Arc<AtomicBool>,
@@ -1265,6 +1328,65 @@ fn max_recording_samples(config: &Config) -> usize {
     usize::try_from(samples).unwrap_or(usize::MAX)
 }
 
+fn append_recording_audio(buffer: &mut Vec<i16>, chunk: &[i16], max_samples: usize) -> usize {
+    let accepted = chunk.len().min(max_samples.saturating_sub(buffer.len()));
+    buffer.extend_from_slice(&chunk[..accepted]);
+    accepted
+}
+
+fn try_enqueue_realtime_audio(
+    sender: &mpsc::SyncSender<backend::AsrControl>,
+    packet: Vec<i16>,
+) -> bool {
+    sender
+        .try_send(backend::AsrControl::AppendPcm16(packet))
+        .is_ok()
+}
+
+fn request_session_finish(requested: &AtomicBool, reason: &str) {
+    if requested.swap(true, Ordering::SeqCst) {
+        return;
+    }
+
+    eprintln!("voice-input capture: {reason}; finishing automatically");
+    thread::spawn(|| {
+        if let Err(error) = send_control_command("stop") {
+            eprintln!("voice-input capture: automatic finish request failed: {error:#}");
+        }
+    });
+}
+
+fn request_automatic_finish(requested: &AtomicBool, maximum_seconds: u64) {
+    request_session_finish(
+        requested,
+        &format!("reached configured {maximum_seconds}-second limit"),
+    );
+}
+
+fn mark_realtime_overloaded(
+    overloaded: &AtomicBool,
+    abort_flag: Option<&AtomicBool>,
+    state: &StateHandle,
+    session_id: u64,
+) {
+    if overloaded.swap(true, Ordering::SeqCst) {
+        return;
+    }
+
+    if let Some(abort_flag) = abort_flag {
+        abort_flag.store(true, Ordering::SeqCst);
+    }
+    eprintln!(
+        "voice-input realtime ASR: audio queue could not keep up for session {session_id}; preserving full audio for recovery"
+    );
+    let _ = state.update(|snapshot| {
+        if snapshot.phase == Phase::Recording {
+            snapshot.tooltip =
+                "Realtime transcript delayed — audio will recover when stopped".into();
+        }
+    });
+}
+
 fn spawn_reader_thread(
     mut stdout: impl Read + Send + 'static,
     context: ReaderThreadContext,
@@ -1276,6 +1398,9 @@ fn spawn_reader_thread(
             state,
             stop_flag,
             cancel_flag,
+            automatic_finish_requested,
+            realtime_overloaded,
+            asr_abort_flag,
             audio_buffer,
             capture_ready,
             asr_ready,
@@ -1284,31 +1409,46 @@ fn spawn_reader_thread(
             waveform_analyzer,
             waveform,
         } = context;
-        let started = Instant::now();
+        let max_samples = max_recording_samples(&config);
         let mut bytes = [0u8; 512];
-        let mut asr_control_tx = asr_control_tx;
 
         loop {
             if stop_flag.load(Ordering::SeqCst) || cancel_flag.load(Ordering::SeqCst) {
                 break;
             }
-            let read = stdout
-                .read(&mut bytes)
-                .context("failed reading from pw-record")?;
-            if read == 0 {
-                break;
-            }
+            let read = match stdout.read(&mut bytes) {
+                Ok(0) => {
+                    stop_flag.store(true, Ordering::SeqCst);
+                    request_session_finish(&automatic_finish_requested, "audio stream ended");
+                    break;
+                }
+                Ok(read) => read,
+                Err(error) => {
+                    stop_flag.store(true, Ordering::SeqCst);
+                    request_session_finish(&automatic_finish_requested, "audio stream failed");
+                    return Err(error).context("failed reading from pw-record");
+                }
+            };
 
             let mut chunk = Vec::with_capacity(read / 2);
             for pair in bytes[..read].chunks_exact(2) {
                 chunk.push(i16::from_le_bytes([pair[0], pair[1]]));
             }
 
-            let total_samples = {
+            let (accepted_samples, total_samples) = {
                 let mut buffer = audio_buffer.lock().expect("audio buffer mutex poisoned");
-                buffer.extend_from_slice(&chunk);
-                buffer.len()
+                let accepted = append_recording_audio(&mut buffer, &chunk, max_samples);
+                (accepted, buffer.len())
             };
+            if accepted_samples == 0 {
+                stop_flag.store(true, Ordering::SeqCst);
+                request_automatic_finish(
+                    &automatic_finish_requested,
+                    config.audio.max_duration_secs,
+                );
+                break;
+            }
+            let chunk = &chunk[..accepted_samples];
 
             if total_samples >= capture_warmup_samples(&config)
                 && !capture_ready.swap(true, Ordering::SeqCst)
@@ -1322,32 +1462,43 @@ fn spawn_reader_thread(
                 )?;
             }
 
-            if let (Some(tx), Some(packetizer)) = (asr_control_tx.as_ref(), asr_packetizer.as_ref())
+            let frames = waveform_analyzer
+                .lock()
+                .expect("waveform analyzer mutex poisoned")
+                // Keep local capture and visualization independent of realtime
+                // network backpressure.
+                .push(chunk, true);
+            for frame in frames {
+                waveform.try_publish(session_id, frame);
+            }
+
+            if !realtime_overloaded.load(Ordering::SeqCst)
+                && let (Some(tx), Some(packetizer)) =
+                    (asr_control_tx.as_ref(), asr_packetizer.as_ref())
             {
                 let packets = packetizer
                     .lock()
                     .expect("ASR packetizer mutex poisoned")
-                    .push(&chunk);
+                    .push(chunk);
                 for packet in packets {
-                    if tx.send(backend::AsrControl::AppendPcm16(packet)).is_err() {
-                        asr_control_tx = None;
+                    if !try_enqueue_realtime_audio(tx, packet) {
+                        mark_realtime_overloaded(
+                            &realtime_overloaded,
+                            asr_abort_flag.as_deref(),
+                            &state,
+                            session_id,
+                        );
                         break;
                     }
                 }
             }
 
-            let frames = waveform_analyzer
-                .lock()
-                .expect("waveform analyzer mutex poisoned")
-                // Keep visual analysis independent of remote VAD state. The
-                // analyzer's RMS floor suppresses silence locally.
-                .push(&chunk, true);
-            for frame in frames {
-                waveform.try_publish(session_id, frame);
-            }
-
-            if started.elapsed() >= Duration::from_secs(config.audio.max_duration_secs) {
+            if accepted_samples < bytes.len() / 2 || total_samples >= max_samples {
                 stop_flag.store(true, Ordering::SeqCst);
+                request_automatic_finish(
+                    &automatic_finish_requested,
+                    config.audio.max_duration_secs,
+                );
                 break;
             }
         }
@@ -1365,6 +1516,7 @@ struct RealtimeEventThreadContext {
     asr_ready: Arc<AtomicBool>,
     voice_active: Arc<AtomicBool>,
     speech_detected: Arc<AtomicBool>,
+    realtime_overloaded: Arc<AtomicBool>,
     event_rx: mpsc::Receiver<backend::AsrEvent>,
 }
 
@@ -1381,6 +1533,7 @@ fn spawn_realtime_event_thread(
             asr_ready,
             voice_active,
             speech_detected,
+            realtime_overloaded,
             event_rx,
         } = context;
         let mut final_transcript = None;
@@ -1407,10 +1560,10 @@ fn spawn_realtime_event_thread(
                 backend::AsrEvent::RealtimeTranscriptDelayed => {
                     speech_detected.store(true, Ordering::SeqCst);
                     state.update(|snapshot| {
-                        if matches!(snapshot.phase, Phase::Arming | Phase::Recording)
-                            && snapshot.transcript.is_empty()
-                        {
-                            snapshot.tooltip = "Listening…\nRealtime transcript delayed; full audio will be recovered when stopped".into();
+                        if matches!(snapshot.phase, Phase::Arming | Phase::Recording) {
+                            snapshot.tooltip =
+                                "Realtime transcript delayed — audio will recover when stopped"
+                                    .into();
                         }
                     })?;
                 }
@@ -1431,18 +1584,20 @@ fn spawn_realtime_event_thread(
                             || snapshot.phase == Phase::Transcribing
                         {
                             snapshot.transcript = transcript.clone();
-                            snapshot.tooltip =
-                                if snapshot.phase == Phase::Arming && transcript.is_empty() {
-                                    arming_tooltip(
-                                        &config,
-                                        capture_ready.load(Ordering::SeqCst),
-                                        asr_ready.load(Ordering::SeqCst),
-                                    )
-                                } else if transcript.is_empty() {
-                                    format!("Listening…\nLanguage: {}", config.asr.language.label())
-                                } else {
-                                    transcript.clone()
-                                };
+                            snapshot.tooltip = if realtime_overloaded.load(Ordering::SeqCst) {
+                                "Realtime transcript delayed — audio will recover when stopped"
+                                    .into()
+                            } else if snapshot.phase == Phase::Arming && transcript.is_empty() {
+                                arming_tooltip(
+                                    &config,
+                                    capture_ready.load(Ordering::SeqCst),
+                                    asr_ready.load(Ordering::SeqCst),
+                                )
+                            } else if transcript.is_empty() {
+                                format!("Listening…\nLanguage: {}", config.asr.language.label())
+                            } else {
+                                transcript.clone()
+                            };
                             snapshot.text = format!("session-{session_id}");
                         }
                     })?;
@@ -1457,7 +1612,12 @@ fn spawn_realtime_event_thread(
                     state.update(|snapshot| {
                         if snapshot.phase != Phase::Idle {
                             snapshot.transcript = text.clone();
-                            snapshot.tooltip = text.clone();
+                            snapshot.tooltip = if realtime_overloaded.load(Ordering::SeqCst) {
+                                "Realtime transcript delayed — audio will recover when stopped"
+                                    .into()
+                            } else {
+                                text.clone()
+                            };
                             snapshot.text = format!("session-{session_id}");
                         }
                     })?;
@@ -1603,5 +1763,21 @@ mod tests {
         config.audio.sample_rate = 16_000;
         config.audio.max_duration_secs = 90;
         assert_eq!(max_recording_samples(&config), 1_440_000);
+    }
+
+    #[test]
+    fn recording_audio_is_capped_without_dropping_the_accepted_prefix() {
+        let mut buffer = vec![1; 8];
+        assert_eq!(append_recording_audio(&mut buffer, &[2, 3, 4, 5], 10), 2);
+        assert_eq!(buffer, vec![1, 1, 1, 1, 1, 1, 1, 1, 2, 3]);
+        assert_eq!(append_recording_audio(&mut buffer, &[6, 7], 10), 0);
+        assert_eq!(buffer.len(), 10);
+    }
+
+    #[test]
+    fn realtime_audio_enqueue_reports_backpressure_without_blocking() {
+        let (sender, _receiver) = mpsc::sync_channel(1);
+        assert!(try_enqueue_realtime_audio(&sender, vec![1, 2]));
+        assert!(!try_enqueue_realtime_audio(&sender, vec![3, 4]));
     }
 }

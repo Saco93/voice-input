@@ -33,8 +33,8 @@ SettingsPage {
             SettingTextField {
                 theme: root.theme
                 label: "Maximum duration"
-                value: root.controller.value("audio.max_duration_secs", 90)
-                help: "Seconds."
+                value: root.controller.value("audio.max_duration_secs", 300)
+                help: "Recording finishes automatically at this limit, in seconds."
                 error: root.controller.errorFor("audio.max_duration_secs")
                 enabled: !root.controller.busy
                 onEdited: (value) => {

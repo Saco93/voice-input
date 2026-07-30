@@ -1,7 +1,11 @@
 use std::{
     net::{TcpStream, ToSocketAddrs},
     path::Path,
-    sync::mpsc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -41,12 +45,17 @@ impl AsrBackend for QwenRealtimeBackend {
     fn spawn_session(&self, config: &Config, spec: AudioSpec) -> Result<AsrSessionHandle> {
         let (control_tx, control_rx) = mpsc::sync_channel(ASR_CONTROL_QUEUE_CAPACITY);
         let (event_tx, event_rx) = mpsc::channel();
+        let abort_flag = Arc::new(AtomicBool::new(false));
+        let worker_abort_flag = abort_flag.clone();
         let config = config.clone();
 
-        let join = thread::spawn(move || run_session(config, spec, control_rx, event_tx));
+        let join = thread::spawn(move || {
+            run_session(config, spec, control_rx, worker_abort_flag, event_tx)
+        });
 
         Ok(AsrSessionHandle {
             control_tx,
+            abort_flag,
             event_rx,
             join,
         })
@@ -61,6 +70,7 @@ fn run_session(
     config: Config,
     spec: AudioSpec,
     control_rx: mpsc::Receiver<AsrControl>,
+    abort_flag: Arc<AtomicBool>,
     event_tx: mpsc::Sender<AsrEvent>,
 ) -> Result<()> {
     let alibaba = &config.asr.alibaba;
@@ -111,7 +121,17 @@ fn run_session(
     let mut last_transcription_activity = Instant::now();
 
     loop {
+        if abort_flag.load(Ordering::SeqCst) {
+            let _ = socket.close(None);
+            return Ok(());
+        }
+
         while let Ok(control) = control_rx.try_recv() {
+            if abort_flag.load(Ordering::SeqCst) {
+                let _ = socket.close(None);
+                return Ok(());
+            }
+
             match control {
                 AsrControl::AppendPcm16(samples) => {
                     if finish_requested {
@@ -171,10 +191,6 @@ fn run_session(
                             next_event_id += 1;
                         }
                     }
-                }
-                AsrControl::Cancel => {
-                    let _ = socket.close(None);
-                    return Ok(());
                 }
             }
         }

@@ -58,7 +58,7 @@ QtObject {
             "audio": {
                 "device": "default",
                 "sample_rate": 16000,
-                "max_duration_secs": 90,
+                "max_duration_secs": 300,
                 "partial_interval_ms": 1500,
                 "pre_roll_enabled": false,
                 "pre_roll_ms": 500

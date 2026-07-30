@@ -80,6 +80,7 @@ QtObject {
         "Device": "设备",
         "Maximum duration": "最长时长",
         "Seconds.": "秒。",
+        "Recording finishes automatically at this limit, in seconds.": "达到此秒数后会自动结束录音。",
         "Enable pre-roll": "启用预录",
         "Keep a short capture buffer so the first syllable is preserved.": "保留一段短暂的采集缓冲，以免遗漏第一个音节。",
         "Recognition": "语音识别",
