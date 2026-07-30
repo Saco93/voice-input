@@ -19,7 +19,9 @@ use tungstenite::{
 use url::Url;
 
 use crate::{
-    backend::{AsrBackend, AsrControl, AsrEvent, AsrSessionHandle, AudioSpec},
+    backend::{
+        ASR_CONTROL_QUEUE_CAPACITY, AsrBackend, AsrControl, AsrEvent, AsrSessionHandle, AudioSpec,
+    },
     config::{AlibabaTurnMode, Config},
 };
 
@@ -37,7 +39,7 @@ impl QwenRealtimeBackend {
 
 impl AsrBackend for QwenRealtimeBackend {
     fn spawn_session(&self, config: &Config, spec: AudioSpec) -> Result<AsrSessionHandle> {
-        let (control_tx, control_rx) = mpsc::channel();
+        let (control_tx, control_rx) = mpsc::sync_channel(ASR_CONTROL_QUEUE_CAPACITY);
         let (event_tx, event_rx) = mpsc::channel();
         let config = config.clone();
 

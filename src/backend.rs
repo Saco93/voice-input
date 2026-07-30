@@ -5,7 +5,7 @@ mod text;
 
 use std::{
     path::Path,
-    sync::mpsc::{Receiver, Sender},
+    sync::mpsc::{Receiver, SyncSender},
     thread::JoinHandle,
 };
 
@@ -20,6 +20,10 @@ pub use text::apply_script_conversion;
 pub struct AudioSpec {
     pub sample_rate_hz: u32,
 }
+
+// At the 16 kHz capture rate, 128 packets bound queued PCM to roughly 16
+// seconds (512 KiB) and still accommodate the maximum 10-second pre-roll.
+pub const ASR_CONTROL_QUEUE_CAPACITY: usize = 128;
 
 #[derive(Debug)]
 pub enum AsrControl {
@@ -41,7 +45,7 @@ pub enum AsrEvent {
 }
 
 pub struct AsrSessionHandle {
-    pub control_tx: Sender<AsrControl>,
+    pub control_tx: SyncSender<AsrControl>,
     pub event_rx: Receiver<AsrEvent>,
     pub join: JoinHandle<Result<()>>,
 }

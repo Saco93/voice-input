@@ -83,8 +83,10 @@ QtObject {
     property Timer waveformReconnectTimer
     property FileView themeFile
     property Timer themeRefreshTimer
-    // Status and transcript remain in the atomic state file. Waveform samples
-    // arrive independently over QLocalSocket and never trigger file polling.
+    // Status and transcript remain in the atomically replaced state file.
+    // FileView change notifications do not reliably follow inode replacement,
+    // so use bounded polling: lower frequency while idle and the original
+    // responsive cadence while active. Waveform samples use the socket.
     property FileView stateFile
     property Timer refreshTimer
     property int invalidSnapshotCount: 0
@@ -364,7 +366,7 @@ QtObject {
     }
 
     refreshTimer: Timer {
-        interval: 50
+        interval: root.active ? 50 : 100
         repeat: true
         running: true
         triggeredOnStart: true
