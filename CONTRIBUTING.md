@@ -1,5 +1,7 @@
 # Contributing
 
+[简体中文](CONTRIBUTING.zh-CN.md)
+
 Voice Input is a Rust 2024 application with two Quickshell/Qt Quick interfaces:
 the runtime HUD and the settings window. Changes should preserve low capture
 latency, bounded resource use, private credential handling, and compatibility

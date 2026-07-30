@@ -23,9 +23,9 @@ flowchart LR
     Agent[Focused Pi / Codex] -. terminology only .-> LLM
 ```
 
-1. A persistent PipeWire capture service keeps a short pre-roll buffer, so speech immediately after the hotkey is not lost.
-2. Qwen Realtime streams partial text to the HUD while Server VAD controls waveform visibility.
-3. On toggle-off, the complete recording is optionally recognized again by the final ASR model.
+1. A persistent PipeWire capture service keeps a short pre-roll buffer, so speech immediately after the hotkey is not lost. Sessions stop and finalize automatically at the configured duration limit (five minutes by default).
+2. Qwen Realtime streams partial text to the HUD while Server VAD controls waveform visibility. Realtime delivery uses a bounded, nonblocking queue so network backpressure cannot freeze capture or the waveform.
+3. On toggle-off, the complete recording is optionally recognized again by the final ASR model. If realtime delivery falls behind, incomplete remote text is rejected and the complete audio buffer is recovered through the enabled final pass or local fallback.
 4. The transcript is lightly cleaned by an OpenAI-compatible LLM. Refinement uses the configured timeout (15 seconds by default, capped at 30 seconds); when the budget is at least 10 seconds, contextual requests reserve five seconds for a transcript-only cleanup retry and ultimately fail open to Final ASR.
 5. Short text is typed with `wtype`; long text and XWayland targets use clipboard paste with automatic restoration.
 
@@ -100,7 +100,7 @@ systemctl --user status voice-input.service voice-input-hud.service
 | Installation | [Installation](https://github.com/Saco93/voice-input/wiki/Installation) | [安装指南](https://github.com/Saco93/voice-input/wiki/Installation.zh-CN) |
 | Configuration | [Configuration](https://github.com/Saco93/voice-input/wiki/Configuration) | [配置参考](https://github.com/Saco93/voice-input/wiki/Configuration.zh-CN) |
 | Troubleshooting | [Troubleshooting](https://github.com/Saco93/voice-input/wiki/Troubleshooting) | [故障排查](https://github.com/Saco93/voice-input/wiki/Troubleshooting.zh-CN) |
-| Development | [Contributing](CONTRIBUTING.md) | [工程规范](CONTRIBUTING.md) |
+| Development | [Contributing](CONTRIBUTING.md) | [贡献指南](CONTRIBUTING.zh-CN.md) |
 
 The Wiki also covers agent context, desktop integration, privacy, and development.
 

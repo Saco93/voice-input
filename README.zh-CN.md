@@ -23,9 +23,9 @@ flowchart LR
     Agent[当前 Pi / Codex] -. 仅提供术语 .-> LLM
 ```
 
-1. 常驻 PipeWire capture service 保留一小段 pre-roll，避免快捷键按下后最开始的语音被截掉。
-2. Qwen Realtime 持续把 partial transcript 发送到 HUD，Server VAD 控制波形是否可见。
-3. Toggle off 后，可选择让 Final ASR 对完整录音重新识别一次。
+1. 常驻 PipeWire capture service 保留一小段 pre-roll，避免快捷键按下后最开始的语音被截掉。录音达到配置的时长上限后会自动停止并进入最终处理；默认上限为五分钟。
+2. Qwen Realtime 持续把 partial transcript 发送到 HUD，Server VAD 控制波形是否可见。实时音频使用容量受限的非阻塞 queue，网络反压不会冻结采集或波形。
+3. Toggle off 后，可选择让 Final ASR 对完整录音重新识别一次。如果实时音频传输落后，程序会拒绝不完整的远程文本，并通过已启用的 final pass 或本地 fallback 恢复完整音频。
 4. OpenAI-compatible LLM 对文本做轻量整理。Refinement 使用配置的 timeout（默认 15 秒，最多 30 秒）；预算达到 10 秒时，包含 coding agent 上下文的请求会为纯 transcript 清理重试预留 5 秒，最终失败时使用 Final ASR。
 5. 短文本通过 `wtype` 输入；长文本和 XWayland 窗口自动使用剪贴板粘贴，并在结束后恢复原剪贴板。
 
@@ -100,7 +100,7 @@ systemctl --user status voice-input.service voice-input-hud.service
 | 安装 | [Installation](https://github.com/Saco93/voice-input/wiki/Installation) | [安装指南](https://github.com/Saco93/voice-input/wiki/Installation.zh-CN) |
 | 配置 | [Configuration](https://github.com/Saco93/voice-input/wiki/Configuration) | [配置参考](https://github.com/Saco93/voice-input/wiki/Configuration.zh-CN) |
 | 故障排查 | [Troubleshooting](https://github.com/Saco93/voice-input/wiki/Troubleshooting) | [故障排查](https://github.com/Saco93/voice-input/wiki/Troubleshooting.zh-CN) |
-| 开发与贡献 | [Contributing](CONTRIBUTING.md) | [工程规范](CONTRIBUTING.md) |
+| 开发与贡献 | [Contributing](CONTRIBUTING.md) | [贡献指南](CONTRIBUTING.zh-CN.md) |
 
 Wiki 还包含 Agent context、桌面集成、安全隐私和开发说明。
 
