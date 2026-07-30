@@ -244,6 +244,7 @@ SettingsPage {
             SectionCard {
                 theme: root.theme
                 title: "Recognition timeouts"
+                showDivider: alibabaTuningCard.visible || alibabaFinalPassCard.visible
 
                 SettingTextField {
                     theme: root.theme
@@ -272,9 +273,12 @@ SettingsPage {
             }
 
             SectionCard {
+                id: alibabaTuningCard
+
                 visible: root.controller.value("asr.provider", "local-cli") === "alibaba-qwen-realtime" || root.controller.hasErrorPrefix("asr.alibaba.")
                 theme: root.theme
                 title: "Alibaba tuning"
+                showDivider: alibabaFinalPassCard.visible
 
                 SettingTextField {
                     theme: root.theme
@@ -313,9 +317,12 @@ SettingsPage {
             }
 
             SectionCard {
+                id: alibabaFinalPassCard
+
                 visible: root.controller.value("asr.provider", "local-cli") === "alibaba-qwen-realtime" || root.controller.hasErrorPrefix("asr.alibaba.final_pass_")
                 theme: root.theme
                 title: "Alibaba final pass"
+                showDivider: false
 
                 SettingSwitch {
                     theme: root.theme

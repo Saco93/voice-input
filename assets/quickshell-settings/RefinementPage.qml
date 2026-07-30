@@ -148,6 +148,7 @@ SettingsPage {
             SectionCard {
                 theme: root.theme
                 title: "Agent context"
+                showDivider: false
 
                 SettingTextField {
                     theme: root.theme

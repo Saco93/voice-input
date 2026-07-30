@@ -9,7 +9,10 @@ Rectangle {
     required property SettingsController controller
 
     Layout.fillWidth: true
+    Layout.minimumHeight: 58
     Layout.preferredHeight: 58
+    Layout.maximumHeight: 58
+    implicitHeight: 58
     color: root.theme.surface
     border.color: root.theme.border
 
@@ -53,19 +56,28 @@ Rectangle {
 
         }
 
-        AppButton {
-            theme: root.theme
-            text: "Discard"
-            enabled: root.controller.dirty && !root.controller.busy
-            onClicked: root.controller.discard()
-        }
+        RowLayout {
+            Layout.alignment: Qt.AlignRight | Qt.AlignVCenter
+            Layout.fillWidth: false
+            spacing: 8
 
-        AppButton {
-            theme: root.theme
-            text: root.controller.saving ? "Saving…" : "Save & restart"
-            primary: true
-            enabled: root.controller.dirty && !root.controller.busy
-            onClicked: root.controller.save()
+            AppButton {
+                theme: root.theme
+                text: "Discard"
+                Layout.fillWidth: false
+                enabled: root.controller.dirty && !root.controller.busy
+                onClicked: root.controller.discard()
+            }
+
+            AppButton {
+                theme: root.theme
+                text: root.controller.saving ? "Saving…" : "Save & restart"
+                primary: true
+                Layout.fillWidth: false
+                enabled: root.controller.dirty && !root.controller.busy
+                onClicked: root.controller.save()
+            }
+
         }
 
     }

@@ -104,32 +104,42 @@ Rectangle {
 
         }
 
-        Rectangle {
+        Item {
             Layout.fillWidth: true
-            Layout.preferredHeight: 1
-            color: root.theme.border
-        }
+            Layout.preferredHeight: 44
 
-        ColumnLayout {
-            Layout.fillWidth: true
-            Layout.leftMargin: 8
-            Layout.rightMargin: 8
-            spacing: 3
-
-            Label {
-                text: root.theme.tr("Local service")
-                color: root.theme.foreground
-                font.pixelSize: 11
-                font.weight: Font.Medium
-                Layout.fillWidth: true
+            Rectangle {
+                anchors.top: parent.top
+                width: parent.width
+                height: 1
+                color: root.theme.border
             }
 
-            Label {
-                text: root.serviceSummary
-                color: root.serviceRunning === false ? root.theme.error : root.theme.subtle
-                font.pixelSize: 11
-                elide: Text.ElideRight
-                Layout.fillWidth: true
+            ColumnLayout {
+                anchors.top: parent.top
+                anchors.left: parent.left
+                anchors.right: parent.right
+                anchors.topMargin: 14
+                anchors.leftMargin: 8
+                anchors.rightMargin: 8
+                spacing: 3
+
+                Label {
+                    text: root.theme.tr("Local service")
+                    color: root.theme.foreground
+                    font.pixelSize: 11
+                    font.weight: Font.Medium
+                    Layout.fillWidth: true
+                }
+
+                Label {
+                    text: root.serviceSummary
+                    color: root.serviceRunning === false ? root.theme.error : root.theme.subtle
+                    font.pixelSize: 11
+                    elide: Text.ElideRight
+                    Layout.fillWidth: true
+                }
+
             }
 
         }

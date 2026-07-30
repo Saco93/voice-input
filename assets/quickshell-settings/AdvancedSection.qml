@@ -21,17 +21,14 @@ Rectangle {
         anchors.right: parent.right
         spacing: 12
 
-        Rectangle {
-            Layout.fillWidth: true
-            Layout.preferredHeight: 1
-            color: root.theme.border
-        }
-
         ItemDelegate {
             Layout.fillWidth: true
             implicitHeight: 48
-            leftPadding: 0
-            rightPadding: 0
+            leftPadding: 12
+            rightPadding: 12
+            topPadding: 0
+            bottomPadding: 0
+            activeFocusOnTab: true
             Accessible.name: root.theme.tr((root.expanded ? "Hide " : "Show ") + "advanced settings")
             onClicked: root.expanded = !root.expanded
 
@@ -69,6 +66,7 @@ Rectangle {
             }
 
             background: Rectangle {
+                radius: 4
                 color: parent.hovered ? Qt.alpha(root.theme.elevated, 0.55) : "transparent"
                 border.width: parent.activeFocus ? 1 : 0
                 border.color: root.theme.accent

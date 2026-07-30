@@ -50,20 +50,25 @@ Rectangle {
             Accessible.name: root.theme.tr("Change settings language")
             onClicked: languageMenu.open()
 
-            Menu {
+            AppMenu {
                 id: languageMenu
 
-                y: languageButton.height
+                theme: root.theme
+                y: languageButton.height + 4
 
-                MenuItem {
+                AppMenuItem {
+                    theme: root.theme
                     text: "English"
+                    leadingText: checked ? "✓" : ""
                     checkable: true
                     checked: root.theme.i18n.locale === "en"
                     onTriggered: root.theme.i18n.setLocale("en")
                 }
 
-                MenuItem {
+                AppMenuItem {
+                    theme: root.theme
                     text: "简体中文"
+                    leadingText: checked ? "✓" : ""
                     checkable: true
                     checked: root.theme.i18n.locale === "zh-CN"
                     onTriggered: root.theme.i18n.setLocale("zh-CN")
@@ -96,13 +101,16 @@ Rectangle {
             Accessible.name: root.theme.tr("More actions")
             onClicked: overflowMenu.open()
 
-            Menu {
+            AppMenu {
                 id: overflowMenu
 
-                y: overflowButton.height
+                theme: root.theme
+                y: overflowButton.height + 4
 
-                MenuItem {
+                AppMenuItem {
+                    theme: root.theme
                     text: root.theme.tr(root.controller.loading ? "Reloading…" : "Reload settings")
+                    leadingText: "↻"
                     enabled: !root.controller.busy
                     onTriggered: root.controller.reload()
                 }

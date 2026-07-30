@@ -45,6 +45,7 @@ SettingsPage {
         SectionCard {
             theme: root.theme
             title: "State"
+            showDivider: false
 
             SettingTextField {
                 theme: root.theme

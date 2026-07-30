@@ -123,6 +123,7 @@ SettingsPage {
             SectionCard {
                 theme: root.theme
                 title: "XWayland"
+                showDivider: false
 
                 SettingSwitch {
                     theme: root.theme

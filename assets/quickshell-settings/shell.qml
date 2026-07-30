@@ -233,6 +233,7 @@ ShellRoot {
                     destinations: shell.destinations
                     serviceRunning: shell.serviceRunning()
                     serviceSummary: shell.serviceSummary()
+                    onCurrentIndexChanged: contentScroll.contentItem.contentY = 0
                     onNavigateRequested: (page) => {
                         return shell.navigate(page);
                     }
@@ -257,6 +258,7 @@ ShellRoot {
                         Layout.fillHeight: true
                         clip: true
                         contentWidth: availableWidth
+                        contentHeight: pageStack.height
                         ScrollBar.horizontal.policy: ScrollBar.AlwaysOff
 
                         StackLayout {

@@ -75,6 +75,7 @@ SettingsPage {
     SectionCard {
         theme: root.theme
         title: "Current configuration"
+        showDivider: false
 
         SettingsGrid {
             spacing: 0

@@ -8,6 +8,7 @@ Rectangle {
     required property QtObject theme
     property string title: ""
     property string description: ""
+    property bool showDivider: true
     default property alias content: body.data
 
     Layout.fillWidth: true
@@ -49,7 +50,8 @@ Rectangle {
         }
 
         Rectangle {
-            Layout.topMargin: 8
+            visible: root.showDivider
+            Layout.topMargin: 18
             Layout.fillWidth: true
             Layout.preferredHeight: 1
             color: root.theme.border

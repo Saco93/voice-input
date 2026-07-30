@@ -95,6 +95,7 @@ SettingsPage {
             SectionCard {
                 theme: root.theme
                 title: "Adjustment"
+                showDivider: false
 
                 SettingTextField {
                     theme: root.theme

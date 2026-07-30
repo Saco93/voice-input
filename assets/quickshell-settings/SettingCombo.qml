@@ -83,27 +83,58 @@ GridLayout {
                 border.color: root.error.length > 0 ? root.theme.error : (combo.activeFocus ? root.theme.accent : root.theme.border)
             }
 
-            popup.background: Rectangle {
-                color: root.theme.elevated
-                border.color: root.theme.border
-                radius: 4
+            popup: Popup {
+                y: combo.height + 4
+                width: combo.width
+                implicitHeight: Math.min(contentItem.implicitHeight + topPadding + bottomPadding, 260)
+                topPadding: 6
+                bottomPadding: 6
+                leftPadding: 6
+                rightPadding: 6
+                closePolicy: Popup.CloseOnEscape | Popup.CloseOnPressOutside
+
+                contentItem: ListView {
+                    clip: true
+                    implicitHeight: contentHeight
+                    model: combo.popup.visible ? combo.delegateModel : null
+                    currentIndex: combo.highlightedIndex
+                    highlightMoveDuration: 0
+
+                    ScrollIndicator.vertical: ScrollIndicator {
+                    }
+
+                }
+
+                background: Rectangle {
+                    color: root.theme.elevated
+                    border.width: 1
+                    border.color: root.theme.border
+                    radius: 6
+                }
+
             }
 
             delegate: ItemDelegate {
                 required property var modelData
                 required property int index
 
-                width: combo.width
+                width: combo.popup ? combo.popup.availableWidth : combo.width
+                implicitHeight: 34
+                leftPadding: 10
+                rightPadding: 10
                 text: root.theme.tr(modelData)
                 highlighted: combo.highlightedIndex === index
 
                 contentItem: Text {
                     text: parent.text
                     color: root.theme.foreground
+                    font.pixelSize: 11
+                    elide: Text.ElideRight
                     verticalAlignment: Text.AlignVCenter
                 }
 
                 background: Rectangle {
+                    radius: 4
                     color: parent.highlighted ? root.theme.surface : "transparent"
                 }
 
