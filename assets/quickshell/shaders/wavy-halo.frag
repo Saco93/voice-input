@@ -24,6 +24,9 @@ layout(std140, binding = 0) uniform buf {
     float spectralCentroid;
     float breath;
     float stage;
+    vec4 previousHaloColor;
+    float colorTransition;
+    float processingBlend;
 };
 
 vec3 rgbToHsv(vec3 color)
@@ -107,6 +110,61 @@ float spectrumEnvelope(float coordinate)
     );
 }
 
+float broadBandPeak(float coordinate, float center, float width)
+{
+    float distanceFromCenter = coordinate - center;
+    return exp(-width * distanceFromCenter * distanceFromCenter);
+}
+
+// Arming, silent Listening, and processing supply calm virtual frequency bands
+// to the same spline used by microphone input. Their broad peaks preserve full
+// geometric reach without pretending that silence or processing is live speech.
+float syntheticSpectrumBand(float index, float syntheticStage, float time)
+{
+    float coordinate = clamp(index, 0.0, 11.0) / 11.0;
+    float primaryCenter;
+    float secondaryCenter;
+    float profile;
+
+    if (syntheticStage < 0.5) {
+        primaryCenter = 0.50 + 0.08 * sin(6.2831853072 * time * 0.70);
+        secondaryCenter = 0.24 + 0.04 * sin(6.2831853072 * time * 0.46 + 1.2);
+        profile = 0.80 * broadBandPeak(coordinate, primaryCenter, 7.0)
+            + 0.20 * broadBandPeak(coordinate, secondaryCenter, 11.0);
+    } else {
+        // Finalizing, Refining, and Sending share this one continuously moving
+        // profile. Stage changes therefore alter color without selecting a new
+        // geometric animation or restarting its phase.
+        primaryCenter = 0.50 + 0.12 * sin(6.2831853072 * time * 0.78);
+        secondaryCenter = 0.72 - 0.06 * sin(6.2831853072 * time * 0.52 + 0.8);
+        profile = 0.76 * broadBandPeak(coordinate, primaryCenter, 6.0)
+            + 0.24 * broadBandPeak(coordinate, secondaryCenter, 9.0);
+    }
+
+    return clamp(0.34 + 0.66 * profile, 0.0, 1.0);
+}
+
+float syntheticSpectrumEnvelope(float coordinate, float syntheticStage, float time)
+{
+    float position = clamp(coordinate, 0.0, 1.0) * 11.0;
+    float base = floor(position);
+    float t = fract(position);
+    float t2 = t * t;
+    float t3 = t2 * t;
+    float weight0 = (1.0 - 3.0 * t + 3.0 * t2 - t3) / 6.0;
+    float weight1 = (4.0 - 6.0 * t2 + 3.0 * t3) / 6.0;
+    float weight2 = (1.0 + 3.0 * t + 3.0 * t2 - 3.0 * t3) / 6.0;
+    float weight3 = t3 / 6.0;
+    return clamp(
+        weight0 * syntheticSpectrumBand(base - 1.0, syntheticStage, time)
+            + weight1 * syntheticSpectrumBand(base, syntheticStage, time)
+            + weight2 * syntheticSpectrumBand(base + 1.0, syntheticStage, time)
+            + weight3 * syntheticSpectrumBand(base + 2.0, syntheticStage, time),
+        0.0,
+        1.0
+    );
+}
+
 // Map each exterior point to its closest position on the rounded capsule.
 // Straight-edge coordinates are independent of outward distance, preventing
 // the diagonal shear produced by projecting rays from the capsule center.
@@ -163,15 +221,11 @@ void main()
     vec2 point = qt_TexCoord0 * effectSize - 0.5 * effectSize;
     float distanceToCapsule = roundedBoxDistance(point, halfCapsule, radius);
 
-    vec2 normalizedPoint = point / halfCapsule;
     float straightWidth = max(capsuleWidth - 2.0 * radius, 0.0);
     float straightHeight = max(capsuleHeight - 2.0 * radius, 0.0);
     float perimeterLength = 2.0 * (straightWidth + straightHeight)
         + 6.283185307179586 * radius;
     float perimeter = perimeterCoordinate(point, halfCapsule, radius);
-    float theta = perimeter * 6.28318530717958647692;
-    float travelAngle = phase * 6.28318530717958647692 / max(perimeterLength, 1.0);
-    float travelingTheta = theta - travelAngle;
 
     float activity = clamp(level, 0.0, 1.0);
     float normalizedPitch = clamp(pitch, 0.0, 1.0);
@@ -180,47 +234,10 @@ void main()
     float normalizedCentroid = clamp(spectralCentroid, 0.0, 1.0);
     float normalizedBreath = clamp(breath, 0.0, 1.0);
 
-    // Every component uses the same traveling coordinate, so changing pitch
-    // changes spatial density without changing the wave's border speed.
-    float mode = mix(5.0, 12.0, normalizedPitch);
-    float lowerMode = floor(mode);
-    float modeBlend = smoothstep(0.0, 1.0, fract(mode));
-    float fundamental = mix(
-        sin(lowerMode * travelingTheta),
-        sin((lowerMode + 1.0) * travelingTheta),
-        modeBlend
-    );
-
-    // Adjacent-mode interference and a broad low-frequency envelope stop the
-    // peaks from looking mechanically equal. Timbre raises the contribution of
-    // the finer components, approximating the measured high-band energy.
-    float interferenceWeight = mix(0.08, 0.18, normalizedTimbre);
-    float interference = mix(
-        sin((lowerMode + 2.0) * travelingTheta + 1.7),
-        sin((lowerMode + 3.0) * travelingTheta + 1.7),
-        modeBlend
-    );
-    float harmonicWeight = mix(0.04, 0.12, normalizedTimbre);
-    float harmonic = mix(
-        sin(2.0 * lowerMode * travelingTheta + 0.8),
-        sin(2.0 * (lowerMode + 1.0) * travelingTheta + 0.8),
-        modeBlend
-    );
-    float profile = (fundamental + interferenceWeight * interference
-        + harmonicWeight * harmonic)
-        / (1.0 + interferenceWeight + harmonicWeight);
-    float heightEnvelope = clamp(
-        0.82
-            + 0.10 * sin(3.0 * travelingTheta + 1.1 + normalizedTimbre)
-            + 0.05 * sin(5.0 * travelingTheta - 1.4 + normalizedPitch),
-        0.65,
-        1.0
-    );
-    float verticalDirection = -normalizedPoint.y / max(length(normalizedPoint), 0.00001);
-    float directionalBias = 0.20 * (2.0 * normalizedTimbre - 1.0) * verticalDirection;
-    float wave = clamp(0.5 + 0.5 * profile + directionalBias, 0.0, 1.0);
-    float shapedWave = smoothstep(0.04, 0.96, wave);
-    float heightWave = clamp(pow(shapedWave, 0.82) * heightEnvelope, 0.0, 1.0);
+    // Stage-specific inputs assign this below. Keeping the legacy perimeter
+    // wave out of the Listening path prevents it from resurfacing while live
+    // speech decays into the quiet standby envelope.
+    float heightWave = 0.0;
 
     // Run the crest through the upper part of both rounded corners as well as
     // the straight top edge. Its normal therefore rotates with the capsule and
@@ -261,6 +278,13 @@ void main()
     // energetic bands produce a visibly deeper geometric height difference.
     float spectralWave = smoothstep(0.48, 0.96, spectrumEnvelope(spectralCoordinate));
     spectralWave = pow(spectralWave, 1.35);
+    float syntheticEnvelope = syntheticSpectrumEnvelope(
+        spectralCoordinate,
+        stage,
+        phase / max(capsuleWidth, 1.0)
+    );
+    float syntheticWave = smoothstep(0.34, 0.88, syntheticEnvelope);
+    syntheticWave = pow(syntheticWave, 0.90);
     float spectralPresence = max(max(max(band0, band1), max(band2, band3)),
         max(max(max(band4, band5), max(band6, band7)),
             max(max(band8, band9), max(band10, band11))));
@@ -268,54 +292,43 @@ void main()
     // into a presence gate once instead of multiplying the spectrum and reach
     // by the same small value twice, which flattened ordinary speech.
     float speechPresence = smoothstep(0.015, 0.18, activity);
-    float spectralBlend = speechPresence
-        * smoothstep(0.02, 0.25, spectralPresence) * 0.98;
+    float spectralAvailability = smoothstep(0.02, 0.25, spectralPresence) * 0.98;
 
-    // Every normal pipeline stage uses the same top-edge relief language. The
-    // stage only changes the source profile and its emphasis: preparation is
-    // sparse, final transcription consolidates, refinement interferes, and
-    // output sweeps in one direction. Recording remains the live spectrum.
+    // Every active stage uses a frequency envelope on the same top-edge
+    // renderer. Listening keeps the live microphone spectrum. The complete
+    // post-recording pipeline shares one synthetic profile and one continuous
+    // phase, while processingBlend softens the handoff from the final live frame.
     float topTravel = phase / max(straightWidth, 1.0);
+    // Silent Listening uses the same full-height virtual spectrum as processing.
+    // Speech replaces that calm source with measured bands without changing the
+    // renderer or inserting the retired low-amplitude perimeter ripple.
+    float standbyHeight = syntheticWave;
+    float liveHeight = mix(standbyHeight, spectralWave, spectralAvailability);
+    float listeningHeight = mix(standbyHeight, liveHeight, speechPresence);
+    float listeningDrive = mix(0.90, 1.0, speechPresence);
     float stageDrive = speechPresence;
     if (stage < 0.5) {
-        float preparation = 0.5 + 0.5
-            * sin(12.5663706144 * spectralCoordinate - 3.2 * topTravel);
-        heightWave = 0.16 + 0.24 * preparation * (0.72 + 0.28 * normalizedBreath);
+        heightWave = syntheticWave;
         stageDrive = 0.44;
     } else if (stage < 1.5) {
-        // Silent Listening has a restrained traveling ripple instead of a
-        // static outline. Live speech smoothly replaces it with the measured
-        // frequency envelope as soon as local activity appears.
-        float listeningRipple = 0.5 + 0.5
-            * sin(12.5663706144 * spectralCoordinate - 2.6 * topTravel);
-        float standbyHeight = 0.10 + 0.42 * listeningRipple;
-        float liveHeight = mix(heightWave, spectralWave, spectralBlend);
-        heightWave = mix(standbyHeight, liveHeight, speechPresence);
-        stageDrive = mix(0.90, 1.0, speechPresence);
-    } else if (stage < 2.5) {
-        float centerDistance = spectralCoordinate - 0.5;
-        float consolidation = exp(-14.0 * centerDistance * centerDistance);
-        heightWave = 0.16 + 0.48 * consolidation
-            * (0.72 + 0.28 * normalizedBreath);
-        stageDrive = 0.58;
-    } else if (stage < 3.5) {
-        float primary = sin(18.8495559215 * spectralCoordinate + 5.0 * topTravel);
-        float secondary = sin(31.4159265359 * spectralCoordinate - 3.0 * topTravel + 1.3);
-        float interferenceProfile = clamp(0.5 + 0.34 * primary + 0.16 * secondary, 0.0, 1.0);
-        heightWave = 0.14 + 0.54 * interferenceProfile;
-        stageDrive = 0.70;
+        heightWave = listeningHeight;
+        stageDrive = listeningDrive;
     } else {
-        float sweepCenter = fract(3.0 * topTravel);
-        float sweepDistance = spectralCoordinate - sweepCenter;
-        float sweep = exp(-72.0 * sweepDistance * sweepDistance);
-        heightWave = 0.10 + 0.72 * sweep;
-        stageDrive = 0.82;
+        float processingMix = smootherStep(0.0, 1.0, processingBlend);
+        heightWave = mix(listeningHeight, syntheticWave, processingMix);
+        stageDrive = mix(listeningDrive, 0.68, processingMix);
     }
 
-    // Keep a small uniform breathing radius around the complete capsule. Only
-    // the shared top-edge profile is allowed to expand beyond it.
-    float ambientReach = mix(5.0, 9.0, normalizedBreath);
+    // Keep only a restrained contact glow around the complete capsule. The
+    // measured top-edge profile carries the visible reach and hierarchy.
+    float ambientReach = mix(3.5, 6.0, normalizedBreath);
     float reachPulse = clamp(0.55 * activity + 0.75 * normalizedFlux, 0.0, 1.0);
+    float recordingStage = 1.0 - smoothstep(0.20, 0.45, abs(stage - 1.0));
+    float silentListening = recordingStage * (1.0 - speechPresence);
+    float syntheticStage = step(-0.5, stage) * (1.0 - recordingStage);
+    float fullHeightVirtual = max(syntheticStage, silentListening);
+    float reachDrive = mix(stageDrive, 1.0, fullHeightVirtual);
+    reachPulse = max(reachPulse, fullHeightVirtual);
     float maximumActiveReach = max(
         ambientReach + 3.0,
         mix(50.0, 42.0, normalizedPitch) * mix(0.84, 1.0, reachPulse)
@@ -325,7 +338,7 @@ void main()
     float taperedHeightWave = heightWave * topEdgeMask;
     float activeReach = mix(ambientReach, maximumActiveReach, taperedHeightWave);
     float topSpectrumDrive = topEdgeMask * stageDrive;
-    float localReach = mix(ambientReach, activeReach, stageDrive);
+    float localReach = mix(ambientReach, activeReach, reachDrive);
     float antialias = max(fwidth(distanceToCapsule), 0.5);
     float outside = smoothstep(-antialias, antialias, distanceToCapsule);
     float falloff = 1.0 - smoothstep(0.0, localReach, distanceToCapsule);
@@ -336,28 +349,40 @@ void main()
     float activeContrast = mix(0.18, 1.0, pow(heightWave, 0.7));
     float normalizedStrength = clamp(strength, 0.0, 1.0);
     float ambientBrightness = normalizedStrength
-        * mix(0.28, 0.42, normalizedBreath);
+        * mix(0.16, 0.25, normalizedBreath);
     float activeBrightness = normalizedStrength
         * mix(0.85, 1.0, activity)
         * activeContrast
         * mix(0.90, 1.0, normalizedFlux);
     float brightness = mix(ambientBrightness, activeBrightness, topSpectrumDrive);
-    float waveAlpha = outside * falloff * brightness * haloColor.a;
+    // Blend the complete halo at once. A spatial wipe introduced a visible
+    // vertical boundary where old and new phase colors met on the top edge.
+    float colorBlend = smootherStep(0.0, 1.0, colorTransition);
+    vec4 effectiveHaloColor = mix(previousHaloColor, haloColor, colorBlend);
+    float waveAlpha = outside * falloff * brightness * effectiveHaloColor.a;
 
     // A narrow continuous foot keeps every spectral lobe optically attached to
     // the capsule even when the local wave contrast reaches a deep trough.
-    float anchorReach = mix(4.0, 7.0, normalizedBreath) + activity;
+    float anchorReach = mix(3.0, 5.0, normalizedBreath) + activity;
     float anchorFalloff = 1.0 - smoothstep(0.0, anchorReach, distanceToCapsule);
     anchorFalloff *= anchorFalloff;
     float anchorAlpha = outside * anchorFalloff * normalizedStrength
-        * mix(0.24, 0.34, activity) * haloColor.a;
+        * mix(0.16, 0.24, activity) * effectiveHaloColor.a;
     float alpha = max(waveAlpha, anchorAlpha);
-    float recordingStage = 1.0 - smoothstep(0.20, 0.45, abs(stage - 1.0));
-    float silentListening = recordingStage * (1.0 - speechPresence);
-    float standbyFalloff = 1.0 - smoothstep(0.0, localReach, distanceToCapsule);
-    float standbyAlpha = silentListening * topEdgeMask * outside * standbyFalloff
-        * mix(0.65, 0.90, normalizedStrength) * mix(0.45, 1.0, heightWave);
-    alpha = max(alpha, standbyAlpha);
+
+    // Enter processing with a short breath-like handoff: preserve the final
+    // Listening frame, dip almost out while geometry and color change, then
+    // restore the shared processing halo. Later processing phases keep blend=1
+    // and therefore do not repeat this visibility transition.
+    float handoffProgress = clamp(processingBlend, 0.0, 1.0);
+    float distanceFromHandoffCenter = abs(2.0 * handoffProgress - 1.0);
+    float handoffVisibility = mix(
+        0.05,
+        1.0,
+        smootherStep(0.0, 1.0, distanceFromHandoffCenter)
+    );
+    float processingStageMask = step(1.5, stage);
+    alpha *= mix(1.0, handoffVisibility, processingStageMask);
 
     // Frequency position controls local hue while energy controls saturation
     // and lightness. As different bands become dominant, the visible peak
@@ -365,9 +390,9 @@ void main()
     float spectralTone = mix(normalizedTimbre, normalizedCentroid, 0.82);
     float spectralHighlight = topSpectrumDrive * spectralTone * pow(heightWave, 0.6)
         + 0.08 * normalizedFlux * topEdgeMask;
-    vec3 localColor = haloColor.rgb * mix(0.84, 1.0, heightWave);
+    vec3 localColor = effectiveHaloColor.rgb * mix(0.84, 1.0, heightWave);
     localColor = mix(localColor, vec3(1.0), 0.14 * spectralHighlight);
-    vec3 baseHsv = rgbToHsv(haloColor.rgb);
+    vec3 baseHsv = rgbToHsv(effectiveHaloColor.rgb);
     float frequencyHue = (spectralCoordinate - 0.5) * 0.28;
     float energyHue = (spectralWave - 0.42) * 0.24
         * smoothstep(0.04, 0.55, spectralPresence);

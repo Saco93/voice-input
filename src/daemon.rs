@@ -537,6 +537,8 @@ impl Daemon {
                 hud_position: self.config.hud.position,
                 hud_offset_x: self.config.hud.offset_x,
                 hud_offset_y: self.config.hud.offset_y,
+                recording_started_at_ms: None,
+                recording_duration_ms: 0,
                 raw_transcript: None,
                 refined_transcript: None,
                 refinement_status: None,
@@ -742,6 +744,7 @@ impl Daemon {
             session.cancel_flag.store(true, Ordering::SeqCst);
         }
         session.stop_flag.store(true, Ordering::SeqCst);
+        self.state.update(Snapshot::stop_recording_clock)?;
         match session.capture_mode {
             SessionCaptureMode::Dedicated {
                 mut child,
@@ -1110,6 +1113,7 @@ fn refresh_recording_readiness(
         snapshot.text = format!("session-{session_id}");
 
         if capture_ready && asr_ready {
+            snapshot.start_recording_clock();
             snapshot.phase = Phase::Recording;
             snapshot.tooltip = if snapshot.transcript.is_empty() {
                 format!("Listening…\nLanguage: {}", config.asr.language.label())

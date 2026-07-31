@@ -35,7 +35,7 @@ PanelWindow {
             return "Listening…";
 
         if (store.phase === "transcribing")
-            return "Transcribing…";
+            return "Finalizing transcript…";
 
         if (store.phase === "refining")
             return "Refining transcript…";
@@ -67,7 +67,32 @@ PanelWindow {
     property real waveTravel: 0
     property real breathCycles: 0
     property real levelSmoothed: 0
+    property int observedHaloStage: -1
+    property color processingColorFrom: store.themeAccent
+    property color processingColorTo: store.themeAccent
+    property color lastRecordingColor: store.themeAccent
+    property real processingColorProgress: 1
+    property real processingGeometryBlend: 1
     property real speechPaceSmoothed: 0
+
+    // Initialize transition state synchronously with the phase change. Waiting
+    // for the next FrameAnimation tick would expose one frame at progress 1,
+    // then jump back to progress 0 before beginning the intended crossfade.
+    onHaloStageChanged: {
+        const previousStage = observedHaloStage;
+        if (processing) {
+            if (previousStage >= 2) {
+                const easedProgress = processingColorProgress * processingColorProgress * (3 - 2 * processingColorProgress);
+                processingColorFrom = mixColors(processingColorFrom, processingColorTo, easedProgress);
+            } else {
+                processingColorFrom = lastRecordingColor;
+            }
+            processingColorTo = phaseColor;
+            processingColorProgress = 0;
+            processingGeometryBlend = previousStage === 1 ? 0 : 1;
+        }
+        observedHaloStage = haloStage;
+    }
     property real transcriptPaceSmoothed: 0
     property real transcriptSessionStart: 0
     property real lastTranscriptGrowthClock: 0
@@ -78,9 +103,9 @@ PanelWindow {
     property bool paceWasRecording: false
     property real pitchSmoothed: 0.35
     property real timbreSmoothed: 0.5
-    // Listening rests at a slow, welcoming cadence while the user is silent,
-    // then blends into pitch-responsive motion as speech grows louder. Final
-    // ASR, refinement, and output retain their distinct processing cadences.
+    // Listening rests at a slow cadence while the user is silent, then blends
+    // into pitch-responsive motion as speech grows louder. Every post-recording
+    // stage shares one processing cadence so phase changes cannot restart it.
     readonly property real speechBreathHz: 0.48 + pitchSmoothed * 0.35
     // Analyzer levels occupy only part of the normalized range during ordinary
     // speech. Remove the silence floor, then expand that useful range so voice
@@ -89,22 +114,17 @@ PanelWindow {
         const normalized = Math.max(0, Math.min(1, (levelSmoothed - 0.02) / 0.28));
         return normalized * normalized * (3 - 2 * normalized);
     }
-    readonly property real breathHz: recording ? 0.42 + (speechBreathHz - 0.42) * voiceActivity : finalizing ? 0.36 : refining ? 0.52 : outputting ? 0.7 : 1.1
+    readonly property real breathHz: recording ? 0.42 + (speechBreathHz - 0.42) * voiceActivity : processing ? 0.48 : 1.1
     // Incremental ASR throughput becomes authoritative as recognized units
     // arrive; acoustic onset density provides immediate fallback at startup.
     readonly property real transcriptPaceConfidence: Math.min(1, lastTranscriptUnits / 6)
     readonly property real effectiveSpeechPace: speechPaceSmoothed * (1 - 0.8 * transcriptPaceConfidence) + transcriptPaceSmoothed * 0.8 * transcriptPaceConfidence
     readonly property real waveTravelSpeed: recording ? 72 + 12 * voiceActivity + 120 * effectiveSpeechPace : 72
     readonly property real breathPhase: 0.5 + 0.5 * Math.sin(breathCycles * 2 * Math.PI)
-    // All envelopes have zero slope at their dim and bright endpoints. Refine
-    // and output dwell near peak brightness so short phases remain legible.
+    // One zero-slope pulse continues across Finalizing, Refining, and Sending.
     readonly property real processingPulse: {
         const cycle = breathCycles - Math.floor(breathCycles);
-        const cosine = 0.5 - 0.5 * Math.cos(cycle * 2 * Math.PI);
-        if (outputting)
-            return Math.pow(cosine, 0.5);
-
-        return refining ? Math.pow(cosine, 0.72) : cosine;
+        return 0.5 - 0.5 * Math.cos(cycle * 2 * Math.PI);
     }
     readonly property real glowStrength: {
         if (arming)
@@ -118,14 +138,8 @@ PanelWindow {
             const voiceGlow = 0.58 * voiceActivity * (0.75 + 0.25 * breathPhase);
             return Math.min(1, waitingGlow + voiceGlow);
         }
-        if (finalizing)
-            return 0.38 + 0.32 * processingPulse;
-
-        if (refining)
-            return 0.42 + 0.34 * processingPulse;
-
-        if (outputting)
-            return 0.48 + 0.3 * processingPulse;
+        if (processing)
+            return 0.42 + 0.32 * processingPulse;
 
         return 0;
     }
@@ -147,7 +161,36 @@ PanelWindow {
     // visible row enters the top fade; the three rows below remain clear.
     readonly property int transcriptViewportHeight: 68
     readonly property int transcriptEdgeFadeHeight: 16
+    readonly property int statusBarHeight: 22
     readonly property int cardWidth: expanded ? 600 : 300
+    property real clockNowMs: Date.now()
+    readonly property real displayedRecordingDurationMs: {
+        if (recording && store.recordingStartedAtMs > 0)
+            return Math.max(store.recordingDurationMs, clockNowMs - store.recordingStartedAtMs);
+
+        return store.recordingDurationMs;
+    }
+    readonly property string phaseLabel: {
+        if (arming)
+            return "Arming";
+
+        if (recording)
+            return "Listening";
+
+        if (finalizing)
+            return "Finalizing";
+
+        if (refining)
+            return "Refining";
+
+        if (outputting)
+            return "Sending";
+
+        if (store.phase === "error")
+            return "Error";
+
+        return "Idle";
+    }
     // A newly mapped layer surface starts with a temporary 0x0 geometry until
     // Hyprland sends its configure event. Keep the capsule transparent during
     // that frame so its center calculation cannot render it at the left edge.
@@ -161,16 +204,32 @@ PanelWindow {
             if (accent.hslHue < 0)
                 return accent;
 
-            // Every processing stage uses the theme accent hue. Saturation and
-            // cadence distinguish Final ASR, refinement, and text delivery.
-            const saturationScale = finalizing ? 0.58 : outputting ? 0.8 : 1;
-            const lightnessOffset = finalizing ? 0.05 : 0;
-            return Qt.hsla(accent.hslHue, Math.min(1, accent.hslSaturation * saturationScale), Math.min(1, accent.hslLightness + lightnessOffset), 1);
+            // Processing geometry stays identical. Nearby hue, saturation, and
+            // lightness shifts provide the only visual distinction by phase.
+            const hueOffset = finalizing ? -0.035 : refining ? 0.025 : 0.055;
+            const hue = ((accent.hslHue + hueOffset) % 1 + 1) % 1;
+            const saturationScale = finalizing ? 0.55 : refining ? 1 : 0.75;
+            const lightnessOffset = finalizing ? 0.07 : outputting ? 0.04 : 0;
+            return Qt.hsla(hue, Math.min(1, accent.hslSaturation * saturationScale), Math.min(1, accent.hslLightness + lightnessOffset), 1);
         }
         if (store.phase === "error")
             return store.themeError;
 
         return store.themeForeground;
+    }
+
+    function mixColors(fromColor, toColor, amount) {
+        const t = Math.max(0, Math.min(1, amount));
+        return Qt.rgba(fromColor.r + (toColor.r - fromColor.r) * t, fromColor.g + (toColor.g - fromColor.g) * t, fromColor.b + (toColor.b - fromColor.b) * t, fromColor.a + (toColor.a - fromColor.a) * t);
+    }
+
+    function formatRecordingDuration(milliseconds) {
+        const totalSeconds = Math.max(0, Math.floor(milliseconds / 1000));
+        const minutes = Math.floor(totalSeconds / 60);
+        const seconds = totalSeconds % 60;
+        const minuteText = minutes < 10 ? "0" + minutes : String(minutes);
+        const secondText = seconds < 10 ? "0" + seconds : String(seconds);
+        return minuteText + ":" + secondText;
     }
 
     function transcriptUnits(text) {
@@ -203,6 +262,18 @@ PanelWindow {
         running: !store.active
     }
 
+    Timer {
+        interval: 100
+        repeat: true
+        running: panel.visible && panel.recording && store.recordingStartedAtMs > 0
+        onRunningChanged: {
+            if (running)
+                panel.clockNowMs = Date.now();
+
+        }
+        onTriggered: panel.clockNowMs = Date.now()
+    }
+
     FrameAnimation {
         running: (panel.arming || panel.recording || panel.processing) && panel.visible
         onRunningChanged: {
@@ -219,6 +290,16 @@ PanelWindow {
         }
         // frameTime is the elapsed time in seconds since the previous frame.
         onTriggered: {
+            if (panel.recording)
+                panel.lastRecordingColor = panel.glowColor;
+
+            if (panel.processing) {
+                const enteringProcessing = panel.processingGeometryBlend < 1;
+                const colorDuration = enteringProcessing ? 0.36 : 0.65;
+                panel.processingColorProgress = Math.min(1, panel.processingColorProgress + frameTime / colorDuration);
+                panel.processingGeometryBlend = Math.min(1, panel.processingGeometryBlend + frameTime / 0.36);
+            }
+
             panel.vizClock = (panel.vizClock + frameTime) % 3600;
             panel.paceClock += frameTime;
             if (panel.recording && !panel.paceWasRecording) {
@@ -283,7 +364,7 @@ PanelWindow {
             // modulate the rate smoothly instead of jumping the phase.
             panel.breathCycles = (panel.breathCycles + frameTime * panel.breathHz) % 120;
             const levelTarget = panel.recording ? store.voiceLevel : 0;
-            const levelConstant = levelTarget > panel.levelSmoothed ? 0.2 : 0.85;
+            const levelConstant = levelTarget > panel.levelSmoothed ? 0.15 : 0.8;
             panel.levelSmoothed += (levelTarget - panel.levelSmoothed) * (1 - Math.exp(-frameTime / levelConstant));
             panel.pitchSmoothed += (store.voicePitch - panel.pitchSmoothed) * (1 - Math.exp(-frameTime / 0.3));
             panel.timbreSmoothed += (store.voiceTimbre - panel.timbreSmoothed) * (1 - Math.exp(-frameTime / 0.3));
@@ -344,6 +425,9 @@ PanelWindow {
         spectralCentroid: store.voiceSpectralCentroid
         breath: panel.breathPhase
         stage: panel.haloStage
+        previousHaloColor: panel.processing ? panel.processingColorFrom : panel.glowColor
+        colorTransition: panel.processing ? panel.processingColorProgress : 1
+        processingBlend: panel.processing ? panel.processingGeometryBlend : 1
         visible: false
         layer.enabled: true
     }
@@ -368,7 +452,7 @@ PanelWindow {
         id: capsule
 
         width: panel.cardWidth
-        height: Math.max(Math.max(32, store.hudHeight), transcriptViewport.height + 24)
+        height: Math.max(Math.max(32, store.hudHeight), transcriptViewport.height + panel.statusBarHeight + 24)
         x: {
             if (store.hudPosition === "bottom-left")
                 return 24 + store.hudOffsetX;
@@ -384,10 +468,10 @@ PanelWindow {
         // edge the curved corner is only about one pixel inset, far less than
         // the twenty-pixel text margins. A pill radius (height / 2) let the
         // top and bottom text rows escape past the curved border instead.
-        radius: 18
-        color: Qt.rgba(0.067, 0.078, 0.106, 0.92)
+        radius: 14
+        color: Qt.rgba(0.067, 0.078, 0.106, 0.96)
         border.width: 1
-        border.color: Qt.alpha(panel.glowColor, 0.1 + 0.55 * panel.glowStrength)
+        border.color: Qt.alpha(store.themeForeground, 0.12)
         opacity: store.hudEnabled && store.active && panel.geometryReady ? 1 : 0
 
         Item {
@@ -395,7 +479,9 @@ PanelWindow {
 
             width: capsule.width - 40
             height: panel.transcriptViewportHeight
-            anchors.centerIn: parent
+            anchors.top: parent.top
+            anchors.topMargin: 12
+            anchors.horizontalCenter: parent.horizontalCenter
             clip: true
 
             Text {
@@ -414,10 +500,11 @@ PanelWindow {
                 // complete transcript upward instead of eliding its tail.
                 y: implicitHeight <= parent.height ? (parent.height - implicitHeight) / 2 : parent.height - implicitHeight
                 text: panel.displayText
-                color: "#eef2ff"
-                font.family: "Inter"
+                color: store.themeForeground
                 font.pixelSize: 14
-                font.weight: Font.DemiBold
+                font.weight: Font.Medium
+                lineHeight: 1.28
+                lineHeightMode: Text.ProportionalHeight
                 horizontalAlignment: panel.expanded ? Text.AlignLeft : Text.AlignHCenter
                 wrapMode: Text.WrapAtWordBoundaryOrAnywhere
 
@@ -453,6 +540,62 @@ PanelWindow {
 
                 }
 
+            }
+
+        }
+
+        Item {
+            id: statusBar
+
+            height: panel.statusBarHeight
+            anchors.left: parent.left
+            anchors.right: parent.right
+            anchors.bottom: parent.bottom
+            anchors.leftMargin: 20
+            anchors.rightMargin: 20
+            anchors.bottomMargin: 6
+
+            Rectangle {
+                anchors.left: parent.left
+                anchors.right: parent.right
+                anchors.top: parent.top
+                height: 1
+                color: Qt.alpha(store.themeForeground, 0.1)
+            }
+
+            Row {
+                anchors.left: parent.left
+                anchors.verticalCenter: parent.verticalCenter
+                anchors.verticalCenterOffset: 1
+                spacing: 7
+
+                Rectangle {
+                    width: 4
+                    height: 4
+                    radius: 2
+                    anchors.verticalCenter: parent.verticalCenter
+                    color: panel.processing ? panel.mixColors(panel.processingColorFrom, panel.processingColorTo, panel.processingColorProgress * panel.processingColorProgress * (3 - 2 * panel.processingColorProgress)) : panel.glowColor
+                    opacity: 0.9
+                }
+
+                Text {
+                    text: panel.phaseLabel
+                    color: Qt.alpha(store.themeForeground, 0.68)
+                    font.pixelSize: 11
+                    font.weight: Font.Medium
+                }
+
+            }
+
+            Text {
+                anchors.right: parent.right
+                anchors.verticalCenter: parent.verticalCenter
+                anchors.verticalCenterOffset: 1
+                text: panel.formatRecordingDuration(panel.displayedRecordingDurationMs)
+                color: Qt.alpha(store.themeForeground, 0.62)
+                font.family: "monospace"
+                font.pixelSize: 11
+                font.weight: Font.Medium
             }
 
         }

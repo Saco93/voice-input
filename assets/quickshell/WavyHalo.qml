@@ -19,6 +19,9 @@ ShaderEffect {
     required property real spectralCentroid
     required property real breath
     required property real stage
+    required property color previousHaloColor
+    required property real colorTransition
+    required property real processingBlend
     readonly property real haloPadding: 54
     readonly property real effectWidth: width
     readonly property real effectHeight: height

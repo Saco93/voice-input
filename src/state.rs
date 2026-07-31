@@ -49,6 +49,10 @@ pub struct Snapshot {
     pub hud_offset_x: i32,
     pub hud_offset_y: i32,
     #[serde(default)]
+    pub recording_started_at_ms: Option<u128>,
+    #[serde(default)]
+    pub recording_duration_ms: u64,
+    #[serde(default)]
     pub raw_transcript: Option<String>,
     #[serde(default)]
     pub refined_transcript: Option<String>,
@@ -91,6 +95,8 @@ impl Snapshot {
             hud_position: config.hud.position,
             hud_offset_x: config.hud.offset_x,
             hud_offset_y: config.hud.offset_y,
+            recording_started_at_ms: None,
+            recording_duration_ms: 0,
             raw_transcript: None,
             refined_transcript: None,
             refinement_status: None,
@@ -124,6 +130,8 @@ impl Snapshot {
             payload["hud_position"] = json!(self.hud_position);
             payload["hud_offset_x"] = json!(self.hud_offset_x);
             payload["hud_offset_y"] = json!(self.hud_offset_y);
+            payload["recording_started_at_ms"] = json!(self.recording_started_at_ms);
+            payload["recording_duration_ms"] = json!(self.recording_duration_ms);
             payload["raw_transcript"] = json!(self.raw_transcript);
             payload["refined_transcript"] = json!(self.refined_transcript);
             payload["refinement_status"] = json!(self.refinement_status);
@@ -135,6 +143,30 @@ impl Snapshot {
         }
 
         payload
+    }
+
+    pub fn start_recording_clock(&mut self) {
+        self.start_recording_clock_at(now_ms());
+    }
+
+    pub fn stop_recording_clock(&mut self) {
+        self.stop_recording_clock_at(now_ms());
+    }
+
+    fn start_recording_clock_at(&mut self, timestamp_ms: u128) {
+        if self.recording_started_at_ms.is_none() {
+            self.recording_started_at_ms = Some(timestamp_ms);
+            self.recording_duration_ms = 0;
+        }
+    }
+
+    fn stop_recording_clock_at(&mut self, timestamp_ms: u128) {
+        let Some(started_at_ms) = self.recording_started_at_ms.take() else {
+            return;
+        };
+        self.recording_duration_ms = timestamp_ms
+            .saturating_sub(started_at_ms)
+            .min(u64::MAX as u128) as u64;
     }
 }
 
@@ -264,6 +296,18 @@ mod tests {
         assert_eq!(extended["hud_enabled"], false);
         assert_eq!(extended["hud_margin_bottom"], 101);
         assert_eq!(extended["hud_height"], 64);
+        assert_eq!(extended["recording_started_at_ms"], Value::Null);
+        assert_eq!(extended["recording_duration_ms"], 0);
+    }
+
+    #[test]
+    fn recording_clock_starts_once_and_freezes_at_stop() {
+        let mut snapshot = Snapshot::idle(&Config::default());
+        snapshot.start_recording_clock_at(1_000);
+        snapshot.start_recording_clock_at(1_500);
+        snapshot.stop_recording_clock_at(3_750);
+        assert_eq!(snapshot.recording_started_at_ms, None);
+        assert_eq!(snapshot.recording_duration_ms, 2_750);
     }
 
     #[test]
@@ -274,9 +318,13 @@ mod tests {
         object.remove("hud_enabled");
         object.remove("hud_margin_bottom");
         object.remove("hud_height");
+        object.remove("recording_started_at_ms");
+        object.remove("recording_duration_ms");
         let snapshot: Snapshot = serde_json::from_value(Value::Object(object.clone())).unwrap();
         assert!(snapshot.hud_enabled);
         assert_eq!(snapshot.hud_margin_bottom, 72);
         assert_eq!(snapshot.hud_height, 56);
+        assert_eq!(snapshot.recording_started_at_ms, None);
+        assert_eq!(snapshot.recording_duration_ms, 0);
     }
 }

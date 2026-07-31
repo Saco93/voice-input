@@ -87,7 +87,7 @@ systemctl --user status voice-input.service voice-input-hud.service
 - Pi/Codex terminology context with validation, redaction, truncation, and prompt-injection isolation
 - Automatic long-text paste and clipboard restoration across Wayland/XWayland
 - Encrypted systemd credentials; no secrets in config, argv, logs, or UI
-- Theme-aware, monitor-aware, click-through Quickshell HUD
+- Theme-aware, monitor-aware, click-through Quickshell HUD with an integrated stage and effective recording timer
 - Native Quickshell Settings with validated Rust persistence and encrypted credentials
 - Explicit `/usr/bin/voxtype` local fallback without binary-name ambiguity
 

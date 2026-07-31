@@ -87,7 +87,7 @@ systemctl --user status voice-input.service voice-input-hud.service
 - Pi/Codex 术语上下文：进程验证、脱敏、截断与 prompt-injection 隔离
 - Wayland/XWayland 长文本自动粘贴与剪贴板恢复
 - systemd 加密凭据：配置、argv、日志和 UI 中不保存密钥
-- 跟随 Omarchy 主题、焦点显示器且不抢焦点的 Quickshell HUD
+- 跟随 Omarchy 主题、焦点显示器且不抢焦点的 Quickshell HUD，并在内部显示阶段和有效录音计时
 - 原生 Quickshell Settings，由 Rust 负责配置验证、持久化和加密凭据
 - 明确使用 `/usr/bin/voxtype` 作为本地 fallback，不再与主程序同名混淆
 

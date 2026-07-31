@@ -64,6 +64,8 @@ QtObject {
         "hud_position": "bottom-center",
         "hud_offset_x": 0,
         "hud_offset_y": 0,
+        "recording_started_at_ms": null,
+        "recording_duration_ms": 0,
         "error": null
     })
     readonly property string phase: snapshot.phase || "idle"
@@ -76,6 +78,8 @@ QtObject {
     readonly property string hudPosition: snapshot.hud_position || "bottom-center"
     readonly property int hudOffsetX: snapshot.hud_offset_x || 0
     readonly property int hudOffsetY: snapshot.hud_offset_y || 0
+    readonly property real recordingStartedAtMs: snapshot.recording_started_at_ms === null || snapshot.recording_started_at_ms === undefined ? 0 : Number(snapshot.recording_started_at_ms)
+    readonly property real recordingDurationMs: snapshot.recording_duration_ms === undefined ? 0 : Number(snapshot.recording_duration_ms)
     readonly property string errorText: snapshot.error || ""
     readonly property bool active: phase !== "idle"
     property var waveformSocket: null
@@ -105,6 +109,10 @@ QtObject {
 
     function optionalBoundedInteger(value, minimum, maximum) {
         return value === undefined || Number.isInteger(value) && value >= minimum && value <= maximum;
+    }
+
+    function optionalNullableBoundedInteger(value, maximum) {
+        return value === undefined || value === null || Number.isSafeInteger(value) && value >= 0 && value <= maximum;
     }
 
     function snapshotValidationError(candidate) {
@@ -147,6 +155,9 @@ QtObject {
 
         if (!optionalBoundedInteger(candidate.hud_offset_x, -10000, 10000) || !optionalBoundedInteger(candidate.hud_offset_y, -10000, 10000))
             return "HUD offset is invalid";
+
+        if (!optionalNullableBoundedInteger(candidate.recording_started_at_ms, Number.MAX_SAFE_INTEGER) || !optionalNullableBoundedInteger(candidate.recording_duration_ms, 3600000))
+            return "recording duration is invalid";
 
         const optionalStrings = [["raw_transcript", maximumTranscriptLength], ["refined_transcript", maximumTranscriptLength], ["refinement_status", 4096], ["output_target_hint", 256], ["output_target_resolved", 256], ["output_mode", 256], ["output_driver", 256], ["error", 16384]];
         for (let index = 0; index < optionalStrings.length; index++) {
@@ -237,7 +248,16 @@ QtObject {
         try {
             const message = JSON.parse(data);
             if (message.type === "reset") {
-                resetWaveform();
+                const resetSessionId = Number(message.session_id);
+                // The daemon closes an accepted recording with session_id 0
+                // before the polled snapshot can advance to transcribing. Keep
+                // the final live frame through that ordering gap so Listening
+                // crossfades directly into processing instead of flashing its
+                // silent standby envelope. The idle snapshot clears it shortly
+                // afterward; a positive ID still resets a newly starting session.
+                if (resetSessionId !== 0 || phase === "idle")
+                    resetWaveform();
+
                 return ;
             }
             if (message.type !== "waveform" || !Array.isArray(message.bars) || message.bars.length !== waveformBarCount)
