@@ -30,7 +30,7 @@ SettingsPage {
             SettingCombo {
                 theme: root.theme
                 label: "Mode"
-                value: root.controller.value("hotkey.mode", "hold")
+                value: root.controller.value("hotkey.mode", "toggle")
                 labels: ["Hold", "Toggle"]
                 values: ["hold", "toggle"]
                 error: root.controller.errorFor("hotkey.mode")

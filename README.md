@@ -66,8 +66,9 @@ source = ~/.local/share/voice-input/omarchy-hyprland-snippet.conf
 The default controls are:
 
 ```text
+F8                 Cancel the current dictation
 F9                 Toggle dictation
-Super+Ctrl+X       Toggle dictation
+F10                Discard and restart dictation
 Super+Ctrl+Alt+…   Move/reset the HUD
 ```
 

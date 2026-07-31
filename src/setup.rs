@@ -176,6 +176,15 @@ pub fn print_hyprland_snippet() -> Result<()> {
         "windowrule = center on, match:class ^org\\.quickshell$, match:title ^Voice Input Settings$"
     );
     println!("#");
+    println!("# Add adjacent F-key controls without changing Omarchy's stock Super+Ctrl+X:");
+    println!("unbind = , F8");
+    println!("unbind = , F9");
+    println!("unbind = , F10");
+    println!("binddp = , F8, Cancel voice input, exec, voice-input record cancel");
+    println!(
+        "binddp = , F10, Restart voice input, exec, bash -lc 'voice-input record cancel && voice-input record start'"
+    );
+    println!("#");
     match config.hotkey.mode {
         HotkeyMode::Hold => {
             println!("# Press to start recording, release the trigger key first to finalize:");
@@ -197,14 +206,14 @@ pub fn print_hyprland_snippet() -> Result<()> {
             println!("#");
             println!("# Toggle fallback if press/release is not reliable on your setup:");
             println!(
-                "# bindd = {}, Voice input, exec, voice-input record toggle",
+                "# binddp = {}, Voice input, exec, voice-input record toggle",
                 config.hotkey.accelerator
             );
         }
         HotkeyMode::Toggle => {
             println!("# Toggle mode is the robust fallback on Hyprland when bindr is unreliable:");
             println!(
-                "bindd = {}, Voice input, exec, voice-input record toggle",
+                "binddp = {}, Voice input, exec, voice-input record toggle",
                 config.hotkey.accelerator
             );
             println!("#");

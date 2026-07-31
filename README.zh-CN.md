@@ -66,8 +66,9 @@ source = ~/.local/share/voice-input/omarchy-hyprland-snippet.conf
 默认控制：
 
 ```text
+F8                 取消当前 dictation
 F9                 开始/结束 dictation
-Super+Ctrl+X       开始/结束 dictation
+F10                丢弃并重新开始 dictation
 Super+Ctrl+Alt+…   移动或重置 HUD
 ```
 

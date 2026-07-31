@@ -254,8 +254,8 @@ impl Default for Config {
         Self {
             state_file: "auto".into(),
             hotkey: HotkeyConfig {
-                accelerator: "SUPER CTRL, X".into(),
-                mode: HotkeyMode::Hold,
+                accelerator: ", F9".into(),
+                mode: HotkeyMode::Toggle,
             },
             audio: AudioConfig {
                 device: "default".into(),

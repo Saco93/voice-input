@@ -52,8 +52,8 @@ QtObject {
         return {
             "state_file": "auto",
             "hotkey": {
-                "accelerator": "SUPER CTRL, X",
-                "mode": "hold"
+                "accelerator": ", F9",
+                "mode": "toggle"
             },
             "audio": {
                 "device": "default",
