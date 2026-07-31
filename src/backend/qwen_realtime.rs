@@ -33,6 +33,11 @@ type QwenSocket = WebSocket<MaybeTlsStream<TcpStream>>;
 type QwenHandshakeResponse = tungstenite::http::Response<Option<Vec<u8>>>;
 type QwenConnection = (QwenSocket, QwenHandshakeResponse);
 
+const MAX_CONTROLS_PER_TICK: usize = 8;
+const TRANSCRIPTION_STALL_TIMEOUT: Duration = Duration::from_secs(8);
+const STALL_MIN_ACTIVE_SPEECH_SECS: usize = 2;
+const LOCAL_SPEECH_BURST_GAP: Duration = Duration::from_secs(1);
+
 pub struct QwenRealtimeBackend;
 
 impl QwenRealtimeBackend {
@@ -50,7 +55,11 @@ impl AsrBackend for QwenRealtimeBackend {
         let config = config.clone();
 
         let join = thread::spawn(move || {
-            run_session(config, spec, control_rx, worker_abort_flag, event_tx)
+            let result = run_session(config, spec, control_rx, worker_abort_flag, event_tx);
+            if let Err(error) = result.as_ref() {
+                eprintln!("voice-input realtime ASR: worker terminated: {error:#}");
+            }
+            result
         });
 
         Ok(AsrSessionHandle {
@@ -114,10 +123,8 @@ fn run_session(
     let mut speech_stopped_count = 0_u64;
     let mut appended_sample_count = 0_u64;
     let mut noise_gate = PcmNoiseGate::new((spec.sample_rate_hz as usize) / 2);
-    let mut samples_since_commit = 0_usize;
-    let mut locally_voiced_samples_since_commit = 0_usize;
-    let mut forced_commit_count = 0_u64;
-    let mut forced_commit_in_flight = false;
+    let mut active_local_speech_samples = 0_usize;
+    let mut last_local_speech_activity = None;
     let mut last_transcription_activity = Instant::now();
 
     loop {
@@ -126,7 +133,13 @@ fn run_session(
             return Ok(());
         }
 
-        while let Ok(control) = control_rx.try_recv() {
+        // Keep outbound audio and inbound transcription events fair. Draining
+        // an actively refilled queue without a bound can starve socket reads,
+        // eventually blocking both directions behind TCP backpressure.
+        for _ in 0..MAX_CONTROLS_PER_TICK {
+            let Ok(control) = control_rx.try_recv() else {
+                break;
+            };
             if abort_flag.load(Ordering::SeqCst) {
                 let _ = socket.close(None);
                 return Ok(());
@@ -148,9 +161,14 @@ fn run_session(
                         }),
                     )?;
                     appended_sample_count += filtered_samples.len() as u64;
-                    samples_since_commit += filtered_samples.len();
+                    active_local_speech_samples = update_local_speech_burst(
+                        active_local_speech_samples,
+                        filtered_samples.len(),
+                        has_local_speech,
+                        last_local_speech_activity.map(|activity: Instant| activity.elapsed()),
+                    );
                     if has_local_speech {
-                        locally_voiced_samples_since_commit += filtered_samples.len();
+                        last_local_speech_activity = Some(Instant::now());
                     }
                     next_event_id += 1;
                 }
@@ -166,18 +184,14 @@ fn run_session(
 
                     match config.asr.alibaba.turn_mode {
                         AlibabaTurnMode::ServerVad => {
-                            if forced_commit_in_flight {
-                                waiting_for_commit = true;
-                            } else {
-                                send_json(
-                                    &mut socket,
-                                    json!({
-                                        "event_id": format!("event-{}", next_event_id),
-                                        "type": "session.finish",
-                                    }),
-                                )?;
-                                next_event_id += 1;
-                            }
+                            send_json(
+                                &mut socket,
+                                json!({
+                                    "event_id": format!("event-{}", next_event_id),
+                                    "type": "session.finish",
+                                }),
+                            )?;
+                            next_event_id += 1;
                         }
                         AlibabaTurnMode::Manual => {
                             waiting_for_commit = true;
@@ -196,6 +210,24 @@ fn run_session(
         }
 
         match socket.read() {
+            Ok(Message::Close(frame)) => {
+                if let Some(frame) = frame {
+                    eprintln!(
+                        "voice-input realtime ASR: server closed websocket code={} reason={}",
+                        u16::from(frame.code),
+                        frame.reason
+                    );
+                } else {
+                    eprintln!("voice-input realtime ASR: server closed websocket");
+                }
+                let final_text = assembler.final_text();
+                if finish_requested && !final_text.is_empty() {
+                    let _ = event_tx.send(AsrEvent::Final { text: final_text });
+                } else if !finish_requested {
+                    let _ = event_tx.send(AsrEvent::RealtimeTranscriptDelayed);
+                }
+                return Ok(());
+            }
             Ok(message) => {
                 if let Some(event) = parse_server_event(message)? {
                     match event {
@@ -219,9 +251,6 @@ fn run_session(
                             }
                         }
                         ServerEvent::InputCommitted => {
-                            samples_since_commit = 0;
-                            locally_voiced_samples_since_commit = 0;
-                            forced_commit_in_flight = false;
                             if waiting_for_commit {
                                 waiting_for_commit = false;
                                 send_json(
@@ -242,6 +271,7 @@ fn run_session(
                             if noise_gate.speech_observed() {
                                 partial_event_count += 1;
                                 last_transcription_activity = Instant::now();
+                                active_local_speech_samples = 0;
                                 if partial_event_count == 1 {
                                     eprintln!(
                                         "voice-input realtime ASR: first partial after {} ms",
@@ -263,6 +293,7 @@ fn run_session(
                             if noise_gate.speech_observed() {
                                 completed_event_count += 1;
                                 last_transcription_activity = Instant::now();
+                                active_local_speech_samples = 0;
                                 let text = assembler.apply_completed(item_id, transcript);
                                 let _ = event_tx.send(AsrEvent::SegmentFinal { text });
                             }
@@ -281,7 +312,7 @@ fn run_session(
                         }
                         ServerEvent::SessionFinished => {
                             eprintln!(
-                                "voice-input realtime ASR: session finished with {partial_event_count} partial, {completed_event_count} completed, {speech_started_count} speech-started, {speech_stopped_count} speech-stopped, {forced_commit_count} forced-commit events, {appended_sample_count} appended samples, {} noise-gate openings, and {} suppressed samples",
+                                "voice-input realtime ASR: session finished with {partial_event_count} partial, {completed_event_count} completed, {speech_started_count} speech-started, {speech_stopped_count} speech-stopped, {appended_sample_count} appended samples, {} noise-gate openings, and {} suppressed samples",
                                 noise_gate.reopen_count(),
                                 noise_gate.suppressed_sample_count()
                             );
@@ -300,13 +331,15 @@ fn run_session(
                     || error.kind() == std::io::ErrorKind::TimedOut => {}
             Err(tungstenite::Error::ConnectionClosed) | Err(tungstenite::Error::AlreadyClosed) => {
                 eprintln!(
-                    "voice-input realtime ASR: connection closed with {partial_event_count} partial, {completed_event_count} completed, {speech_started_count} speech-started, {speech_stopped_count} speech-stopped, {forced_commit_count} forced-commit events, {appended_sample_count} appended samples, {} noise-gate openings, and {} suppressed samples",
+                    "voice-input realtime ASR: connection closed with {partial_event_count} partial, {completed_event_count} completed, {speech_started_count} speech-started, {speech_stopped_count} speech-stopped, {appended_sample_count} appended samples, {} noise-gate openings, and {} suppressed samples",
                     noise_gate.reopen_count(),
                     noise_gate.suppressed_sample_count()
                 );
                 let final_text = assembler.final_text();
                 if finish_requested && !final_text.is_empty() {
                     let _ = event_tx.send(AsrEvent::Final { text: final_text });
+                } else if !finish_requested {
+                    let _ = event_tx.send(AsrEvent::RealtimeTranscriptDelayed);
                 }
                 return Ok(());
             }
@@ -318,42 +351,28 @@ fn run_session(
             }
         }
 
-        // Qwen's server VAD occasionally accepts initial audio without any
-        // speech or transcription event. Allow one recovery commit only before
-        // the server has demonstrated normal VAD/transcription activity. A
-        // commit after an established segment can prevent a later speech turn
-        // from producing partials until session.finish.
-        let forced_commit_min_samples = (spec.sample_rate_hz as usize) * 3;
-        let forced_commit_min_voiced_samples = (spec.sample_rate_hz as usize) / 2;
-        if should_force_initial_commit(
+        // A connected server can stop producing transcription events while it
+        // continues accepting audio. Once local speech is still active and the
+        // gap is long enough, stop trusting this realtime stream. Do not send a
+        // manual commit in server-VAD mode: Qwen can reject it and close the
+        // socket. The daemon keeps the complete PCM buffer for stop-time final
+        // recognition.
+        if should_mark_realtime_stalled(
             finish_requested,
             matches!(config.asr.alibaba.turn_mode, AlibabaTurnMode::ServerVad),
-            forced_commit_in_flight,
-            forced_commit_count > 0,
-            speech_started_count > 0 || partial_event_count > 0 || completed_event_count > 0,
-            samples_since_commit >= forced_commit_min_samples
-                && locally_voiced_samples_since_commit >= forced_commit_min_voiced_samples,
-            last_transcription_activity.elapsed() >= Duration::from_secs(3),
+            active_local_speech_samples
+                >= (spec.sample_rate_hz as usize) * STALL_MIN_ACTIVE_SPEECH_SECS,
+            last_local_speech_activity
+                .is_some_and(|activity| activity.elapsed() <= LOCAL_SPEECH_BURST_GAP),
+            last_transcription_activity.elapsed() >= TRANSCRIPTION_STALL_TIMEOUT,
         ) {
-            send_json(
-                &mut socket,
-                json!({
-                    "event_id": format!("event-{}", next_event_id),
-                    "type": "input_audio_buffer.commit",
-                }),
-            )?;
-            next_event_id += 1;
-            forced_commit_count += 1;
-            forced_commit_in_flight = true;
-            last_transcription_activity = Instant::now();
-            // The local gate has observed sustained speech even though the
-            // server has emitted no VAD or transcript event. Preserve that
-            // fact so stopping the session performs full-audio recovery
-            // instead of discarding it as empty.
             let _ = event_tx.send(AsrEvent::RealtimeTranscriptDelayed);
             eprintln!(
-                "voice-input realtime ASR: forced buffered-audio commit after transcription inactivity"
+                "voice-input realtime ASR: transcription stalled for {} ms while local speech continued; preserving full audio for recovery",
+                last_transcription_activity.elapsed().as_millis()
             );
+            let _ = socket.close(None);
+            return Ok(());
         }
 
         if let Some(deadline) = finalize_deadline
@@ -435,27 +454,41 @@ fn pcm_chunk_exceeds_rms(samples: &[i16], minimum_rms: i64) -> bool {
 }
 
 fn pcm_chunk_has_local_speech(samples: &[i16]) -> bool {
-    // This stricter threshold gates forced-commit recovery; opening the audio
+    // This stricter threshold gates stalled-stream recovery; opening the audio
     // noise gate itself uses a lower threshold to preserve quiet speech.
     const LOCAL_SPEECH_RMS: i64 = 197; // approximately 0.006 of i16 full scale
     pcm_chunk_exceeds_rms(samples, LOCAL_SPEECH_RMS)
 }
 
-fn should_force_initial_commit(
+fn update_local_speech_burst(
+    current: usize,
+    packet_samples: usize,
+    has_speech: bool,
+    time_since_last_speech: Option<Duration>,
+) -> usize {
+    let current = if time_since_last_speech.is_some_and(|gap| gap > LOCAL_SPEECH_BURST_GAP) {
+        0
+    } else {
+        current
+    };
+    if has_speech {
+        current.saturating_add(packet_samples)
+    } else {
+        current
+    }
+}
+
+fn should_mark_realtime_stalled(
     finish_requested: bool,
     server_vad: bool,
-    forced_commit_in_flight: bool,
-    has_forced_commit: bool,
-    has_server_activity: bool,
-    has_recovery_audio: bool,
+    has_active_local_speech: bool,
+    has_recent_local_speech: bool,
     inactive_long_enough: bool,
 ) -> bool {
     !finish_requested
         && server_vad
-        && !forced_commit_in_flight
-        && !has_forced_commit
-        && !has_server_activity
-        && has_recovery_audio
+        && has_active_local_speech
+        && has_recent_local_speech
         && inactive_long_enough
 }
 
@@ -721,9 +754,11 @@ fn push_transcript_piece(target: &mut String, piece: &str) {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::{
         Message, PcmNoiseGate, TranscriptAssembler, parse_server_event, pcm_chunk_has_local_speech,
-        push_transcript_piece, should_force_initial_commit,
+        push_transcript_piece, should_mark_realtime_stalled, update_local_speech_burst,
     };
 
     #[test]
@@ -750,23 +785,35 @@ mod tests {
     }
 
     #[test]
-    fn forced_commit_is_only_an_initial_no_event_recovery() {
-        let eligible = |has_server_activity, has_forced_commit, has_recovery_audio| {
-            should_force_initial_commit(
-                false,
-                true,
-                false,
-                has_forced_commit,
-                has_server_activity,
-                has_recovery_audio,
-                true,
-            )
-        };
+    fn stalled_stream_requires_active_recent_speech_and_inactivity() {
+        assert!(should_mark_realtime_stalled(false, true, true, true, true));
+        assert!(!should_mark_realtime_stalled(true, true, true, true, true));
+        assert!(!should_mark_realtime_stalled(
+            false, false, true, true, true
+        ));
+        assert!(!should_mark_realtime_stalled(
+            false, true, false, true, true
+        ));
+        assert!(!should_mark_realtime_stalled(
+            false, true, true, false, true
+        ));
+        assert!(!should_mark_realtime_stalled(
+            false, true, true, true, false
+        ));
 
-        assert!(eligible(false, false, true));
-        assert!(!eligible(false, false, false));
-        assert!(!eligible(true, false, true));
-        assert!(!eligible(false, true, true));
+        let burst = update_local_speech_burst(0, 2_048, true, None);
+        assert_eq!(
+            update_local_speech_burst(burst, 2_048, true, Some(Duration::from_millis(500))),
+            4_096
+        );
+        assert_eq!(
+            update_local_speech_burst(burst, 2_048, true, Some(Duration::from_secs(2))),
+            2_048
+        );
+        assert_eq!(
+            update_local_speech_burst(burst, 2_048, false, Some(Duration::from_secs(2))),
+            0
+        );
     }
 
     #[test]

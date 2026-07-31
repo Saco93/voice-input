@@ -9,7 +9,7 @@
 
 [English](README.md) · **简体中文** · [Documentation](https://github.com/Saco93/voice-input/wiki) · [中文文档](https://github.com/Saco93/voice-input/wiki/Home.zh-CN)
 
-Voice Input 是一个常驻式 dictation 服务，提供实时转写、原生动态 HUD、全音频最终识别、保守的 LLM 整理，以及来自当前 Pi 或 Codex 会话的可选术语上下文。
+Voice Input 是一个常驻式 dictation 服务，提供实时转写、原生动态 HUD、全音频最终识别、保守的 LLM 整理，以及来自 dictation 结束时聚焦的 Pi 或 Codex 会话的可选术语上下文。
 
 ## 实现原理
 
@@ -20,12 +20,12 @@ flowchart LR
     Final --> LLM[LLM refinement<br/>默认预算 15 秒]
     LLM --> Out[Wayland / XWayland 输出]
     RT -. 实时文本 .-> HUD[Quickshell HUD]
-    Agent[当前 Pi / Codex] -. 仅提供术语 .-> LLM
+    Agent[停止时聚焦的 Pi / Codex] -. 仅提供术语 .-> LLM
 ```
 
 1. 常驻 PipeWire capture service 保留一小段 pre-roll，避免快捷键按下后最开始的语音被截掉。录音达到配置的时长上限后会自动停止并进入最终处理；默认上限为五分钟。
-2. Qwen Realtime 持续把 partial transcript 发送到 HUD，Server VAD 控制波形是否可见。实时音频使用容量受限的非阻塞 queue，网络反压不会冻结采集或波形。
-3. Toggle off 后，可选择让 Final ASR 对完整录音重新识别一次。如果实时音频传输落后，程序会拒绝不完整的远程文本，并通过已启用的 final pass 或本地 fallback 恢复完整音频。
+2. Qwen Realtime 持续把 partial transcript 发送到 HUD，Server VAD 控制波形是否可见。实时音频使用容量受限的非阻塞 queue、公平的双向 WebSocket 处理和八秒有声录音停滞检测，因此网络或服务端故障不会冻结采集或波形。
+3. Toggle off 后，可选择让 Final ASR 对完整录音重新识别一次。如果实时处理停滞、断开连接或传输落后，程序会拒绝不完整的远程文本，并通过已启用的 final pass 或本地 fallback 恢复完整音频。
 4. OpenAI-compatible LLM 对文本做轻量整理。Refinement 使用配置的 timeout（默认 15 秒，最多 30 秒）；预算达到 10 秒时，包含 coding agent 上下文的请求会为纯 transcript 清理重试预留 5 秒，最终失败时使用 Final ASR。
 5. 短文本通过 `wtype` 输入；长文本和 XWayland 窗口自动使用剪贴板粘贴，并在结束后恢复原剪贴板。
 

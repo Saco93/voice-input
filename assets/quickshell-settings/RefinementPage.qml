@@ -72,7 +72,7 @@ SettingsPage {
                 theme: root.theme
                 label: "Use agent context"
                 checked: root.controller.value("llm.agent_context_enabled", false)
-                help: "Send a redacted excerpt from the focused Pi or Codex session."
+                help: "Send a redacted excerpt from the Pi or Codex session focused when dictation ends."
                 enabled: !root.controller.busy
                 onToggled: (checked) => {
                     return root.controller.setValue("llm.agent_context_enabled", checked);

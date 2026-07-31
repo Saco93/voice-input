@@ -9,7 +9,7 @@
 
 **English** · [简体中文](README.zh-CN.md) · [Documentation](https://github.com/Saco93/voice-input/wiki) · [中文文档](https://github.com/Saco93/voice-input/wiki/Home.zh-CN)
 
-Voice Input is a resident dictation service with realtime transcription, a native animated HUD, full-audio final recognition, conservative LLM cleanup, and optional terminology context from the focused Pi or Codex session.
+Voice Input is a resident dictation service with realtime transcription, a native animated HUD, full-audio final recognition, conservative LLM cleanup, and optional terminology context from the Pi or Codex session focused when dictation ends.
 
 ## How it works
 
@@ -20,12 +20,12 @@ flowchart LR
     Final --> LLM[LLM refinement<br/>15 s default budget]
     LLM --> Out[Wayland / XWayland output]
     RT -. live transcript .-> HUD[Quickshell HUD]
-    Agent[Focused Pi / Codex] -. terminology only .-> LLM
+    Agent[Pi / Codex focused at stop] -. terminology only .-> LLM
 ```
 
 1. A persistent PipeWire capture service keeps a short pre-roll buffer, so speech immediately after the hotkey is not lost. Sessions stop and finalize automatically at the configured duration limit (five minutes by default).
-2. Qwen Realtime streams partial text to the HUD while Server VAD controls waveform visibility. Realtime delivery uses a bounded, nonblocking queue so network backpressure cannot freeze capture or the waveform.
-3. On toggle-off, the complete recording is optionally recognized again by the final ASR model. If realtime delivery falls behind, incomplete remote text is rejected and the complete audio buffer is recovered through the enabled final pass or local fallback.
+2. Qwen Realtime streams partial text to the HUD while Server VAD controls waveform visibility. Realtime delivery uses a bounded, nonblocking queue, fair bidirectional WebSocket processing, and an eight-second voiced-audio stall detector so network or server failures cannot freeze capture or the waveform.
+3. On toggle-off, the complete recording is optionally recognized again by the final ASR model. If realtime processing stalls, disconnects, or falls behind, incomplete remote text is rejected and the complete audio buffer is recovered through the enabled final pass or local fallback.
 4. The transcript is lightly cleaned by an OpenAI-compatible LLM. Refinement uses the configured timeout (15 seconds by default, capped at 30 seconds); when the budget is at least 10 seconds, contextual requests reserve five seconds for a transcript-only cleanup retry and ultimately fail open to Final ASR.
 5. Short text is typed with `wtype`; long text and XWayland targets use clipboard paste with automatic restoration.
 

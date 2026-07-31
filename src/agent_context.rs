@@ -47,19 +47,37 @@ pub struct AgentReference {
     pub text: String,
 }
 
-pub fn capture_focused_session() -> Result<Option<AgentSessionLocator>> {
+pub struct FocusedAgentSnapshot {
+    kind: AgentKind,
+    pid: u32,
+}
+
+impl FocusedAgentSnapshot {
+    pub fn agent(&self) -> AgentKind {
+        self.kind
+    }
+}
+
+pub fn capture_focused_agent() -> Result<Option<FocusedAgentSnapshot>> {
     let active = active_window()?;
     if !active.class.eq_ignore_ascii_case("kitty") {
         return Ok(None);
     }
 
-    let Some(process) = focused_kitty_agent(active.pid)? else {
-        return Ok(None);
-    };
+    focused_kitty_agent(active.pid).map(|process| {
+        process.map(|process| FocusedAgentSnapshot {
+            kind: process.kind,
+            pid: process.pid,
+        })
+    })
+}
 
-    match process.kind {
-        AgentKind::Pi => resolve_pi_session(process.pid),
-        AgentKind::Codex => resolve_codex_session(process.pid),
+pub fn resolve_focused_session(
+    snapshot: FocusedAgentSnapshot,
+) -> Result<Option<AgentSessionLocator>> {
+    match snapshot.kind {
+        AgentKind::Pi => resolve_pi_session(snapshot.pid),
+        AgentKind::Codex => resolve_codex_session(snapshot.pid),
     }
 }
 

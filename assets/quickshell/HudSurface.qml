@@ -21,8 +21,8 @@ PanelWindow {
         return !focused || !monitor || monitor.name === focused.name;
     }
     readonly property string displayText: {
-        if (store.phase === "recording" && store.tooltip.includes("Realtime transcript delayed")) {
-            const recoveryNotice = "Realtime transcript delayed — audio will recover when stopped";
+        if (store.phase === "recording" && store.tooltip.includes("recording continues")) {
+            const recoveryNotice = store.tooltip.trim();
             return store.transcript.trim().length > 0 ? store.transcript.trim() + "\n\n" + recoveryNotice : recoveryNotice;
         }
         if (store.transcript.trim().length > 0)
@@ -164,6 +164,8 @@ PanelWindow {
     readonly property int statusBarHeight: 22
     readonly property int cardWidth: expanded ? 600 : 300
     property real clockNowMs: Date.now()
+    property real recordingClockAccumulator: 0
+    property real stateRefreshFallbackAccumulator: 0
     readonly property real displayedRecordingDurationMs: {
         if (recording && store.recordingStartedAtMs > 0)
             return Math.max(store.recordingDurationMs, clockNowMs - store.recordingStartedAtMs);
@@ -262,22 +264,15 @@ PanelWindow {
         running: !store.active
     }
 
-    Timer {
-        interval: 100
-        repeat: true
-        running: panel.visible && panel.recording && store.recordingStartedAtMs > 0
-        onRunningChanged: {
-            if (running)
-                panel.clockNowMs = Date.now();
-
-        }
-        onTriggered: panel.clockNowMs = Date.now()
-    }
-
     FrameAnimation {
         running: (panel.arming || panel.recording || panel.processing) && panel.visible
         onRunningChanged: {
+            if (running && panel.recording)
+                panel.clockNowMs = Date.now();
+
             if (!running) {
+                panel.recordingClockAccumulator = 0;
+                panel.stateRefreshFallbackAccumulator = 0;
                 panel.speechPaceSmoothed = 0;
                 panel.transcriptPaceSmoothed = 0;
                 panel.levelSmoothed = 0;
@@ -290,8 +285,25 @@ PanelWindow {
         }
         // frameTime is the elapsed time in seconds since the previous frame.
         onTriggered: {
-            if (panel.recording)
+            panel.stateRefreshFallbackAccumulator += frameTime;
+            // StateStore normally polls at 20 Hz. This low-rate fallback
+            // couples state refresh to the visible animation heartbeat across
+            // arming, recording, and processing phases.
+            if (panel.stateRefreshFallbackAccumulator >= 0.25) {
+                store.refreshSnapshot();
+                panel.stateRefreshFallbackAccumulator = 0;
+            }
+
+            if (panel.recording) {
                 panel.lastRecordingColor = panel.glowColor;
+                panel.recordingClockAccumulator += frameTime;
+                if (panel.recordingClockAccumulator >= 0.1) {
+                    panel.clockNowMs = Math.max(Date.now(), panel.clockNowMs + panel.recordingClockAccumulator * 1000);
+                    panel.recordingClockAccumulator = 0;
+                }
+            } else {
+                panel.recordingClockAccumulator = 0;
+            }
 
             if (panel.processing) {
                 const enteringProcessing = panel.processingGeometryBlend < 1;

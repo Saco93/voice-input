@@ -141,7 +141,7 @@ QtObject {
         "Replace OpenRouter API key": "替换 OpenRouter API key",
         "Context": "上下文",
         "Use agent context": "使用 Agent 上下文",
-        "Send a redacted excerpt from the focused Pi or Codex session.": "发送当前 Pi 或 Codex 会话中经过脱敏的片段。",
+        "Send a redacted excerpt from the Pi or Codex session focused when dictation ends.": "发送 dictation 结束时聚焦的 Pi 或 Codex 会话中经过脱敏的片段。",
         "Test refinement": "测试文本优化",
         "Test the current LLM draft and credential without saving it.": "无需保存即可测试当前 LLM 设置草稿和凭据。",
         "Testing…": "正在测试…",

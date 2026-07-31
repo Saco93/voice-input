@@ -149,10 +149,6 @@ impl Snapshot {
         self.start_recording_clock_at(now_ms());
     }
 
-    pub fn stop_recording_clock(&mut self) {
-        self.stop_recording_clock_at(now_ms());
-    }
-
     fn start_recording_clock_at(&mut self, timestamp_ms: u128) {
         if self.recording_started_at_ms.is_none() {
             self.recording_started_at_ms = Some(timestamp_ms);
@@ -160,7 +156,7 @@ impl Snapshot {
         }
     }
 
-    fn stop_recording_clock_at(&mut self, timestamp_ms: u128) {
+    pub(crate) fn stop_recording_clock_at(&mut self, timestamp_ms: u128) {
         let Some(started_at_ms) = self.recording_started_at_ms.take() else {
             return;
         };

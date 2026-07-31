@@ -278,6 +278,53 @@ fn parse_output_target_hint_arg(value: Option<&str>) -> Result<Option<output::Ou
     }
 }
 
+fn should_capture_agent_context(
+    cancel: bool,
+    llm_enabled: bool,
+    agent_context_enabled: bool,
+) -> bool {
+    !cancel && llm_enabled && agent_context_enabled
+}
+
+fn capture_agent_context_at_stop(
+    config: &Config,
+    cancel: bool,
+) -> Option<thread::JoinHandle<Option<agent_context::AgentSessionLocator>>> {
+    if !should_capture_agent_context(cancel, config.llm.enabled, config.llm.agent_context_enabled) {
+        return None;
+    }
+
+    let snapshot = match agent_context::capture_focused_agent() {
+        Ok(Some(snapshot)) => snapshot,
+        Ok(None) => {
+            eprintln!("voice-input agent context: no supported focused session captured at stop");
+            return None;
+        }
+        Err(_) => {
+            eprintln!("voice-input agent context: focused-session capture failed at stop");
+            return None;
+        }
+    };
+    eprintln!(
+        "voice-input agent context: captured focused {} process at stop",
+        snapshot.agent().label()
+    );
+
+    Some(thread::spawn(
+        move || match agent_context::resolve_focused_session(snapshot) {
+            Ok(Some(locator)) => Some(locator),
+            Ok(None) => {
+                eprintln!("voice-input agent context: captured process has no valid session");
+                None
+            }
+            Err(_) => {
+                eprintln!("voice-input agent context: captured session discovery failed");
+                None
+            }
+        },
+    ))
+}
+
 struct Daemon {
     config: Config,
     state: StateHandle,
@@ -294,7 +341,6 @@ struct Session {
     realtime_overloaded: Arc<AtomicBool>,
     audio_buffer: Arc<Mutex<Vec<i16>>>,
     output_target_hint: Option<output::OutputTargetHint>,
-    agent_context_handle: Option<thread::JoinHandle<Option<agent_context::AgentSessionLocator>>>,
     asr_packetizer: Option<Arc<Mutex<AsrPacketizer>>>,
     speech_detected: Arc<AtomicBool>,
     capture_mode: SessionCaptureMode,
@@ -479,22 +525,6 @@ impl Daemon {
         let session_id = self.next_session_id.fetch_add(1, Ordering::SeqCst);
         let output_target_hint =
             output_target_hint_override.or_else(|| output::detect_output_target_hint().ok());
-        let agent_context_handle = self.config.llm.agent_context_enabled.then(|| {
-            thread::spawn(|| match agent_context::capture_focused_session() {
-                Ok(locator) => {
-                    if locator.is_none() {
-                        eprintln!(
-                            "voice-input agent context: no supported focused session captured"
-                        );
-                    }
-                    locator
-                }
-                Err(_) => {
-                    eprintln!("voice-input agent context: focused-session discovery failed");
-                    None
-                }
-            })
-        });
         let pre_roll_audio = self.capture.seed_audio();
         let asr_packetizer = (self.config.asr.provider == AsrProvider::AlibabaQwenRealtime)
             .then(|| Arc::new(Mutex::new(AsrPacketizer::default())));
@@ -606,12 +636,14 @@ impl Daemon {
                 .expect("ASR packetizer mutex poisoned")
                 .push(&pre_roll_audio);
             for packet in packets {
-                if !try_enqueue_realtime_audio(tx, packet) {
+                let result = try_enqueue_realtime_audio(tx, packet);
+                if result != RealtimeAudioEnqueue::Sent {
                     mark_realtime_overloaded(
                         &realtime_overloaded,
                         asr_abort_flag.as_deref(),
                         &self.state,
                         session_id,
+                        result,
                     );
                     break;
                 }
@@ -675,7 +707,6 @@ impl Daemon {
             realtime_overloaded,
             audio_buffer,
             output_target_hint,
-            agent_context_handle,
             asr_packetizer,
             speech_detected,
             capture_mode,
@@ -738,13 +769,17 @@ impl Daemon {
             return Ok(());
         };
         let output_target_hint = session.output_target_hint;
-        let realtime_overloaded = session.realtime_overloaded.load(Ordering::SeqCst);
+        let realtime_overloaded_flag = session.realtime_overloaded.clone();
+        let mut realtime_overloaded = realtime_overloaded_flag.load(Ordering::SeqCst);
 
         if cancel {
             session.cancel_flag.store(true, Ordering::SeqCst);
         }
         session.stop_flag.store(true, Ordering::SeqCst);
-        self.state.update(Snapshot::stop_recording_clock)?;
+        let stopped_at_ms = unix_time_ms();
+        let agent_context_handle = capture_agent_context_at_stop(&self.config, cancel);
+        self.state
+            .update(|snapshot| snapshot.stop_recording_clock_at(stopped_at_ms))?;
         match session.capture_mode {
             SessionCaptureMode::Dedicated {
                 mut child,
@@ -759,20 +794,34 @@ impl Daemon {
             }
         }
 
-        if !cancel
-            && !realtime_overloaded
-            && matches!(&session.asr_runtime, SessionAsrRuntime::Realtime { .. })
+        realtime_overloaded |= realtime_overloaded_flag.load(Ordering::SeqCst);
+        if let SessionAsrRuntime::Realtime { backend_handle, .. } = &session.asr_runtime
+            && backend_handle.is_finished()
+            && !cancel
         {
+            // A realtime worker must remain alive until stop. Preserve local
+            // audio even when it exits between the final capture packet and
+            // the event-pump update that would otherwise mark degradation.
+            realtime_overloaded = true;
+            realtime_overloaded_flag.store(true, Ordering::SeqCst);
+        }
+        if !cancel && matches!(&session.asr_runtime, SessionAsrRuntime::Realtime { .. }) {
             // Speech/transcript events can trail the final PCM packet slightly.
             // Give the event pump a brief chance to observe them, then treat a
-            // session with no server-detected speech as a cancellation. This
-            // avoids sending silence through final ASR, LLM refinement, or the
-            // active text input and also avoids Qwen waiting on an empty commit.
-            let deadline = Instant::now() + Duration::from_millis(SPEECH_EVENT_GRACE_MS);
-            while !session.speech_detected.load(Ordering::SeqCst) && Instant::now() < deadline {
-                thread::sleep(Duration::from_millis(10));
+            // session with no server-detected speech as a cancellation. A
+            // degraded realtime stream always keeps its complete local audio
+            // for recovery, even if the terminal event races with stop.
+            if !realtime_overloaded {
+                let deadline = Instant::now() + Duration::from_millis(SPEECH_EVENT_GRACE_MS);
+                while !session.speech_detected.load(Ordering::SeqCst)
+                    && !realtime_overloaded_flag.load(Ordering::SeqCst)
+                    && Instant::now() < deadline
+                {
+                    thread::sleep(Duration::from_millis(10));
+                }
             }
-            if !session.speech_detected.load(Ordering::SeqCst) {
+            realtime_overloaded |= realtime_overloaded_flag.load(Ordering::SeqCst);
+            if !realtime_overloaded && !session.speech_detected.load(Ordering::SeqCst) {
                 eprintln!(
                     "voice-input realtime ASR: no speech detected; cancelling empty dictation"
                 );
@@ -793,10 +842,6 @@ impl Daemon {
         };
         self.waveform.try_reset(0);
 
-        let agent_locator = session
-            .agent_context_handle
-            .take()
-            .and_then(|handle| handle.join().ok().flatten());
         let audio = session
             .audio_buffer
             .lock()
@@ -835,6 +880,7 @@ impl Daemon {
                 event_handle,
                 backend_handle,
             } => {
+                realtime_overloaded |= realtime_overloaded_flag.load(Ordering::SeqCst);
                 if !cancel {
                     self.state.update(|snapshot| {
                         snapshot.phase = Phase::Transcribing;
@@ -855,6 +901,7 @@ impl Daemon {
                 }
                 let backend_result = join_session_handle(backend_handle, "realtime ASR worker");
                 let event_result = join_value_handle(event_handle, "realtime ASR event pump");
+                realtime_overloaded |= realtime_overloaded_flag.load(Ordering::SeqCst);
 
                 if cancel {
                     backend_result?;
@@ -980,6 +1027,13 @@ impl Daemon {
             snapshot.refinement_changed = None;
         })?;
 
+        let agent_locator = agent_context_handle.and_then(|handle| match handle.join() {
+            Ok(locator) => locator,
+            Err(_) => {
+                eprintln!("voice-input agent context: session discovery worker panicked");
+                None
+            }
+        });
         let agent_reference = agent_locator.as_ref().and_then(|locator| {
             match agent_context::load_reference(
                 locator,
@@ -1282,12 +1336,14 @@ fn run_capture_service(
                     .expect("ASR packetizer mutex poisoned")
                     .push(chunk);
                 for packet in packets {
-                    if !try_enqueue_realtime_audio(tx, packet) {
+                    let result = try_enqueue_realtime_audio(tx, packet);
+                    if result != RealtimeAudioEnqueue::Sent {
                         mark_realtime_overloaded(
                             &active.realtime_overloaded,
                             active.asr_abort_flag.as_deref(),
                             &state,
                             active.session_id,
+                            result,
                         );
                         break;
                     }
@@ -1338,13 +1394,22 @@ fn append_recording_audio(buffer: &mut Vec<i16>, chunk: &[i16], max_samples: usi
     accepted
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RealtimeAudioEnqueue {
+    Sent,
+    Full,
+    Disconnected,
+}
+
 fn try_enqueue_realtime_audio(
     sender: &mpsc::SyncSender<backend::AsrControl>,
     packet: Vec<i16>,
-) -> bool {
-    sender
-        .try_send(backend::AsrControl::AppendPcm16(packet))
-        .is_ok()
+) -> RealtimeAudioEnqueue {
+    match sender.try_send(backend::AsrControl::AppendPcm16(packet)) {
+        Ok(()) => RealtimeAudioEnqueue::Sent,
+        Err(mpsc::TrySendError::Full(_)) => RealtimeAudioEnqueue::Full,
+        Err(mpsc::TrySendError::Disconnected(_)) => RealtimeAudioEnqueue::Disconnected,
+    }
 }
 
 fn request_session_finish(requested: &AtomicBool, reason: &str) {
@@ -1372,6 +1437,7 @@ fn mark_realtime_overloaded(
     abort_flag: Option<&AtomicBool>,
     state: &StateHandle,
     session_id: u64,
+    enqueue_result: RealtimeAudioEnqueue,
 ) {
     if overloaded.swap(true, Ordering::SeqCst) {
         return;
@@ -1380,13 +1446,23 @@ fn mark_realtime_overloaded(
     if let Some(abort_flag) = abort_flag {
         abort_flag.store(true, Ordering::SeqCst);
     }
+    let (log_reason, tooltip) = match enqueue_result {
+        RealtimeAudioEnqueue::Full => (
+            "audio queue could not keep up",
+            "Realtime audio delayed — recording continues",
+        ),
+        RealtimeAudioEnqueue::Disconnected => (
+            "ASR worker disconnected",
+            "Realtime connection interrupted — recording continues",
+        ),
+        RealtimeAudioEnqueue::Sent => return,
+    };
     eprintln!(
-        "voice-input realtime ASR: audio queue could not keep up for session {session_id}; preserving full audio for recovery"
+        "voice-input realtime ASR: {log_reason} for session {session_id}; preserving full audio for recovery"
     );
     let _ = state.update(|snapshot| {
         if snapshot.phase == Phase::Recording {
-            snapshot.tooltip =
-                "Realtime transcript delayed — audio will recover when stopped".into();
+            snapshot.tooltip = tooltip.into();
         }
     });
 }
@@ -1485,12 +1561,14 @@ fn spawn_reader_thread(
                     .expect("ASR packetizer mutex poisoned")
                     .push(chunk);
                 for packet in packets {
-                    if !try_enqueue_realtime_audio(tx, packet) {
+                    let result = try_enqueue_realtime_audio(tx, packet);
+                    if result != RealtimeAudioEnqueue::Sent {
                         mark_realtime_overloaded(
                             &realtime_overloaded,
                             asr_abort_flag.as_deref(),
                             &state,
                             session_id,
+                            result,
                         );
                         break;
                     }
@@ -1563,11 +1641,11 @@ fn spawn_realtime_event_thread(
                 }
                 backend::AsrEvent::RealtimeTranscriptDelayed => {
                     speech_detected.store(true, Ordering::SeqCst);
+                    realtime_overloaded.store(true, Ordering::SeqCst);
                     state.update(|snapshot| {
                         if matches!(snapshot.phase, Phase::Arming | Phase::Recording) {
                             snapshot.tooltip =
-                                "Realtime transcript delayed — audio will recover when stopped"
-                                    .into();
+                                "Realtime transcript delayed — recording continues".into();
                         }
                     })?;
                 }
@@ -1589,8 +1667,7 @@ fn spawn_realtime_event_thread(
                         {
                             snapshot.transcript = transcript.clone();
                             snapshot.tooltip = if realtime_overloaded.load(Ordering::SeqCst) {
-                                "Realtime transcript delayed — audio will recover when stopped"
-                                    .into()
+                                "Realtime transcript delayed — recording continues".into()
                             } else if snapshot.phase == Phase::Arming && transcript.is_empty() {
                                 arming_tooltip(
                                     &config,
@@ -1617,8 +1694,7 @@ fn spawn_realtime_event_thread(
                         if snapshot.phase != Phase::Idle {
                             snapshot.transcript = text.clone();
                             snapshot.tooltip = if realtime_overloaded.load(Ordering::SeqCst) {
-                                "Realtime transcript delayed — audio will recover when stopped"
-                                    .into()
+                                "Realtime transcript delayed — recording continues".into()
                             } else {
                                 text.clone()
                             };
@@ -1642,6 +1718,8 @@ fn spawn_realtime_event_thread(
                     })?;
                 }
                 backend::AsrEvent::Error { message } => {
+                    speech_detected.store(true, Ordering::SeqCst);
+                    realtime_overloaded.store(true, Ordering::SeqCst);
                     return Err(anyhow!("Alibaba realtime ASR failed: {message}"));
                 }
             }
@@ -1762,6 +1840,14 @@ mod tests {
     }
 
     #[test]
+    fn agent_context_capture_requires_stop_and_enabled_refinement() {
+        assert!(should_capture_agent_context(false, true, true));
+        assert!(!should_capture_agent_context(true, true, true));
+        assert!(!should_capture_agent_context(false, false, true));
+        assert!(!should_capture_agent_context(false, true, false));
+    }
+
+    #[test]
     fn recording_sample_limit_uses_rate_and_duration() {
         let mut config = Config::default();
         config.audio.sample_rate = 16_000;
@@ -1779,9 +1865,20 @@ mod tests {
     }
 
     #[test]
-    fn realtime_audio_enqueue_reports_backpressure_without_blocking() {
-        let (sender, _receiver) = mpsc::sync_channel(1);
-        assert!(try_enqueue_realtime_audio(&sender, vec![1, 2]));
-        assert!(!try_enqueue_realtime_audio(&sender, vec![3, 4]));
+    fn realtime_audio_enqueue_distinguishes_backpressure_and_disconnect() {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        assert_eq!(
+            try_enqueue_realtime_audio(&sender, vec![1, 2]),
+            RealtimeAudioEnqueue::Sent
+        );
+        assert_eq!(
+            try_enqueue_realtime_audio(&sender, vec![3, 4]),
+            RealtimeAudioEnqueue::Full
+        );
+        drop(receiver);
+        assert_eq!(
+            try_enqueue_realtime_audio(&sender, vec![5, 6]),
+            RealtimeAudioEnqueue::Disconnected
+        );
     }
 }
