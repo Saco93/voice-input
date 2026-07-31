@@ -24,8 +24,8 @@ flowchart LR
 ```
 
 1. A persistent PipeWire capture service keeps a short pre-roll buffer, so speech immediately after the hotkey is not lost. Sessions stop and finalize automatically at the configured duration limit (five minutes by default).
-2. Qwen Realtime streams partial text to the HUD while Server VAD controls waveform visibility. Realtime delivery uses a bounded, nonblocking queue, fair bidirectional WebSocket processing, and an eight-second voiced-audio stall detector so network or server failures cannot freeze capture or the waveform.
-3. On toggle-off, the complete recording is optionally recognized again by the final ASR model. If realtime processing stalls, disconnects, or falls behind, incomplete remote text is rejected and the complete audio buffer is recovered through the enabled final pass or local fallback.
+2. Qwen Realtime streams partial text to the HUD while Server VAD controls waveform visibility. Realtime delivery uses a bounded, nonblocking queue, fair bidirectional WebSocket processing, and an eight-second voiced-audio stall detector. On the first transcript stall, the worker reconstructs the realtime session once and replays every buffered raw PCM packet from the beginning while recording continues.
+3. On toggle-off, the complete recording is optionally recognized again by the final ASR model. If the controlled reconstruction fails, the connection closes, or realtime delivery falls behind, incomplete remote text is rejected and the complete audio is recovered through the enabled final pass or local fallback.
 4. The transcript is lightly cleaned by an OpenAI-compatible LLM. Refinement uses the configured timeout (15 seconds by default, capped at 30 seconds); when the budget is at least 10 seconds, contextual requests reserve five seconds for a transcript-only cleanup retry and ultimately fail open to Final ASR.
 5. Short text is typed with `wtype`; long text and XWayland targets use clipboard paste with automatic restoration.
 
@@ -83,7 +83,7 @@ systemctl --user status voice-input.service voice-input-hud.service
 
 - Realtime Chinese/English mixed dictation with Server VAD
 - Center-symmetric 62.5 FPS PCM waveform, independent of ASR packet cadence
-- Complete realtime transcript plus optional full-audio final pass
+- One controlled realtime reconstruction with complete buffered-audio replay, followed by complete-audio final recovery if needed
 - Conservative LLM refinement with bounded latency and a transcript-only cleanup fallback
 - Pi/Codex terminology context with validation, redaction, truncation, and prompt-injection isolation
 - Automatic long-text paste and clipboard restoration across Wayland/XWayland

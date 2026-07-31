@@ -21,7 +21,7 @@ PanelWindow {
         return !focused || !monitor || monitor.name === focused.name;
     }
     readonly property string displayText: {
-        if (store.phase === "recording" && store.tooltip.includes("recording continues")) {
+        if (store.phase === "recording" && (store.tooltip.includes("recording continues") || store.tooltip === "Replaying buffered audio…")) {
             const recoveryNotice = store.tooltip.trim();
             return store.transcript.trim().length > 0 ? store.transcript.trim() + "\n\n" + recoveryNotice : recoveryNotice;
         }
@@ -166,6 +166,8 @@ PanelWindow {
     property real clockNowMs: Date.now()
     property real recordingClockAccumulator: 0
     property real stateRefreshFallbackAccumulator: 0
+    property real statusIndicatorCycles: 0
+    readonly property real statusIndicatorBreath: 0.5 - 0.5 * Math.cos(statusIndicatorCycles * 2 * Math.PI)
     readonly property real displayedRecordingDurationMs: {
         if (recording && store.recordingStartedAtMs > 0)
             return Math.max(store.recordingDurationMs, clockNowMs - store.recordingStartedAtMs);
@@ -197,6 +199,27 @@ PanelWindow {
     // Hyprland sends its configure event. Keep the capsule transparent during
     // that frame so its center calculation cannot render it at the left edge.
     readonly property bool geometryReady: width >= cardWidth + 48 && height >= 160
+    readonly property color statusIndicatorColor: {
+        if (arming)
+            return store.themeForeground;
+
+        if (recording)
+            return store.themeAccent;
+
+        if (finalizing)
+            return "#AAB7BE";
+
+        if (refining)
+            return "#E8A9C4";
+
+        if (outputting)
+            return "#7BA7D9";
+
+        if (store.phase === "error")
+            return store.themeError;
+
+        return store.themeForeground;
+    }
     readonly property color phaseColor: {
         if (store.phase === "arming" || store.phase === "recording")
             return store.themeAccent;
@@ -265,7 +288,7 @@ PanelWindow {
     }
 
     FrameAnimation {
-        running: (panel.arming || panel.recording || panel.processing) && panel.visible
+        running: (panel.arming || panel.recording || panel.processing || store.phase === "error") && panel.visible
         onRunningChanged: {
             if (running && panel.recording)
                 panel.clockNowMs = Date.now();
@@ -313,6 +336,9 @@ PanelWindow {
             }
 
             panel.vizClock = (panel.vizClock + frameTime) % 3600;
+            // The status lamp has its own calm, phase-independent cadence so
+            // every active stage reads as alive even when the halo is steady.
+            panel.statusIndicatorCycles = (panel.statusIndicatorCycles + frameTime * 0.32) % 120;
             panel.paceClock += frameTime;
             if (panel.recording && !panel.paceWasRecording) {
                 panel.transcriptSessionStart = panel.paceClock;
@@ -581,13 +607,44 @@ PanelWindow {
                 anchors.verticalCenterOffset: 1
                 spacing: 7
 
-                Rectangle {
-                    width: 4
-                    height: 4
-                    radius: 2
+                Item {
+                    width: 8
+                    height: 8
                     anchors.verticalCenter: parent.verticalCenter
-                    color: panel.processing ? panel.mixColors(panel.processingColorFrom, panel.processingColorTo, panel.processingColorProgress * panel.processingColorProgress * (3 - 2 * panel.processingColorProgress)) : panel.glowColor
-                    opacity: 0.9
+
+                    Rectangle {
+                        anchors.centerIn: parent
+                        width: 8
+                        height: 8
+                        radius: 4
+                        color: panel.statusIndicatorColor
+                        opacity: 0.06 + 0.16 * panel.statusIndicatorBreath
+                        scale: 0.85 + 0.25 * panel.statusIndicatorBreath
+
+                        Behavior on color {
+                            ColorAnimation {
+                                duration: 260
+                                easing.type: Easing.OutCubic
+                            }
+                        }
+                    }
+
+                    Rectangle {
+                        anchors.centerIn: parent
+                        width: 5
+                        height: 5
+                        radius: 2.5
+                        color: panel.statusIndicatorColor
+                        opacity: 0.48 + 0.52 * panel.statusIndicatorBreath
+                        scale: 0.88 + 0.12 * panel.statusIndicatorBreath
+
+                        Behavior on color {
+                            ColorAnimation {
+                                duration: 260
+                                easing.type: Easing.OutCubic
+                            }
+                        }
+                    }
                 }
 
                 Text {

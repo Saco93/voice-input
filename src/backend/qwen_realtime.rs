@@ -34,6 +34,8 @@ type QwenHandshakeResponse = tungstenite::http::Response<Option<Vec<u8>>>;
 type QwenConnection = (QwenSocket, QwenHandshakeResponse);
 
 const MAX_CONTROLS_PER_TICK: usize = 8;
+const MAX_AUDIO_SENDS_PER_TICK: usize = 8;
+const REPLAY_SPEED_MULTIPLIER: f64 = 4.0;
 const TRANSCRIPTION_STALL_TIMEOUT: Duration = Duration::from_secs(8);
 const STALL_MIN_ACTIVE_SPEECH_SECS: usize = 2;
 const LOCAL_SPEECH_BURST_GAP: Duration = Duration::from_secs(1);
@@ -87,36 +89,19 @@ fn run_session(
         bail!("Alibaba realtime ASR requires an API key");
     }
 
-    let url = build_url(alibaba.endpoint.as_str(), alibaba.model.as_str())?;
-    let mut request = url
-        .as_str()
-        .into_client_request()
-        .context("failed to build Qwen realtime websocket request")?;
-    request.headers_mut().insert(
-        AUTHORIZATION,
-        HeaderValue::from_str(&format!("bearer {}", alibaba.api_key.trim()))
-            .context("Alibaba API key contains an invalid header value")?,
-    );
-
-    let (mut socket, _) = connect_with_timeout(
-        request,
-        Duration::from_millis(config.asr.connect_timeout_ms.max(1_000)),
-    )?;
-    configure_socket(socket.get_mut())?;
-
-    let mut next_event_id = 1_u64;
-    send_json(
-        &mut socket,
-        session_update_payload(&config, spec, format!("event-{}", next_event_id).as_str()),
-    )?;
-    next_event_id += 1;
+    let OpenedStream {
+        mut socket,
+        mut next_event_id,
+    } = open_stream(&config, spec)?;
 
     let mut ready = false;
+    let mut ready_event_sent = false;
     let mut finish_requested = false;
+    let mut finish_sent = false;
     let mut waiting_for_commit = false;
     let mut finalize_deadline = None;
     let mut assembler = TranscriptAssembler::default();
-    let session_started = Instant::now();
+    let mut session_started = Instant::now();
     let mut partial_event_count = 0_u64;
     let mut completed_event_count = 0_u64;
     let mut speech_started_count = 0_u64;
@@ -124,108 +109,199 @@ fn run_session(
     let mut appended_sample_count = 0_u64;
     let mut noise_gate = PcmNoiseGate::new((spec.sample_rate_hz as usize) / 2);
     let mut active_local_speech_samples = 0_usize;
-    let mut last_local_speech_activity = None;
+    let mut last_local_speech_activity = Some(Instant::now());
     let mut last_transcription_activity = Instant::now();
+    let mut retained_audio = RetainedAudio::default();
+    let mut retry_budget = RetryBudget::default();
+    let mut attempt_number = 1_u8;
+    let mut replay_pacing = false;
+    let mut next_replay_packet_at = Instant::now();
+    let mut replacement_ready_event_sent = false;
 
-    loop {
+    macro_rules! reconstruct_or_stop {
+        ($label:lifetime, $reason:expr) => {{
+            match reconstruct_stream(
+                &mut socket,
+                &config,
+                spec,
+                &abort_flag,
+                &event_tx,
+                &mut retry_budget,
+                $reason,
+                &retained_audio,
+                attempt_number,
+            )? {
+                Reconstruction::Restarted(opened) => {
+                    socket = opened.socket;
+                    next_event_id = opened.next_event_id;
+                    attempt_number += 1;
+                    ready = false;
+                    finish_sent = false;
+                    waiting_for_commit = false;
+                    finalize_deadline = None;
+                    assembler = TranscriptAssembler::default();
+                    session_started = Instant::now();
+                    partial_event_count = 0;
+                    completed_event_count = 0;
+                    speech_started_count = 0;
+                    speech_stopped_count = 0;
+                    appended_sample_count = 0;
+                    noise_gate = PcmNoiseGate::new((spec.sample_rate_hz as usize) / 2);
+                    active_local_speech_samples = 0;
+                    last_local_speech_activity = Some(Instant::now());
+                    last_transcription_activity = Instant::now();
+                    retained_audio.rewind();
+                    replay_pacing = true;
+                    next_replay_packet_at = Instant::now();
+                    replacement_ready_event_sent = false;
+                    continue $label;
+                }
+                Reconstruction::Stop => return Ok(()),
+            }
+        }};
+    }
+
+    'session: loop {
         if abort_flag.load(Ordering::SeqCst) {
             let _ = socket.close(None);
             return Ok(());
         }
 
-        // Keep outbound audio and inbound transcription events fair. Draining
-        // an actively refilled queue without a bound can starve socket reads,
-        // eventually blocking both directions behind TCP backpressure.
+        // Drain capture controls even while old audio is being replayed. The
+        // retained sequence remains authoritative and ordered, while the
+        // bounded control queue stays available to the nonblocking capture
+        // thread during reconstruction.
         for _ in 0..MAX_CONTROLS_PER_TICK {
-            let Ok(control) = control_rx.try_recv() else {
+            if finish_requested {
                 break;
-            };
+            }
+            match control_rx.try_recv() {
+                Ok(control) => {
+                    if retained_audio.accept_control(control) {
+                        finish_requested = true;
+                        finalize_deadline = Some(
+                            Instant::now()
+                                + Duration::from_millis(config.asr.finalize_timeout_ms.max(1_000)),
+                        );
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+
+        // Replay at a bounded multiple of realtime speed instead of bursting
+        // an entire recording into the replacement service. Live packets are
+        // sent without pacing once the retained backlog has caught up.
+        for _ in 0..MAX_AUDIO_SENDS_PER_TICK {
             if abort_flag.load(Ordering::SeqCst) {
                 let _ = socket.close(None);
                 return Ok(());
             }
+            let now = Instant::now();
+            if replay_pacing && now < next_replay_packet_at {
+                break;
+            }
+            let Some(samples) = retained_audio.next_packet() else {
+                replay_pacing = false;
+                break;
+            };
+            let packet_duration = Duration::from_secs_f64(
+                samples.len() as f64 / f64::from(spec.sample_rate_hz) / REPLAY_SPEED_MULTIPLIER,
+            );
+            let has_local_speech = pcm_chunk_has_local_speech(samples);
+            let (speech_samples, starts_new_burst) = update_local_speech_burst(
+                active_local_speech_samples,
+                samples.len(),
+                has_local_speech,
+                last_local_speech_activity.map(|activity: Instant| now.duration_since(activity)),
+            );
+            if starts_new_burst {
+                // A long user pause starts a new observation window. An old
+                // partial must not make the new speech look stalled.
+                last_transcription_activity = now;
+            }
+            active_local_speech_samples = speech_samples;
+            if has_local_speech {
+                last_local_speech_activity = Some(now);
+            }
 
-            match control {
-                AsrControl::AppendPcm16(samples) => {
-                    if finish_requested {
-                        continue;
-                    }
-                    let has_local_speech = pcm_chunk_has_local_speech(&samples);
-                    let filtered_samples = noise_gate.filter(samples);
-                    send_json(
-                        &mut socket,
-                        json!({
-                            "event_id": format!("event-{}", next_event_id),
-                            "type": "input_audio_buffer.append",
-                            "audio": encode_pcm16_chunk(&filtered_samples),
-                        }),
-                    )?;
-                    appended_sample_count += filtered_samples.len() as u64;
-                    active_local_speech_samples = update_local_speech_burst(
-                        active_local_speech_samples,
-                        filtered_samples.len(),
-                        has_local_speech,
-                        last_local_speech_activity.map(|activity: Instant| activity.elapsed()),
-                    );
-                    if has_local_speech {
-                        last_local_speech_activity = Some(Instant::now());
-                    }
-                    next_event_id += 1;
-                }
-                AsrControl::Finish => {
-                    if finish_requested {
-                        continue;
-                    }
-                    finish_requested = true;
-                    finalize_deadline = Some(
-                        Instant::now()
-                            + Duration::from_millis(config.asr.finalize_timeout_ms.max(1_000)),
-                    );
-
-                    match config.asr.alibaba.turn_mode {
-                        AlibabaTurnMode::ServerVad => {
-                            send_json(
-                                &mut socket,
-                                json!({
-                                    "event_id": format!("event-{}", next_event_id),
-                                    "type": "session.finish",
-                                }),
-                            )?;
-                            next_event_id += 1;
-                        }
-                        AlibabaTurnMode::Manual => {
-                            waiting_for_commit = true;
-                            send_json(
-                                &mut socket,
-                                json!({
-                                    "event_id": format!("event-{}", next_event_id),
-                                    "type": "input_audio_buffer.commit",
-                                }),
-                            )?;
-                            next_event_id += 1;
-                        }
-                    }
+            let filtered_samples = noise_gate.filter(samples);
+            if send_json(
+                &mut socket,
+                json!({
+                    "event_id": format!("event-{}", next_event_id),
+                    "type": "input_audio_buffer.append",
+                    "audio": encode_pcm16_chunk(&filtered_samples),
+                }),
+            )
+            .is_err()
+            {
+                terminal_stream_failure(
+                    &mut socket,
+                    &event_tx,
+                    attempt_number,
+                    InterruptionReason::StreamWrite,
+                    &retained_audio,
+                );
+                return Ok(());
+            }
+            retained_audio.mark_packet_sent();
+            appended_sample_count += filtered_samples.len() as u64;
+            next_event_id += 1;
+            if replay_pacing {
+                next_replay_packet_at = std::cmp::max(next_replay_packet_at, now) + packet_duration;
+                if retained_audio.caught_up() {
+                    replay_pacing = false;
                 }
             }
         }
 
+        if retained_audio.finish_ready(finish_requested) && !finish_sent {
+            let finish_result = match config.asr.alibaba.turn_mode {
+                AlibabaTurnMode::ServerVad => send_json(
+                    &mut socket,
+                    json!({
+                        "event_id": format!("event-{}", next_event_id),
+                        "type": "session.finish",
+                    }),
+                ),
+                AlibabaTurnMode::Manual => {
+                    waiting_for_commit = true;
+                    send_json(
+                        &mut socket,
+                        json!({
+                            "event_id": format!("event-{}", next_event_id),
+                            "type": "input_audio_buffer.commit",
+                        }),
+                    )
+                }
+            };
+            if finish_result.is_err() {
+                terminal_stream_failure(
+                    &mut socket,
+                    &event_tx,
+                    attempt_number,
+                    InterruptionReason::StreamWrite,
+                    &retained_audio,
+                );
+                return Ok(());
+            }
+            finish_sent = true;
+            next_event_id += 1;
+        }
+
         match socket.read() {
             Ok(Message::Close(frame)) => {
-                if let Some(frame) = frame {
-                    eprintln!(
-                        "voice-input realtime ASR: server closed websocket code={} reason={}",
-                        u16::from(frame.code),
-                        frame.reason
-                    );
-                } else {
-                    eprintln!("voice-input realtime ASR: server closed websocket");
-                }
-                let final_text = assembler.final_text();
-                if finish_requested && !final_text.is_empty() {
-                    let _ = event_tx.send(AsrEvent::Final { text: final_text });
-                } else if !finish_requested {
-                    let _ = event_tx.send(AsrEvent::RealtimeTranscriptDelayed);
-                }
+                let reason = InterruptionReason::WebSocketClose(
+                    frame.as_ref().map(|frame| u16::from(frame.code)),
+                );
+                terminal_stream_failure(
+                    &mut socket,
+                    &event_tx,
+                    attempt_number,
+                    reason,
+                    &retained_audio,
+                );
                 return Ok(());
             }
             Ok(message) => {
@@ -234,7 +310,14 @@ fn run_session(
                         ServerEvent::SessionCreated => {}
                         ServerEvent::SessionUpdated => {
                             if !ready {
-                                let _ = event_tx.send(AsrEvent::Ready);
+                                if !ready_event_sent {
+                                    let _ = event_tx.send(AsrEvent::Ready);
+                                    ready_event_sent = true;
+                                }
+                                if attempt_number > 1 && !replacement_ready_event_sent {
+                                    let _ = event_tx.send(AsrEvent::RealtimeRestarted);
+                                    replacement_ready_event_sent = true;
+                                }
                                 ready = true;
                             }
                         }
@@ -253,13 +336,24 @@ fn run_session(
                         ServerEvent::InputCommitted => {
                             if waiting_for_commit {
                                 waiting_for_commit = false;
-                                send_json(
+                                if send_json(
                                     &mut socket,
                                     json!({
                                         "event_id": format!("event-{}", next_event_id),
                                         "type": "session.finish",
                                     }),
-                                )?;
+                                )
+                                .is_err()
+                                {
+                                    terminal_stream_failure(
+                                        &mut socket,
+                                        &event_tx,
+                                        attempt_number,
+                                        InterruptionReason::StreamWrite,
+                                        &retained_audio,
+                                    );
+                                    return Ok(());
+                                }
                                 next_event_id += 1;
                             }
                         }
@@ -274,7 +368,7 @@ fn run_session(
                                 active_local_speech_samples = 0;
                                 if partial_event_count == 1 {
                                     eprintln!(
-                                        "voice-input realtime ASR: first partial after {} ms",
+                                        "voice-input realtime ASR: attempt {attempt_number} first partial after {} ms",
                                         session_started.elapsed().as_millis()
                                     );
                                 }
@@ -312,7 +406,7 @@ fn run_session(
                         }
                         ServerEvent::SessionFinished => {
                             eprintln!(
-                                "voice-input realtime ASR: session finished with {partial_event_count} partial, {completed_event_count} completed, {speech_started_count} speech-started, {speech_stopped_count} speech-stopped, {appended_sample_count} appended samples, {} noise-gate openings, and {} suppressed samples",
+                                "voice-input realtime ASR: attempt {attempt_number} finished with {partial_event_count} partial, {completed_event_count} completed, {speech_started_count} speech-started, {speech_stopped_count} speech-stopped, {appended_sample_count} appended samples, {} noise-gate openings, and {} suppressed samples",
                                 noise_gate.reopen_count(),
                                 noise_gate.suppressed_sample_count()
                             );
@@ -330,33 +424,30 @@ fn run_session(
                 if error.kind() == std::io::ErrorKind::WouldBlock
                     || error.kind() == std::io::ErrorKind::TimedOut => {}
             Err(tungstenite::Error::ConnectionClosed) | Err(tungstenite::Error::AlreadyClosed) => {
-                eprintln!(
-                    "voice-input realtime ASR: connection closed with {partial_event_count} partial, {completed_event_count} completed, {speech_started_count} speech-started, {speech_stopped_count} speech-stopped, {appended_sample_count} appended samples, {} noise-gate openings, and {} suppressed samples",
-                    noise_gate.reopen_count(),
-                    noise_gate.suppressed_sample_count()
+                terminal_stream_failure(
+                    &mut socket,
+                    &event_tx,
+                    attempt_number,
+                    InterruptionReason::ConnectionClosed,
+                    &retained_audio,
                 );
-                let final_text = assembler.final_text();
-                if finish_requested && !final_text.is_empty() {
-                    let _ = event_tx.send(AsrEvent::Final { text: final_text });
-                } else if !finish_requested {
-                    let _ = event_tx.send(AsrEvent::RealtimeTranscriptDelayed);
-                }
                 return Ok(());
             }
-            Err(error) => {
-                let _ = event_tx.send(AsrEvent::Error {
-                    message: error.to_string(),
-                });
-                return Err(error).context("Alibaba realtime websocket failed");
+            Err(_) => {
+                terminal_stream_failure(
+                    &mut socket,
+                    &event_tx,
+                    attempt_number,
+                    InterruptionReason::StreamRead,
+                    &retained_audio,
+                );
+                return Ok(());
             }
         }
 
         // A connected server can stop producing transcription events while it
         // continues accepting audio. Once local speech is still active and the
-        // gap is long enough, stop trusting this realtime stream. Do not send a
-        // manual commit in server-VAD mode: Qwen can reject it and close the
-        // socket. The daemon keeps the complete PCM buffer for stop-time final
-        // recognition.
+        // gap is long enough, reconstruct the stream once from retained PCM.
         if should_mark_realtime_stalled(
             finish_requested,
             matches!(config.asr.alibaba.turn_mode, AlibabaTurnMode::ServerVad),
@@ -366,25 +457,239 @@ fn run_session(
                 .is_some_and(|activity| activity.elapsed() <= LOCAL_SPEECH_BURST_GAP),
             last_transcription_activity.elapsed() >= TRANSCRIPTION_STALL_TIMEOUT,
         ) {
-            let _ = event_tx.send(AsrEvent::RealtimeTranscriptDelayed);
-            eprintln!(
-                "voice-input realtime ASR: transcription stalled for {} ms while local speech continued; preserving full audio for recovery",
-                last_transcription_activity.elapsed().as_millis()
-            );
-            let _ = socket.close(None);
-            return Ok(());
+            reconstruct_or_stop!('session, InterruptionReason::TranscriptStall);
         }
 
         if let Some(deadline) = finalize_deadline
             && Instant::now() > deadline
         {
-            bail!("Alibaba realtime ASR finalize timed out");
+            terminal_stream_failure(
+                &mut socket,
+                &event_tx,
+                attempt_number,
+                InterruptionReason::FinalizeTimeout,
+                &retained_audio,
+            );
+            return Ok(());
         }
 
         if !finish_requested && !ready {
             thread::sleep(Duration::from_millis(10));
         }
     }
+}
+
+struct OpenedStream {
+    socket: QwenSocket,
+    next_event_id: u64,
+}
+
+fn open_stream(config: &Config, spec: AudioSpec) -> Result<OpenedStream> {
+    let alibaba = &config.asr.alibaba;
+    let url = build_url(alibaba.endpoint.as_str(), alibaba.model.as_str())?;
+    let mut request = url
+        .as_str()
+        .into_client_request()
+        .context("failed to build Qwen realtime websocket request")?;
+    request.headers_mut().insert(
+        AUTHORIZATION,
+        HeaderValue::from_str(&format!("bearer {}", alibaba.api_key.trim()))
+            .context("Alibaba API key contains an invalid header value")?,
+    );
+
+    let (mut socket, _) = connect_with_timeout(
+        request,
+        Duration::from_millis(config.asr.connect_timeout_ms.max(1_000)),
+    )?;
+    configure_socket(socket.get_mut())?;
+    send_json(&mut socket, session_update_payload(config, spec, "event-1"))?;
+
+    Ok(OpenedStream {
+        socket,
+        next_event_id: 2,
+    })
+}
+
+#[derive(Debug, Default)]
+struct RetryBudget {
+    replacement_used: bool,
+}
+
+impl RetryBudget {
+    fn claim_replacement(&mut self) -> bool {
+        if self.replacement_used {
+            false
+        } else {
+            self.replacement_used = true;
+            true
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct RetainedAudio {
+    packets: Vec<Vec<i16>>,
+    next_packet_index: usize,
+    sample_count: u64,
+}
+
+impl RetainedAudio {
+    fn accept_control(&mut self, control: AsrControl) -> bool {
+        match control {
+            AsrControl::AppendPcm16(samples) => {
+                self.retain(samples);
+                false
+            }
+            AsrControl::Finish => true,
+        }
+    }
+
+    fn retain(&mut self, samples: Vec<i16>) {
+        self.sample_count = self.sample_count.saturating_add(samples.len() as u64);
+        self.packets.push(samples);
+    }
+
+    fn has_unsent_packet(&self) -> bool {
+        self.next_packet_index < self.packets.len()
+    }
+
+    fn caught_up(&self) -> bool {
+        !self.has_unsent_packet()
+    }
+
+    fn finish_ready(&self, finish_requested: bool) -> bool {
+        finish_requested && self.caught_up()
+    }
+
+    fn next_packet(&self) -> Option<&[i16]> {
+        self.packets.get(self.next_packet_index).map(Vec::as_slice)
+    }
+
+    fn mark_packet_sent(&mut self) {
+        debug_assert!(self.has_unsent_packet());
+        self.next_packet_index += 1;
+    }
+
+    fn rewind(&mut self) {
+        self.next_packet_index = 0;
+    }
+
+    fn packet_count(&self) -> usize {
+        self.packets.len()
+    }
+
+    fn sample_count(&self) -> u64 {
+        self.sample_count
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum InterruptionReason {
+    TranscriptStall,
+    WebSocketClose(Option<u16>),
+    ConnectionClosed,
+    StreamRead,
+    StreamWrite,
+    FinalizeTimeout,
+}
+
+impl std::fmt::Display for InterruptionReason {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TranscriptStall => formatter.write_str("8-second transcript stall"),
+            Self::WebSocketClose(Some(code)) => write!(formatter, "WebSocket close ({code})"),
+            Self::WebSocketClose(None) => formatter.write_str("WebSocket close"),
+            Self::ConnectionClosed => formatter.write_str("connection closed"),
+            Self::StreamRead => formatter.write_str("stream read failure"),
+            Self::StreamWrite => formatter.write_str("stream write failure"),
+            Self::FinalizeTimeout => formatter.write_str("finalize timeout"),
+        }
+    }
+}
+
+enum Reconstruction {
+    Restarted(Box<OpenedStream>),
+    Stop,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn reconstruct_stream(
+    socket: &mut QwenSocket,
+    config: &Config,
+    spec: AudioSpec,
+    abort_flag: &AtomicBool,
+    event_tx: &mpsc::Sender<AsrEvent>,
+    retry_budget: &mut RetryBudget,
+    reason: InterruptionReason,
+    retained_audio: &RetainedAudio,
+    attempt_number: u8,
+) -> Result<Reconstruction> {
+    if abort_flag.load(Ordering::SeqCst) {
+        let _ = socket.close(None);
+        return Ok(Reconstruction::Stop);
+    }
+
+    if !retry_budget.claim_replacement() {
+        terminal_stream_failure(socket, event_tx, attempt_number, reason, retained_audio);
+        return Ok(Reconstruction::Stop);
+    }
+
+    let _ = socket.close(None);
+    if abort_flag.load(Ordering::SeqCst) {
+        return Ok(Reconstruction::Stop);
+    }
+
+    let replacement_attempt = attempt_number + 1;
+    eprintln!(
+        "voice-input realtime ASR: attempt {attempt_number} interrupted by {reason}; starting attempt {replacement_attempt} with {} retained packets / {} samples",
+        retained_audio.packet_count(),
+        retained_audio.sample_count()
+    );
+    let _ = event_tx.send(AsrEvent::RealtimeRestarting);
+    if abort_flag.load(Ordering::SeqCst) {
+        return Ok(Reconstruction::Stop);
+    }
+
+    let opened = match open_stream(config, spec) {
+        Ok(opened) => opened,
+        Err(error) => {
+            eprintln!(
+                "voice-input realtime ASR: attempt {replacement_attempt} replacement connection failed after {reason}: {error:#}; {} retained packets / {} samples",
+                retained_audio.packet_count(),
+                retained_audio.sample_count()
+            );
+            let _ = event_tx.send(AsrEvent::RealtimeTranscriptDelayed);
+            return Ok(Reconstruction::Stop);
+        }
+    };
+    if abort_flag.load(Ordering::SeqCst) {
+        let mut socket = opened.socket;
+        let _ = socket.close(None);
+        return Ok(Reconstruction::Stop);
+    }
+
+    eprintln!(
+        "voice-input realtime ASR: attempt {replacement_attempt} connected; replaying {} retained packets / {} samples",
+        retained_audio.packet_count(),
+        retained_audio.sample_count()
+    );
+    Ok(Reconstruction::Restarted(Box::new(opened)))
+}
+
+fn terminal_stream_failure(
+    socket: &mut QwenSocket,
+    event_tx: &mpsc::Sender<AsrEvent>,
+    attempt_number: u8,
+    reason: InterruptionReason,
+    retained_audio: &RetainedAudio,
+) {
+    eprintln!(
+        "voice-input realtime ASR: attempt {attempt_number} ended after {reason}; retry exhausted with {} retained packets / {} samples",
+        retained_audio.packet_count(),
+        retained_audio.sample_count()
+    );
+    let _ = socket.close(None);
+    let _ = event_tx.send(AsrEvent::RealtimeTranscriptDelayed);
 }
 
 struct PcmNoiseGate {
@@ -406,7 +711,8 @@ impl PcmNoiseGate {
         }
     }
 
-    fn filter(&mut self, mut samples: Vec<i16>) -> Vec<i16> {
+    fn filter(&mut self, samples: &[i16]) -> Vec<i16> {
+        let mut samples = samples.to_vec();
         // The measured idle microphone RMS peaks around 0.0015 of full scale
         // on the target hardware. Open at roughly 0.0022 so quiet speech after
         // a long pause can restart realtime ASR, then retain half a second of
@@ -465,17 +771,20 @@ fn update_local_speech_burst(
     packet_samples: usize,
     has_speech: bool,
     time_since_last_speech: Option<Duration>,
-) -> usize {
+) -> (usize, bool) {
+    let starts_new_burst =
+        has_speech && time_since_last_speech.is_some_and(|gap| gap > LOCAL_SPEECH_BURST_GAP);
     let current = if time_since_last_speech.is_some_and(|gap| gap > LOCAL_SPEECH_BURST_GAP) {
         0
     } else {
         current
     };
-    if has_speech {
+    let current = if has_speech {
         current.saturating_add(packet_samples)
     } else {
         current
-    }
+    };
+    (current, starts_new_burst)
 }
 
 fn should_mark_realtime_stalled(
@@ -588,6 +897,11 @@ fn connect_with_timeout(
     let stream = TcpStream::connect_timeout(&address, timeout)
         .with_context(|| format!("failed to connect to Alibaba realtime ASR at {host}:{port}"))?;
     stream.set_nodelay(true).ok();
+    // Bound TLS and HTTP upgrade I/O as well as the TCP connect. DNS remains
+    // subject to the operating-system resolver, but an accepted TCP socket can
+    // no longer hold Stop indefinitely during a stalled handshake.
+    stream.set_read_timeout(Some(timeout))?;
+    stream.set_write_timeout(Some(timeout))?;
 
     match client_tls_with_config(request, stream, None, None) {
         Ok(value) => Ok(value),
@@ -757,22 +1071,23 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        Message, PcmNoiseGate, TranscriptAssembler, parse_server_event, pcm_chunk_has_local_speech,
-        push_transcript_piece, should_mark_realtime_stalled, update_local_speech_burst,
+        AsrControl, Message, PcmNoiseGate, RetainedAudio, RetryBudget, TranscriptAssembler,
+        parse_server_event, pcm_chunk_has_local_speech, push_transcript_piece,
+        should_mark_realtime_stalled, update_local_speech_burst,
     };
 
     #[test]
     fn noise_gate_zeros_idle_noise_and_preserves_speech_with_hangover() {
         let mut gate = PcmNoiseGate::new(4);
 
-        assert_eq!(gate.filter(vec![40; 4]), vec![0; 4]);
+        assert_eq!(gate.filter(&[40; 4]), vec![0; 4]);
         assert!(!gate.speech_observed());
         assert_eq!(gate.suppressed_sample_count(), 4);
-        assert_eq!(gate.filter(vec![300; 4]), vec![300; 4]);
+        assert_eq!(gate.filter(&[300; 4]), vec![300; 4]);
         assert!(gate.speech_observed());
         assert_eq!(gate.reopen_count(), 1);
-        assert_eq!(gate.filter(vec![40; 4]), vec![40; 4]);
-        assert_eq!(gate.filter(vec![40; 4]), vec![0; 4]);
+        assert_eq!(gate.filter(&[40; 4]), vec![40; 4]);
+        assert_eq!(gate.filter(&[40; 4]), vec![0; 4]);
         assert_eq!(gate.suppressed_sample_count(), 8);
     }
 
@@ -801,19 +1116,61 @@ mod tests {
             false, true, true, true, false
         ));
 
-        let burst = update_local_speech_burst(0, 2_048, true, None);
+        let (burst, starts_new_burst) = update_local_speech_burst(0, 2_048, true, None);
+        assert!(!starts_new_burst);
         assert_eq!(
             update_local_speech_burst(burst, 2_048, true, Some(Duration::from_millis(500))),
-            4_096
+            (4_096, false)
         );
         assert_eq!(
             update_local_speech_burst(burst, 2_048, true, Some(Duration::from_secs(2))),
-            2_048
+            (2_048, true)
+        );
+        assert_eq!(
+            update_local_speech_burst(0, 2_048, true, Some(Duration::from_secs(2))),
+            (2_048, true)
         );
         assert_eq!(
             update_local_speech_burst(burst, 2_048, false, Some(Duration::from_secs(2))),
-            0
+            (0, false)
         );
+    }
+
+    #[test]
+    fn retry_budget_allows_exactly_one_replacement() {
+        let mut budget = RetryBudget::default();
+
+        assert!(budget.claim_replacement());
+        assert!(!budget.claim_replacement());
+        assert!(!budget.claim_replacement());
+    }
+
+    #[test]
+    fn retained_audio_replays_in_order_before_later_controls() {
+        let mut audio = RetainedAudio::default();
+        assert!(!audio.accept_control(AsrControl::AppendPcm16(vec![1, 2])));
+        assert!(!audio.accept_control(AsrControl::AppendPcm16(vec![3])));
+        assert_eq!(audio.packet_count(), 2);
+        assert_eq!(audio.sample_count(), 3);
+
+        assert_eq!(audio.next_packet(), Some([1, 2].as_slice()));
+        audio.mark_packet_sent();
+        assert!(!audio.caught_up());
+        assert_eq!(audio.next_packet(), Some([3].as_slice()));
+        audio.mark_packet_sent();
+        assert!(audio.caught_up());
+
+        audio.rewind();
+        assert!(!audio.caught_up());
+        assert_eq!(audio.next_packet(), Some([1, 2].as_slice()));
+        audio.mark_packet_sent();
+        let finish_requested = audio.accept_control(AsrControl::Finish);
+        assert!(finish_requested);
+        assert!(!audio.finish_ready(finish_requested));
+        assert_eq!(audio.next_packet(), Some([3].as_slice()));
+        audio.mark_packet_sent();
+        assert!(audio.caught_up());
+        assert!(audio.finish_ready(finish_requested));
     }
 
     #[test]

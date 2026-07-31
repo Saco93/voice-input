@@ -24,8 +24,8 @@ flowchart LR
 ```
 
 1. 常驻 PipeWire capture service 保留一小段 pre-roll，避免快捷键按下后最开始的语音被截掉。录音达到配置的时长上限后会自动停止并进入最终处理；默认上限为五分钟。
-2. Qwen Realtime 持续把 partial transcript 发送到 HUD，Server VAD 控制波形是否可见。实时音频使用容量受限的非阻塞 queue、公平的双向 WebSocket 处理和八秒有声录音停滞检测，因此网络或服务端故障不会冻结采集或波形。
-3. Toggle off 后，可选择让 Final ASR 对完整录音重新识别一次。如果实时处理停滞、断开连接或传输落后，程序会拒绝不完整的远程文本，并通过已启用的 final pass 或本地 fallback 恢复完整音频。
+2. Qwen Realtime 持续把 partial transcript 发送到 HUD，Server VAD 控制波形是否可见。实时音频使用容量受限的非阻塞 queue、公平的双向 WebSocket 处理和八秒有声录音停滞检测。第一次发生 transcript 停滞时，worker 会重建一次实时会话，并从头重放所有已缓冲的原始 PCM packet；录音在此期间继续进行。
+3. Toggle off 后，可选择让 Final ASR 对完整录音重新识别一次。如果这次受控重建失败、连接关闭或实时传输落后，程序会拒绝不完整的远程文本，并通过已启用的 final pass 或本地 fallback 对完整音频进行恢复识别。
 4. OpenAI-compatible LLM 对文本做轻量整理。Refinement 使用配置的 timeout（默认 15 秒，最多 30 秒）；预算达到 10 秒时，包含 coding agent 上下文的请求会为纯 transcript 清理重试预留 5 秒，最终失败时使用 Final ASR。
 5. 短文本通过 `wtype` 输入；长文本和 XWayland 窗口自动使用剪贴板粘贴，并在结束后恢复原剪贴板。
 
@@ -83,7 +83,7 @@ systemctl --user status voice-input.service voice-input-hud.service
 
 - 支持中英文混合输入的 Qwen Realtime + Server VAD
 - 与 ASR packet cadence 解耦的 62.5 FPS 中心对称 PCM 波形
-- 完整 Realtime transcript 与可选的全音频 Final ASR
+- 一次受控的实时会话重建与完整缓冲音频重放；重建失败后使用完整音频进行最终恢复
 - 延迟受限且支持纯 transcript 清理重试的保守 LLM refinement
 - Pi/Codex 术语上下文：进程验证、脱敏、截断与 prompt-injection 隔离
 - Wayland/XWayland 长文本自动粘贴与剪贴板恢复

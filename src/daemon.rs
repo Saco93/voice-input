@@ -1331,10 +1331,17 @@ fn run_capture_service(
                     active.asr_packetizer.as_ref(),
                 )
             {
-                let packets = packetizer
-                    .lock()
-                    .expect("ASR packetizer mutex poisoned")
-                    .push(chunk);
+                let packets = {
+                    let mut packetizer = packetizer.lock().expect("ASR packetizer mutex poisoned");
+                    // Stop and the final flush synchronize through this mutex:
+                    // an in-flight shared-capture chunk either enters before
+                    // the flush or observes Stop and cannot appear after Finish.
+                    if active.stop_flag.load(Ordering::SeqCst) {
+                        Vec::new()
+                    } else {
+                        packetizer.push(chunk)
+                    }
+                };
                 for packet in packets {
                     let result = try_enqueue_realtime_audio(tx, packet);
                     if result != RealtimeAudioEnqueue::Sent {
@@ -1619,18 +1626,21 @@ fn spawn_realtime_event_thread(
             event_rx,
         } = context;
         let mut final_transcript = None;
+        let mut realtime_reconstructing = false;
 
         while let Ok(event) = event_rx.recv() {
             match event {
                 backend::AsrEvent::Ready => {
                     asr_ready.store(true, Ordering::SeqCst);
-                    refresh_recording_readiness(
-                        &state,
-                        &config,
-                        session_id,
-                        capture_ready.load(Ordering::SeqCst),
-                        asr_ready.load(Ordering::SeqCst),
-                    )?;
+                    if !realtime_reconstructing {
+                        refresh_recording_readiness(
+                            &state,
+                            &config,
+                            session_id,
+                            capture_ready.load(Ordering::SeqCst),
+                            asr_ready.load(Ordering::SeqCst),
+                        )?;
+                    }
                 }
                 backend::AsrEvent::SpeechStarted => {
                     speech_detected.store(true, Ordering::SeqCst);
@@ -1638,6 +1648,35 @@ fn spawn_realtime_event_thread(
                 }
                 backend::AsrEvent::SpeechStopped => {
                     voice_active.store(false, Ordering::Relaxed);
+                }
+                backend::AsrEvent::RealtimeRestarting => {
+                    // Reconstruction is only requested after the stream has
+                    // accepted audio or local speech has exposed a stall. Keep
+                    // stop-time full-audio recovery eligible if Stop races the
+                    // replacement before Qwen emits a new speech event.
+                    speech_detected.store(true, Ordering::SeqCst);
+                    realtime_reconstructing = true;
+                    state.update(|snapshot| {
+                        if matches!(snapshot.phase, Phase::Arming | Phase::Recording) {
+                            snapshot.tooltip = "Realtime reconnecting — recording continues".into();
+                        }
+                    })?;
+                }
+                backend::AsrEvent::RealtimeRestarted => {
+                    realtime_reconstructing = false;
+                    asr_ready.store(true, Ordering::SeqCst);
+                    refresh_recording_readiness(
+                        &state,
+                        &config,
+                        session_id,
+                        capture_ready.load(Ordering::SeqCst),
+                        true,
+                    )?;
+                    state.update(|snapshot| {
+                        if matches!(snapshot.phase, Phase::Arming | Phase::Recording) {
+                            snapshot.tooltip = "Replaying buffered audio…".into();
+                        }
+                    })?;
                 }
                 backend::AsrEvent::RealtimeTranscriptDelayed => {
                     speech_detected.store(true, Ordering::SeqCst);
@@ -1653,6 +1692,7 @@ fn spawn_realtime_event_thread(
                     committed,
                     unstable,
                 } => {
+                    realtime_reconstructing = false;
                     let transcript = format!("{committed}{unstable}");
                     if !transcript.trim().is_empty() {
                         speech_detected.store(true, Ordering::SeqCst);
@@ -1684,6 +1724,7 @@ fn spawn_realtime_event_thread(
                     })?;
                 }
                 backend::AsrEvent::SegmentFinal { text } => {
+                    realtime_reconstructing = false;
                     if !text.trim().is_empty() {
                         speech_detected.store(true, Ordering::SeqCst);
                     }
