@@ -1,7 +1,10 @@
 use std::{
     fs,
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -69,6 +72,8 @@ pub struct Snapshot {
     #[serde(default)]
     pub output_driver: Option<String>,
     pub error: Option<String>,
+    #[serde(default)]
+    pub revision: u64,
     pub updated_at_ms: u128,
 }
 
@@ -106,6 +111,7 @@ impl Snapshot {
             output_mode: None,
             output_driver: None,
             error: None,
+            revision: 0,
             updated_at_ms: now_ms(),
         }
     }
@@ -140,6 +146,7 @@ impl Snapshot {
             payload["output_target_resolved"] = json!(self.output_target_resolved);
             payload["output_mode"] = json!(self.output_mode);
             payload["output_driver"] = json!(self.output_driver);
+            payload["revision"] = json!(self.revision);
         }
 
         payload
@@ -175,18 +182,21 @@ struct StateInner {
     config: Config,
     snapshot: Mutex<Snapshot>,
     update_lock: Mutex<()>,
+    next_revision: AtomicU64,
 }
 
 impl StateHandle {
     pub fn new(config: Config) -> Result<Self> {
         fs::create_dir_all(paths::runtime_dir()?)
             .context("failed to create runtime directory for voice-input")?;
-        let snapshot = Snapshot::idle(&config);
+        let mut snapshot = Snapshot::idle(&config);
+        snapshot.revision = 1;
         let handle = Self {
             inner: Arc::new(StateInner {
                 config,
                 snapshot: Mutex::new(snapshot),
                 update_lock: Mutex::new(()),
+                next_revision: AtomicU64::new(2),
             }),
         };
         handle.persist()?;
@@ -208,6 +218,7 @@ impl StateHandle {
         {
             let mut snapshot = self.inner.snapshot.lock().expect("snapshot mutex poisoned");
             update(&mut snapshot);
+            assign_next_revision(&mut snapshot, &self.inner.next_revision);
             snapshot.updated_at_ms = now_ms();
         }
         self.persist()
@@ -255,6 +266,10 @@ impl StateHandle {
     }
 }
 
+fn assign_next_revision(snapshot: &mut Snapshot, next_revision: &AtomicU64) {
+    snapshot.revision = next_revision.fetch_add(1, Ordering::SeqCst);
+}
+
 fn default_hud_enabled() -> bool {
     true
 }
@@ -276,9 +291,11 @@ fn now_ms() -> u128 {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::AtomicU64;
+
     use serde_json::Value;
 
-    use super::Snapshot;
+    use super::{Snapshot, assign_next_revision};
     use crate::config::Config;
 
     #[test]
@@ -294,6 +311,7 @@ mod tests {
         assert_eq!(extended["hud_height"], 64);
         assert_eq!(extended["recording_started_at_ms"], Value::Null);
         assert_eq!(extended["recording_duration_ms"], 0);
+        assert_eq!(extended["revision"], 0);
     }
 
     #[test]
@@ -316,11 +334,29 @@ mod tests {
         object.remove("hud_height");
         object.remove("recording_started_at_ms");
         object.remove("recording_duration_ms");
+        object.remove("revision");
         let snapshot: Snapshot = serde_json::from_value(Value::Object(object.clone())).unwrap();
         assert!(snapshot.hud_enabled);
         assert_eq!(snapshot.hud_margin_bottom, 72);
         assert_eq!(snapshot.hud_height, 56);
         assert_eq!(snapshot.recording_started_at_ms, None);
         assert_eq!(snapshot.recording_duration_ms, 0);
+        assert_eq!(snapshot.revision, 0);
+    }
+
+    #[test]
+    fn full_snapshot_replacement_still_advances_revision() {
+        let config = Config::default();
+        let next_revision = AtomicU64::new(12);
+        let mut snapshot = Snapshot::idle(&config);
+        snapshot.revision = 11;
+        assert_eq!(snapshot.revision, 11);
+
+        snapshot = Snapshot::idle(&config);
+        assign_next_revision(&mut snapshot, &next_revision);
+        assert_eq!(snapshot.revision, 12);
+
+        assign_next_revision(&mut snapshot, &next_revision);
+        assert_eq!(snapshot.revision, 13);
     }
 }

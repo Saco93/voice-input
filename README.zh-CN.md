@@ -24,8 +24,8 @@ flowchart LR
 ```
 
 1. 常驻 PipeWire capture service 保留一小段 pre-roll，避免快捷键按下后最开始的语音被截掉。录音达到配置的时长上限后会自动停止并进入最终处理；默认上限为五分钟。
-2. Qwen Realtime 持续把 partial transcript 发送到 HUD，Server VAD 控制波形是否可见。实时音频使用容量受限的非阻塞 queue、公平的双向 WebSocket 处理，以及只在 Server VAD 确认语音段处于 active 状态时运行的八秒 watchdog。第一次发生 transcript 停滞时，worker 会重建一次实时会话，并从头重放所有已缓冲的原始 PCM packet；录音在此期间继续进行。
-3. Toggle off 后，可选择让 Final ASR 对完整录音重新识别一次。如果这次受控重建失败、连接关闭或实时传输落后，程序会拒绝不完整的远程文本，并通过已启用的 final pass 或本地 fallback 对完整音频进行恢复识别。
+2. Qwen Realtime 持续把 partial transcript 发送到 HUD，Server VAD 控制波形是否可见。实时音频使用容量受限的非阻塞 queue，并公平处理双向 WebSocket 消息。如果结束录音前发生传输错误、Server VAD 确认语音段处于 active 状态但 transcript 停滞八秒，或者已经出现文本后检测到持续且具有音高相关性的本地语音，但连续八秒没有收到服务器事件，worker 可以重建一次实时会话。重建期间，worker 会从头重放所有已缓冲的原始 PCM packet，同时继续录音。
+3. Toggle off 后，可选择让 Final ASR 对完整录音重新识别一次。如果受控重建失败、唯一一次重试已经用完，或者实时传输落后，程序会拒绝不完整的远程文本，并通过已启用的 final pass 或本地 fallback 对完整音频进行恢复识别。
 4. OpenAI-compatible LLM 对文本做轻量整理。Refinement 使用配置的 timeout（默认 15 秒，最多 30 秒）；预算达到 10 秒时，包含 coding agent 上下文的请求会为纯 transcript 清理重试预留 5 秒，最终失败时使用 Final ASR。
 5. 短文本通过 `wtype` 输入；长文本和 XWayland 窗口自动使用剪贴板粘贴，并在结束后恢复原剪贴板。
 

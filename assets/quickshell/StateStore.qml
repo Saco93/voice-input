@@ -66,6 +66,7 @@ QtObject {
         "hud_offset_y": 0,
         "recording_started_at_ms": null,
         "recording_duration_ms": 0,
+        "revision": 0,
         "error": null
     })
     readonly property string phase: snapshot.phase || "idle"
@@ -124,6 +125,9 @@ QtObject {
 
         if (!Number.isFinite(candidate.updated_at_ms) || candidate.updated_at_ms < 0)
             return "updated_at_ms is invalid";
+
+        if (candidate.revision !== undefined && (!Number.isSafeInteger(candidate.revision) || candidate.revision < 0))
+            return "revision is invalid";
 
         const requiredStrings = [["class", 64], ["icon", 64], ["text", 1024], ["tooltip", maximumTranscriptLength], ["transcript", maximumTranscriptLength], ["language", 256], ["engine", 2048], ["model", 2048]];
         for (let index = 0; index < requiredStrings.length; index++) {
@@ -188,7 +192,10 @@ QtObject {
                 reportInvalidSnapshot(validationError);
                 return ;
             }
-            if (parsed.updated_at_ms !== snapshot.updated_at_ms) {
+            const revisionsAvailable = Number.isSafeInteger(parsed.revision) && Number.isSafeInteger(snapshot.revision);
+            const revisionChanged = revisionsAvailable && parsed.revision !== snapshot.revision;
+            const snapshotChanged = revisionChanged || parsed.updated_at_ms !== snapshot.updated_at_ms;
+            if (snapshotChanged) {
                 const previousPhase = snapshot.phase;
                 snapshot = parsed;
                 invalidSnapshotCount = 0;

@@ -27,6 +27,7 @@ use crate::{
         ASR_CONTROL_QUEUE_CAPACITY, AsrBackend, AsrControl, AsrEvent, AsrSessionHandle, AudioSpec,
     },
     config::{AlibabaTurnMode, Config},
+    waveform::pcm_has_voiced_speech,
 };
 
 type QwenSocket = WebSocket<MaybeTlsStream<TcpStream>>;
@@ -36,7 +37,9 @@ type QwenConnection = (QwenSocket, QwenHandshakeResponse);
 const MAX_CONTROLS_PER_TICK: usize = 8;
 const MAX_AUDIO_SENDS_PER_TICK: usize = 8;
 const REPLAY_SPEED_MULTIPLIER: f64 = 4.0;
-const TRANSCRIPTION_STALL_TIMEOUT: Duration = Duration::from_secs(8);
+const ACTIVE_TRANSCRIPTION_STALL_TIMEOUT: Duration = Duration::from_secs(8);
+const POST_TRANSCRIPT_SPEECH_STALL_TIMEOUT: Duration = Duration::from_secs(8);
+const LOCAL_VOICED_EVIDENCE_SECS: usize = 1;
 
 pub struct QwenRealtimeBackend;
 
@@ -107,7 +110,10 @@ fn run_session(
     let mut appended_sample_count = 0_u64;
     let mut noise_gate = PcmNoiseGate::new((spec.sample_rate_hz as usize) / 2);
     let mut server_speech_active = false;
+    let mut transcript_seen = false;
     let mut last_transcription_activity = Instant::now();
+    let mut last_server_activity = Instant::now();
+    let mut local_voiced_evidence_samples = 0_usize;
     let mut retained_audio = RetainedAudio::default();
     let mut retry_budget = RetryBudget::default();
     let mut attempt_number = 1_u8;
@@ -145,7 +151,10 @@ fn run_session(
                     appended_sample_count = 0;
                     noise_gate = PcmNoiseGate::new((spec.sample_rate_hz as usize) / 2);
                     server_speech_active = false;
+                    transcript_seen = false;
                     last_transcription_activity = Instant::now();
+                    last_server_activity = Instant::now();
+                    local_voiced_evidence_samples = 0;
                     retained_audio.rewind();
                     replay_pacing = true;
                     next_replay_packet_at = Instant::now();
@@ -204,6 +213,15 @@ fn run_session(
             let packet_duration = Duration::from_secs_f64(
                 samples.len() as f64 / f64::from(spec.sample_rate_hz) / REPLAY_SPEED_MULTIPLIER,
             );
+            let local_voiced = transcript_seen
+                && !server_speech_active
+                && pcm_has_voiced_speech(samples, spec.sample_rate_hz);
+            local_voiced_evidence_samples = update_local_voiced_evidence(
+                local_voiced_evidence_samples,
+                samples.len(),
+                local_voiced,
+                spec.sample_rate_hz as usize * LOCAL_VOICED_EVIDENCE_SECS,
+            );
             let filtered_samples = noise_gate.filter(samples);
             if send_json(
                 &mut socket,
@@ -215,6 +233,9 @@ fn run_session(
             )
             .is_err()
             {
+                if !finish_requested {
+                    reconstruct_or_stop!('session, InterruptionReason::StreamWrite);
+                }
                 terminal_stream_failure(
                     &mut socket,
                     &event_tx,
@@ -274,6 +295,9 @@ fn run_session(
                 let reason = InterruptionReason::WebSocketClose(
                     frame.as_ref().map(|frame| u16::from(frame.code)),
                 );
+                if !finish_requested {
+                    reconstruct_or_stop!('session, reason);
+                }
                 terminal_stream_failure(
                     &mut socket,
                     &event_tx,
@@ -285,6 +309,8 @@ fn run_session(
             }
             Ok(message) => {
                 if let Some(event) = parse_server_event(message)? {
+                    last_server_activity = Instant::now();
+                    local_voiced_evidence_samples = 0;
                     match event {
                         ServerEvent::SessionCreated => {}
                         ServerEvent::SessionUpdated => {
@@ -344,6 +370,7 @@ fn run_session(
                             stash,
                         } => {
                             partial_event_count += 1;
+                            transcript_seen |= !text.is_empty() || !stash.is_empty();
                             last_transcription_activity = Instant::now();
                             if partial_event_count == 1 {
                                 eprintln!(
@@ -363,6 +390,7 @@ fn run_session(
                             transcript,
                         } => {
                             completed_event_count += 1;
+                            transcript_seen |= !transcript.is_empty();
                             last_transcription_activity = Instant::now();
                             let text = assembler.apply_completed(item_id, transcript);
                             let _ = event_tx.send(AsrEvent::SegmentFinal { text });
@@ -399,6 +427,9 @@ fn run_session(
                 if error.kind() == std::io::ErrorKind::WouldBlock
                     || error.kind() == std::io::ErrorKind::TimedOut => {}
             Err(tungstenite::Error::ConnectionClosed) | Err(tungstenite::Error::AlreadyClosed) => {
+                if !finish_requested {
+                    reconstruct_or_stop!('session, InterruptionReason::ConnectionClosed);
+                }
                 terminal_stream_failure(
                     &mut socket,
                     &event_tx,
@@ -409,6 +440,9 @@ fn run_session(
                 return Ok(());
             }
             Err(_) => {
+                if !finish_requested {
+                    reconstruct_or_stop!('session, InterruptionReason::StreamRead);
+                }
                 terminal_stream_failure(
                     &mut socket,
                     &event_tx,
@@ -420,18 +454,22 @@ fn run_session(
             }
         }
 
-        // Reconstruct only while Server VAD says a speech segment is active.
-        // Local RMS is hardware-dependent and can classify steady microphone
-        // noise as speech; it must not start the eight-second watchdog by
-        // itself. If the server never acknowledges speech, stop-time full-audio
-        // recovery remains available without an unnecessary reconnect loop.
-        if should_mark_realtime_stalled(
+        // Server VAD remains authoritative for the fast watchdog. A second
+        // path catches a missed follow-up speech_started event only after the
+        // raw audio contains sustained, pitch-correlated local voice evidence.
+        // Ordinary silence and stationary broadband microphone noise cannot
+        // consume the session's single reconstruction attempt.
+        if let Some(reason) = realtime_stall_reason(
             finish_requested,
             matches!(config.asr.alibaba.turn_mode, AlibabaTurnMode::ServerVad),
             server_speech_active,
-            last_transcription_activity.elapsed() >= TRANSCRIPTION_STALL_TIMEOUT,
+            transcript_seen,
+            local_voiced_evidence_samples
+                >= spec.sample_rate_hz as usize * LOCAL_VOICED_EVIDENCE_SECS,
+            last_transcription_activity.elapsed(),
+            last_server_activity.elapsed(),
         ) {
-            reconstruct_or_stop!('session, InterruptionReason::TranscriptStall);
+            reconstruct_or_stop!('session, reason);
         }
 
         if let Some(deadline) = finalize_deadline
@@ -559,7 +597,8 @@ impl RetainedAudio {
 
 #[derive(Debug, Clone, Copy)]
 enum InterruptionReason {
-    TranscriptStall,
+    ActiveTranscriptStall,
+    PostTranscriptSpeechStall,
     WebSocketClose(Option<u16>),
     ConnectionClosed,
     StreamRead,
@@ -570,7 +609,10 @@ enum InterruptionReason {
 impl std::fmt::Display for InterruptionReason {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::TranscriptStall => formatter.write_str("8-second transcript stall"),
+            Self::ActiveTranscriptStall => formatter.write_str("8-second active transcript stall"),
+            Self::PostTranscriptSpeechStall => {
+                formatter.write_str("post-transcript local-speech stall")
+            }
             Self::WebSocketClose(Some(code)) => write!(formatter, "WebSocket close ({code})"),
             Self::WebSocketClose(None) => formatter.write_str("WebSocket close"),
             Self::ConnectionClosed => formatter.write_str("connection closed"),
@@ -726,13 +768,43 @@ fn pcm_chunk_exceeds_rms(samples: &[i16], minimum_rms: i64) -> bool {
     squared_energy >= minimum_rms.pow(2) * samples.len() as i64
 }
 
-fn should_mark_realtime_stalled(
+fn update_local_voiced_evidence(
+    current_samples: usize,
+    packet_samples: usize,
+    voiced: bool,
+    maximum_samples: usize,
+) -> usize {
+    if voiced {
+        current_samples
+            .saturating_add(packet_samples)
+            .min(maximum_samples)
+    } else {
+        current_samples.saturating_sub(packet_samples / 2)
+    }
+}
+
+fn realtime_stall_reason(
     finish_requested: bool,
     server_vad: bool,
     server_speech_active: bool,
-    inactive_long_enough: bool,
-) -> bool {
-    !finish_requested && server_vad && server_speech_active && inactive_long_enough
+    transcript_seen: bool,
+    has_local_voiced_evidence: bool,
+    transcription_inactive_for: Duration,
+    server_inactive_for: Duration,
+) -> Option<InterruptionReason> {
+    if finish_requested || !server_vad {
+        return None;
+    }
+    if server_speech_active && transcription_inactive_for >= ACTIVE_TRANSCRIPTION_STALL_TIMEOUT {
+        return Some(InterruptionReason::ActiveTranscriptStall);
+    }
+    if transcript_seen
+        && has_local_voiced_evidence
+        && server_inactive_for >= POST_TRANSCRIPT_SPEECH_STALL_TIMEOUT
+    {
+        return Some(InterruptionReason::PostTranscriptSpeechStall);
+    }
+    None
 }
 
 fn send_json(socket: &mut QwenSocket, payload: Value) -> Result<()> {
@@ -1002,9 +1074,13 @@ fn push_transcript_piece(target: &mut String, piece: &str) {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::{
-        AsrControl, Message, PcmNoiseGate, RetainedAudio, RetryBudget, TranscriptAssembler,
-        parse_server_event, push_transcript_piece, should_mark_realtime_stalled,
+        ACTIVE_TRANSCRIPTION_STALL_TIMEOUT, AsrControl, InterruptionReason, Message,
+        POST_TRANSCRIPT_SPEECH_STALL_TIMEOUT, PcmNoiseGate, RetainedAudio, RetryBudget,
+        TranscriptAssembler, parse_server_event, push_transcript_piece, realtime_stall_reason,
+        update_local_voiced_evidence,
     };
 
     #[test]
@@ -1021,15 +1097,111 @@ mod tests {
     }
 
     #[test]
-    fn stalled_stream_requires_authoritative_server_speech_and_inactivity() {
-        assert!(should_mark_realtime_stalled(false, true, true, true));
-        assert!(!should_mark_realtime_stalled(true, true, true, true));
-        assert!(!should_mark_realtime_stalled(false, false, true, true));
-        // Hardware-dependent local RMS is intentionally absent: without a
-        // Server VAD speech_started event, silence or loud stationary noise
-        // cannot trigger buffered-audio replay.
-        assert!(!should_mark_realtime_stalled(false, true, false, true));
-        assert!(!should_mark_realtime_stalled(false, true, true, false));
+    fn active_stall_requires_server_speech_and_eight_seconds() {
+        assert!(matches!(
+            realtime_stall_reason(
+                false,
+                true,
+                true,
+                false,
+                false,
+                ACTIVE_TRANSCRIPTION_STALL_TIMEOUT,
+                Duration::ZERO,
+            ),
+            Some(InterruptionReason::ActiveTranscriptStall)
+        ));
+        assert!(
+            realtime_stall_reason(
+                false,
+                true,
+                true,
+                false,
+                false,
+                ACTIVE_TRANSCRIPTION_STALL_TIMEOUT - Duration::from_millis(1),
+                Duration::ZERO,
+            )
+            .is_none()
+        );
+        assert!(
+            realtime_stall_reason(
+                true,
+                true,
+                true,
+                true,
+                true,
+                ACTIVE_TRANSCRIPTION_STALL_TIMEOUT,
+                POST_TRANSCRIPT_SPEECH_STALL_TIMEOUT,
+            )
+            .is_none()
+        );
+        assert!(
+            realtime_stall_reason(
+                false,
+                false,
+                true,
+                true,
+                true,
+                ACTIVE_TRANSCRIPTION_STALL_TIMEOUT,
+                POST_TRANSCRIPT_SPEECH_STALL_TIMEOUT,
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn inactive_stream_requires_prior_text_local_voice_and_eight_seconds() {
+        assert!(matches!(
+            realtime_stall_reason(
+                false,
+                true,
+                false,
+                true,
+                true,
+                Duration::ZERO,
+                POST_TRANSCRIPT_SPEECH_STALL_TIMEOUT,
+            ),
+            Some(InterruptionReason::PostTranscriptSpeechStall)
+        ));
+        for (transcript_seen, local_voice) in [(false, true), (true, false)] {
+            assert!(
+                realtime_stall_reason(
+                    false,
+                    true,
+                    false,
+                    transcript_seen,
+                    local_voice,
+                    Duration::ZERO,
+                    POST_TRANSCRIPT_SPEECH_STALL_TIMEOUT,
+                )
+                .is_none()
+            );
+        }
+        assert!(
+            realtime_stall_reason(
+                false,
+                true,
+                false,
+                true,
+                true,
+                Duration::ZERO,
+                POST_TRANSCRIPT_SPEECH_STALL_TIMEOUT - Duration::from_millis(1),
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn local_voiced_evidence_accumulates_and_decays() {
+        assert_eq!(update_local_voiced_evidence(0, 2_000, true, 16_000), 2_000);
+        assert_eq!(
+            update_local_voiced_evidence(15_000, 2_000, true, 16_000),
+            16_000
+        );
+        assert_eq!(
+            update_local_voiced_evidence(2_000, 2_000, false, 16_000),
+            1_000
+        );
+        assert_eq!(update_local_voiced_evidence(500, 2_000, false, 16_000), 0);
     }
 
     #[test]

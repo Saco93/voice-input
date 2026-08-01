@@ -45,7 +45,10 @@ pub fn run(config: Config) -> Result<()> {
     let state = StateHandle::new(config.clone())?;
     let waveform =
         WaveformPublisher::start(waveform_socket_path(&runtime_dir), config.audio.sample_rate)?;
-    let daemon = Arc::new(Mutex::new(Daemon::new(config, state, waveform)?));
+    let server = Arc::new(ControlServer {
+        daemon: Mutex::new(Daemon::new(config, state, waveform)?),
+        idle_generation: AtomicU64::new(0),
+    });
     let listener = UnixListener::bind(&socket_path)
         .with_context(|| format!("failed to bind control socket at {}", socket_path.display()))?;
     fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600)).with_context(|| {
@@ -60,21 +63,40 @@ pub fn run(config: Config) -> Result<()> {
         let (stream, _) = listener
             .accept()
             .context("failed to accept control socket")?;
-        let daemon = daemon.clone();
+        let receipt = ControlReceipt {
+            idle_generation: server.idle_generation.load(Ordering::SeqCst),
+            accepted_at: Instant::now(),
+        };
+        let server = server.clone();
         thread::spawn(move || {
-            if let Err(error) = serve_control_connection(stream, &daemon) {
+            if let Err(error) = serve_control_connection(stream, &server, receipt) {
                 eprintln!("voice-input control connection failed: {error:#}");
             }
         });
     }
 }
 
-fn serve_control_connection(mut stream: UnixStream, daemon: &Arc<Mutex<Daemon>>) -> Result<()> {
+struct ControlServer {
+    daemon: Mutex<Daemon>,
+    idle_generation: AtomicU64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ControlReceipt {
+    idle_generation: u64,
+    accepted_at: Instant,
+}
+
+fn serve_control_connection(
+    mut stream: UnixStream,
+    server: &ControlServer,
+    receipt: ControlReceipt,
+) -> Result<()> {
     stream
         .set_read_timeout(Some(CONTROL_READ_TIMEOUT))
         .context("failed to set control socket read timeout")?;
     let command = read_control_command(&mut stream)?;
-    let response = match handle_control(daemon, command.trim()) {
+    let response = match handle_control(server, receipt, command.trim()) {
         Ok(response) => response,
         Err(error) => format!("error: {error:#}\n"),
     };
@@ -112,51 +134,57 @@ pub fn send_control_command(command: &str) -> Result<String> {
     Ok(response)
 }
 
-pub fn send_record_command(command: &str, requested_at_ms: u128) -> Result<String> {
-    if command.split_whitespace().next() == Some("toggle") {
-        send_control_command(&format!("{command} requested_at_ms={requested_at_ms}"))
-    } else {
-        send_control_command(command)
-    }
-}
-
-fn handle_control(daemon: &Arc<Mutex<Daemon>>, command: &str) -> Result<String> {
+fn handle_control(
+    server: &ControlServer,
+    receipt: ControlReceipt,
+    command: &str,
+) -> Result<String> {
     let parts: Vec<&str> = command.split_whitespace().collect();
     let Some(head) = parts.first().copied() else {
         bail!("empty control command");
     };
     // Log receipt before waiting for the daemon mutex. This distinguishes a
     // compositor/keybinding miss from a request queued behind finalization.
-    if matches!(head, "start" | "stop" | "toggle" | "cancel") {
-        eprintln!("voice-input control: received {head}");
+    let is_recording_control = matches!(head, "start" | "stop" | "toggle" | "cancel");
+    if is_recording_control {
+        eprintln!(
+            "voice-input control: received {head} in generation {}",
+            receipt.idle_generation
+        );
     }
 
-    let mut daemon = daemon.lock().expect("daemon mutex poisoned");
+    let mut daemon = server.daemon.lock().expect("daemon mutex poisoned");
+    let current_generation = server.idle_generation.load(Ordering::SeqCst);
+    if is_recording_control && !control_receipt_is_current(receipt, current_generation) {
+        eprintln!(
+            "voice-input control: ignored stale {head} from generation {} (current {current_generation}, queued {} ms)",
+            receipt.idle_generation,
+            receipt.accepted_at.elapsed().as_millis()
+        );
+        return Ok("ignored stale control\n".to_string());
+    }
+
+    let mut completed_session = false;
     let result = match head {
         "start" => daemon
             .start_recording(parse_output_target_hint_arg(parts.get(1).copied())?)
             .map(|_| "ok\n".to_string()),
-        "stop" => daemon.finish_recording(false).map(|_| "ok\n".to_string()),
-        "toggle" => {
-            if daemon.has_session() {
-                let result = daemon.finish_recording(false);
-                daemon.suppress_toggle_start_briefly();
-                result?;
-            } else if daemon.toggle_start_is_suppressed() || toggle_request_is_stale(&parts) {
-                // A second key press can sit in the control socket backlog while
-                // final ASR, refinement, and output are running. Do not turn that
-                // old press into a new recording after processing completes.
-                return Ok("ignored stale toggle\n".to_string());
-            } else {
-                let target_hint = parts
-                    .get(1)
-                    .copied()
-                    .filter(|value| !value.starts_with("requested_at_ms="));
-                daemon.start_recording(parse_output_target_hint_arg(target_hint)?)?;
-            }
-            Ok("ok\n".to_string())
+        "stop" => {
+            completed_session = daemon.has_session();
+            daemon.finish_recording(false).map(|_| "ok\n".to_string())
         }
-        "cancel" => daemon.finish_recording(true).map(|_| "ok\n".to_string()),
+        "toggle" => if daemon.has_session() {
+            completed_session = true;
+            daemon.finish_recording(false)
+        } else {
+            parse_output_target_hint_arg(parts.get(1).copied())
+                .and_then(|target_hint| daemon.start_recording(target_hint))
+        }
+        .map(|_| "ok\n".to_string()),
+        "cancel" => {
+            completed_session = daemon.has_session();
+            daemon.finish_recording(true).map(|_| "ok\n".to_string())
+        }
         "hud" => handle_hud_control(&mut daemon, &parts[1..]),
         other => bail!("unknown control command `{other}`"),
     };
@@ -172,31 +200,11 @@ fn handle_control(daemon: &Arc<Mutex<Daemon>>, command: &str) -> Result<String> 
             snapshot.bars = [0.0; WAVEFORM_BAR_COUNT];
         });
     }
+    if completed_session {
+        let next_generation = advance_idle_generation(&server.idle_generation);
+        eprintln!("voice-input control: entered idle generation {next_generation}");
+    }
     result
-}
-
-fn toggle_request_is_stale(parts: &[&str]) -> bool {
-    const MAX_TOGGLE_QUEUE_AGE_MS: u128 = 750;
-
-    let requested_at = parts
-        .iter()
-        .find_map(|part| part.strip_prefix("requested_at_ms="))
-        .and_then(|value| value.parse::<u128>().ok());
-
-    requested_at
-        .map(|timestamp| unix_time_ms().saturating_sub(timestamp) > MAX_TOGGLE_QUEUE_AGE_MS)
-        .unwrap_or(false)
-}
-
-pub(crate) fn control_request_timestamp_ms() -> u128 {
-    unix_time_ms()
-}
-
-fn unix_time_ms() -> u128 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
 }
 
 fn handle_hud_control(daemon: &mut Daemon, args: &[&str]) -> Result<String> {
@@ -269,6 +277,21 @@ fn label_output_target_hint(hint: Option<output::OutputTargetHint>) -> &'static 
     }
 }
 
+fn control_receipt_is_current(receipt: ControlReceipt, current_generation: u64) -> bool {
+    receipt.idle_generation == current_generation
+}
+
+fn advance_idle_generation(generation: &AtomicU64) -> u64 {
+    generation.fetch_add(1, Ordering::SeqCst) + 1
+}
+
+fn unix_time_ms() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+}
+
 fn parse_output_target_hint_arg(value: Option<&str>) -> Result<Option<output::OutputTargetHint>> {
     match value {
         None => Ok(None),
@@ -332,7 +355,6 @@ struct Daemon {
     capture: CaptureService,
     waveform: WaveformPublisher,
     session: Option<Session>,
-    suppress_toggle_start_until: Option<Instant>,
 }
 
 struct Session {
@@ -492,21 +514,11 @@ impl Daemon {
             capture,
             waveform,
             session: None,
-            suppress_toggle_start_until: None,
         })
     }
 
     fn has_session(&self) -> bool {
         self.session.is_some()
-    }
-
-    fn suppress_toggle_start_briefly(&mut self) {
-        self.suppress_toggle_start_until = Some(Instant::now() + Duration::from_millis(750));
-    }
-
-    fn toggle_start_is_suppressed(&self) -> bool {
-        self.suppress_toggle_start_until
-            .is_some_and(|deadline| Instant::now() < deadline)
     }
 
     fn start_recording(
@@ -578,6 +590,7 @@ impl Daemon {
                 output_mode: None,
                 output_driver: None,
                 error: None,
+                revision: snapshot.revision,
                 updated_at_ms: snapshot.updated_at_ms,
             };
         })?;
@@ -1892,6 +1905,40 @@ mod tests {
 
         let mut invalid_utf8 = Cursor::new(vec![0xff]);
         assert!(read_control_command(&mut invalid_utf8).is_err());
+    }
+
+    #[test]
+    fn queued_recording_controls_become_stale_after_idle_generation_advances() {
+        let generation = AtomicU64::new(4);
+        let queued_toggle = ControlReceipt {
+            idle_generation: generation.load(Ordering::SeqCst),
+            accepted_at: Instant::now(),
+        };
+        let queued_start = queued_toggle;
+
+        assert_eq!(advance_idle_generation(&generation), 5);
+        assert!(!control_receipt_is_current(
+            queued_toggle,
+            generation.load(Ordering::SeqCst)
+        ));
+        assert!(!control_receipt_is_current(
+            queued_start,
+            generation.load(Ordering::SeqCst)
+        ));
+    }
+
+    #[test]
+    fn control_received_after_idle_boundary_uses_current_generation() {
+        let generation = AtomicU64::new(7);
+        let receipt = ControlReceipt {
+            idle_generation: generation.load(Ordering::SeqCst),
+            accepted_at: Instant::now(),
+        };
+
+        assert!(control_receipt_is_current(
+            receipt,
+            generation.load(Ordering::SeqCst)
+        ));
     }
 
     #[test]

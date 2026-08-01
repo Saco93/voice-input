@@ -299,6 +299,51 @@ fn smooth(value: &mut f32, target: f32, frame_seconds: f32, attack: f32, release
 /// Fundamental-frequency estimate from the autocorrelation peak inside the
 /// voiced-speech lag range. Returns `None` when the window has no clear
 /// periodicity (silence, fricatives, noise).
+/// Conservative local voice evidence for realtime-ASR recovery. Mean-centered
+/// normalized autocorrelation rejects DC offset and broadband microphone noise;
+/// the stricter threshold is intentional because a false positive reconnects a
+/// healthy remote stream.
+pub(crate) fn pcm_has_voiced_speech(samples: &[i16], sample_rate: u32) -> bool {
+    const MIN_CENTERED_RMS: f32 = 0.008;
+    const MIN_CORRELATION: f32 = 0.55;
+    const MAX_ANALYSIS_SAMPLES: usize = 1_024;
+
+    if sample_rate == 0 || samples.len() < 2 {
+        return false;
+    }
+    let samples = &samples[samples.len().saturating_sub(MAX_ANALYSIS_SAMPLES)..];
+    let mean = samples.iter().map(|sample| *sample as f32).sum::<f32>() / samples.len() as f32;
+    let energy = samples
+        .iter()
+        .map(|sample| (*sample as f32 - mean).powi(2))
+        .sum::<f32>();
+    let centered_rms = (energy / samples.len() as f32).sqrt() / i16::MAX as f32;
+    if centered_rms < MIN_CENTERED_RMS {
+        return false;
+    }
+
+    let minimum_lag = (sample_rate as f32 / PITCH_MAX_FREQUENCY) as usize;
+    let maximum_lag = ((sample_rate as f32 / PITCH_MIN_FREQUENCY) as usize).min(samples.len() - 1);
+    if minimum_lag >= maximum_lag {
+        return false;
+    }
+
+    (minimum_lag..=maximum_lag).any(|lag| {
+        let mut correlation = 0.0_f32;
+        let mut left_energy = 0.0_f32;
+        let mut right_energy = 0.0_f32;
+        for (left, right) in samples[..samples.len() - lag].iter().zip(&samples[lag..]) {
+            let left = *left as f32 - mean;
+            let right = *right as f32 - mean;
+            correlation += left * right;
+            left_energy += left * left;
+            right_energy += right * right;
+        }
+        let denominator = (left_energy * right_energy).sqrt();
+        denominator > f32::EPSILON && correlation / denominator >= MIN_CORRELATION
+    })
+}
+
 fn estimate_pitch(window: &[i16], sample_rate: u32) -> Option<f32> {
     let min_lag = (sample_rate as f32 / PITCH_MAX_FREQUENCY) as usize;
     let max_lag = ((sample_rate as f32 / PITCH_MIN_FREQUENCY) as usize).min(window.len() - 1);
@@ -674,7 +719,7 @@ mod tests {
     use super::{
         ANALYSIS_HOP_SAMPLES, ANALYSIS_WINDOW_SAMPLES, ASR_PACKET_SAMPLES, AsrPacketizer,
         SPECTRUM_BAND_COUNT, VISIBLE_FLOOR, WAVEFORM_BAR_COUNT, WaveformAnalyzer, WaveformFrame,
-        WaveformPublisher, spectrum_profile,
+        WaveformPublisher, pcm_has_voiced_speech, spectrum_profile,
     };
 
     #[test]
@@ -749,6 +794,24 @@ mod tests {
                 (phase.sin() * amplitude as f32) as i16
             })
             .collect()
+    }
+
+    #[test]
+    fn conservative_voice_evidence_rejects_dc_and_broadband_noise() {
+        let sample_rate = 16_000;
+        let voice = sine_wave(180.0, 8_000, sample_rate, 2_048);
+        let dc = vec![800; 2_048];
+        let mut state = 0x1234_5678_u32;
+        let noise = (0..2_048)
+            .map(|_| {
+                state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                ((state >> 16) as i16) / 8
+            })
+            .collect::<Vec<_>>();
+
+        assert!(pcm_has_voiced_speech(&voice, sample_rate));
+        assert!(!pcm_has_voiced_speech(&dc, sample_rate));
+        assert!(!pcm_has_voiced_speech(&noise, sample_rate));
     }
 
     #[test]
