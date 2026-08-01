@@ -42,8 +42,10 @@ const TIMBRE_MIN_RATIO: f32 = 0.08;
 const TIMBRE_MAX_RATIO: f32 = 0.65;
 const SPECTRUM_MIN_FREQUENCY: f32 = 80.0;
 // Concentrate the display bands on the range that carries the visible energy
-// of ordinary speech instead of reserving much of the HUD for sparse highs.
-const SPECTRUM_MAX_FREQUENCY: f32 = 3_200.0;
+// of ordinary speech. Capping the visual envelope at 1.6 kHz gives low and
+// midrange formants more horizontal space instead of reserving the right side
+// of the HUD for upper bands that are usually sparse during speech.
+const SPECTRUM_MAX_FREQUENCY: f32 = 1_600.0;
 const SPECTRUM_DYNAMIC_RANGE_DB: f32 = 36.0;
 const SPECTRUM_ATTACK_SECONDS: f32 = 0.14;
 const SPECTRUM_RELEASE_SECONDS: f32 = 0.5;
@@ -75,7 +77,7 @@ pub struct WaveformFrame {
     /// muffled/voiced content, high values are bright or fricative content.
     pub timbre: f32,
     /// Smoothed relative energy in twelve logarithmic bands from roughly
-    /// 80 Hz to 6 kHz. The strongest active band approaches one.
+    /// 80 Hz to 1.6 kHz. The strongest active band approaches one.
     pub spectrum: [f32; SPECTRUM_BAND_COUNT],
     /// Positive frame-to-frame spectrum change, normalized to 0..1. This
     /// captures onsets and articulation independently of the speaker's voice.
@@ -820,6 +822,7 @@ mod tests {
         let deep = sine_wave(150.0, 12_000, sample_rate, 8_192);
         let high_pitch = sine_wave(350.0, 12_000, sample_rate, 8_192);
         let bright = sine_wave(2_800.0, 12_000, sample_rate, 8_192);
+        let high_spectrum = sine_wave(1_350.0, 12_000, sample_rate, 8_192);
 
         let mut deep_analyzer = WaveformAnalyzer::new(sample_rate);
         let deep_frame = *deep_analyzer.push(&deep, true).last().unwrap();
@@ -827,6 +830,11 @@ mod tests {
         let high_frame = *high_analyzer.push(&high_pitch, true).last().unwrap();
         let mut bright_analyzer = WaveformAnalyzer::new(sample_rate);
         let bright_frame = *bright_analyzer.push(&bright, true).last().unwrap();
+        let mut high_spectrum_analyzer = WaveformAnalyzer::new(sample_rate);
+        let high_spectrum_frame = *high_spectrum_analyzer
+            .push(&high_spectrum, true)
+            .last()
+            .unwrap();
 
         assert!(deep_frame.level > 0.3, "voiced audio must raise the level");
         assert!(
@@ -847,10 +855,10 @@ mod tests {
             "voiced audio must produce a normalized spectrum"
         );
         assert!(
-            bright_frame.spectral_centroid > deep_frame.spectral_centroid + 0.25,
-            "bright content must raise spectral centroid: deep={} bright={}",
+            high_spectrum_frame.spectral_centroid > deep_frame.spectral_centroid + 0.25,
+            "high-band content must raise spectral centroid: deep={} high={}",
             deep_frame.spectral_centroid,
-            bright_frame.spectral_centroid
+            high_spectrum_frame.spectral_centroid
         );
     }
 
@@ -858,7 +866,7 @@ mod tests {
     fn spectrum_tracks_low_and_high_frequency_regions() {
         let sample_rate = 16_000;
         let low = sine_wave(140.0, 12_000, sample_rate, ANALYSIS_WINDOW_SAMPLES);
-        let high = sine_wave(2_800.0, 12_000, sample_rate, ANALYSIS_WINDOW_SAMPLES);
+        let high = sine_wave(1_350.0, 12_000, sample_rate, ANALYSIS_WINDOW_SAMPLES);
         let low_profile = spectrum_profile(&low, sample_rate);
         let high_profile = spectrum_profile(&high, sample_rate);
         let peak_index = |profile: &[f32; SPECTRUM_BAND_COUNT]| {
@@ -873,7 +881,7 @@ mod tests {
         let high_peak = peak_index(&high_profile);
 
         assert!(low_peak <= 3, "140 Hz peak landed in band {low_peak}");
-        assert!(high_peak >= 8, "2.8 kHz peak landed in band {high_peak}");
+        assert!(high_peak >= 8, "1.35 kHz peak landed in band {high_peak}");
         assert!(high_peak >= low_peak + 6);
         assert!(low_profile.iter().all(|value| value.is_finite()));
         assert!(high_profile.iter().all(|value| value.is_finite()));
