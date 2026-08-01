@@ -20,6 +20,17 @@ use super::text::{apply_script_conversion, extract_transcript};
 const BACKEND_OUTPUT_MAX_BYTES: u64 = 2 * 1024 * 1024;
 const BACKEND_POLL_INTERVAL: Duration = Duration::from_millis(20);
 
+#[derive(Debug)]
+pub(crate) struct EmptyTranscriptError;
+
+impl std::fmt::Display for EmptyTranscriptError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("ASR backend returned an empty transcript")
+    }
+}
+
+impl std::error::Error for EmptyTranscriptError {}
+
 pub struct LocalCliBackend;
 
 impl LocalCliBackend {
@@ -73,7 +84,7 @@ impl AsrBackend for LocalCliBackend {
 
         let transcript = extract_transcript(&String::from_utf8_lossy(&output.stdout));
         if transcript.is_empty() {
-            bail!("ASR backend returned an empty transcript");
+            return Err(EmptyTranscriptError.into());
         }
 
         apply_script_conversion(config.asr.language, &transcript)
@@ -192,6 +203,12 @@ mod tests {
             .expect_err("sleep must exceed the deadline");
         assert!(error.to_string().contains("timed out"));
         assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn empty_transcript_marker_survives_error_context() {
+        let error = anyhow::Error::new(EmptyTranscriptError).context("local ASR failed");
+        assert!(crate::backend::is_empty_transcript_error(&error));
     }
 
     #[test]

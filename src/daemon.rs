@@ -764,7 +764,7 @@ impl Daemon {
         Ok(())
     }
 
-    fn finish_recording(&mut self, mut cancel: bool) -> Result<()> {
+    fn finish_recording(&mut self, cancel: bool) -> Result<()> {
         let Some(mut session) = self.session.take() else {
             return Ok(());
         };
@@ -807,10 +807,11 @@ impl Daemon {
         }
         if !cancel && matches!(&session.asr_runtime, SessionAsrRuntime::Realtime { .. }) {
             // Speech/transcript events can trail the final PCM packet slightly.
-            // Give the event pump a brief chance to observe them, then treat a
-            // session with no server-detected speech as a cancellation. A
-            // degraded realtime stream always keeps its complete local audio
-            // for recovery, even if the terminal event races with stop.
+            // Give the event pump a brief chance to observe them. If the server
+            // still has not acknowledged speech, continue finalization instead
+            // of discarding captured audio: session.finish/manual commit may
+            // produce a late result, and full-audio recovery can still decode a
+            // real utterance from a stream whose first VAD event was lost.
             if !realtime_overloaded {
                 let deadline = Instant::now() + Duration::from_millis(SPEECH_EVENT_GRACE_MS);
                 while !session.speech_detected.load(Ordering::SeqCst)
@@ -823,10 +824,8 @@ impl Daemon {
             realtime_overloaded |= realtime_overloaded_flag.load(Ordering::SeqCst);
             if !realtime_overloaded && !session.speech_detected.load(Ordering::SeqCst) {
                 eprintln!(
-                    "voice-input realtime ASR: no speech detected; cancelling empty dictation"
+                    "voice-input realtime ASR: no server speech event before stop; deferring empty-audio decision until finalization"
                 );
-                session.cancel_flag.store(true, Ordering::SeqCst);
-                cancel = true;
             }
         }
 
@@ -976,7 +975,19 @@ impl Daemon {
                         })?;
 
                         match self.transcribe_alibaba_full_audio(&audio) {
-                            Ok(text) => text,
+                            Ok(Some(text)) => text,
+                            Ok(None) => {
+                                if let Some(text) = remote_transcript {
+                                    // A transcript can arrive during finalization
+                                    // after the pre-Finish speech snapshot.
+                                    text
+                                } else {
+                                    eprintln!(
+                                        "voice-input final ASR: no transcript; cancelling empty dictation"
+                                    );
+                                    String::new()
+                                }
+                            }
                             Err(error) => {
                                 if let Some(text) = remote_transcript {
                                     let _ = self.state.update(|snapshot| {
@@ -1008,7 +1019,7 @@ impl Daemon {
             }
         };
 
-        if cancel {
+        if cancel || raw_transcript.trim().is_empty() {
             self.state
                 .update(|snapshot| *snapshot = Snapshot::idle(&self.config))?;
             return Ok(());
@@ -1650,9 +1661,9 @@ fn spawn_realtime_event_thread(
                     voice_active.store(false, Ordering::Relaxed);
                 }
                 backend::AsrEvent::RealtimeRestarting => {
-                    // Reconstruction is only requested after the stream has
-                    // accepted audio or local speech has exposed a stall. Keep
-                    // stop-time full-audio recovery eligible if Stop races the
+                    // Reconstruction is only requested after Server VAD has
+                    // confirmed an active speech segment. Keep stop-time
+                    // full-audio recovery eligible if Stop races the
                     // replacement before Qwen emits a new speech event.
                     speech_detected.store(true, Ordering::SeqCst);
                     realtime_reconstructing = true;
@@ -1845,7 +1856,7 @@ fn truncate_for_tooltip(text: &str) -> String {
 }
 
 impl Daemon {
-    fn transcribe_alibaba_full_audio(&self, audio: &[i16]) -> Result<String> {
+    fn transcribe_alibaba_full_audio(&self, audio: &[i16]) -> Result<Option<String>> {
         let temp_file = tempfile::NamedTempFile::new()
             .context("failed to create WAV temp file for Alibaba full-audio retranscription")?;
         wav::write_pcm16_wav(temp_file.path(), self.config.audio.sample_rate, audio)?;
@@ -1858,7 +1869,10 @@ impl Daemon {
 
         let mut local_config = self.config.clone();
         local_config.asr.provider = AsrProvider::LocalCli;
-        backend::transcribe(&local_config, temp_file.path())
+        match backend::transcribe(&local_config, temp_file.path()) {
+            Err(error) if backend::is_empty_transcript_error(&error) => Ok(String::new()),
+            result => result,
+        }
     }
 }
 

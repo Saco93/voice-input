@@ -72,3 +72,9 @@ pub fn build(config: &Config) -> Box<dyn AsrBackend> {
 pub fn transcribe(config: &Config, wav_path: &Path) -> Result<String> {
     build(config).transcribe_file(config, wav_path)
 }
+
+pub fn is_empty_transcript_error(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| cause.is::<local_cli::EmptyTranscriptError>())
+}

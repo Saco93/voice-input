@@ -10,7 +10,7 @@ use crate::{config::Config, http_client};
 
 use super::text::apply_script_conversion;
 
-pub fn transcribe_full_audio(config: &Config, wav_path: &Path) -> Result<String> {
+pub fn transcribe_full_audio(config: &Config, wav_path: &Path) -> Result<Option<String>> {
     let base_url = resolve_base_url(config)?;
     let endpoint = format!("{}/chat/completions", base_url.trim_end_matches('/'));
     let audio_uri = wav_data_uri(wav_path)?;
@@ -50,7 +50,7 @@ pub fn transcribe_full_audio(config: &Config, wav_path: &Path) -> Result<String>
     parse_response(response.status, &response.body, config)
 }
 
-fn parse_response(status: StatusCode, body: &[u8], config: &Config) -> Result<String> {
+fn parse_response(status: StatusCode, body: &[u8], config: &Config) -> Result<Option<String>> {
     if status != StatusCode::OK {
         bail!(
             "Alibaba final-pass ASR returned HTTP {}: {}",
@@ -61,15 +61,15 @@ fn parse_response(status: StatusCode, body: &[u8], config: &Config) -> Result<St
 
     let payload: Value =
         serde_json::from_slice(body).context("failed to parse Alibaba final-pass ASR JSON")?;
-    let transcript = payload["choices"][0]["message"]["content"]
+    let Some(transcript) = payload["choices"][0]["message"]["content"]
         .as_str()
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .ok_or_else(|| {
-            anyhow!("Alibaba final-pass ASR response did not contain transcript text")
-        })?;
+    else {
+        return Ok(None);
+    };
 
-    apply_script_conversion(config.asr.language, transcript)
+    apply_script_conversion(config.asr.language, transcript).map(Some)
 }
 
 fn wav_data_uri(wav_path: &Path) -> Result<String> {
@@ -154,7 +154,18 @@ mod tests {
 
         assert_eq!(
             parse_response(StatusCode::OK, response.as_bytes(), &config).expect("transcript"),
-            "请帮我把 Python JSON API 部署到 Kubernetes。"
+            Some("请帮我把 Python JSON API 部署到 Kubernetes。".into())
+        );
+    }
+
+    #[test]
+    fn treats_success_without_transcript_as_empty_audio() {
+        let config = Config::default();
+        let response = "{\"choices\":[{\"message\":{\"content\":\"  \"}}]}";
+
+        assert_eq!(
+            parse_response(StatusCode::OK, response.as_bytes(), &config).expect("empty response"),
+            None
         );
     }
 }

@@ -24,12 +24,12 @@ flowchart LR
 ```
 
 1. A persistent PipeWire capture service keeps a short pre-roll buffer, so speech immediately after the hotkey is not lost. Sessions stop and finalize automatically at the configured duration limit (five minutes by default).
-2. Qwen Realtime streams partial text to the HUD while Server VAD controls waveform visibility. Realtime delivery uses a bounded, nonblocking queue, fair bidirectional WebSocket processing, and an eight-second voiced-audio stall detector. On the first transcript stall, the worker reconstructs the realtime session once and replays every buffered raw PCM packet from the beginning while recording continues.
+2. Qwen Realtime streams partial text to the HUD while Server VAD controls waveform visibility. Realtime delivery uses a bounded, nonblocking queue, fair bidirectional WebSocket processing, and an eight-second watchdog that runs only while Server VAD confirms an active speech segment. On the first transcript stall, the worker reconstructs the realtime session once and replays every buffered raw PCM packet from the beginning while recording continues.
 3. On toggle-off, the complete recording is optionally recognized again by the final ASR model. If the controlled reconstruction fails, the connection closes, or realtime delivery falls behind, incomplete remote text is rejected and the complete audio is recovered through the enabled final pass or local fallback.
 4. The transcript is lightly cleaned by an OpenAI-compatible LLM. Refinement uses the configured timeout (15 seconds by default, capped at 30 seconds); when the budget is at least 10 seconds, contextual requests reserve five seconds for a transcript-only cleanup retry and ultimately fail open to Final ASR.
 5. Short text is typed with `wtype`; long text and XWayland targets use clipboard paste with automatic restoration.
 
-No-speech sessions cancel immediately. Audio capture, ASR, HUD rendering, persistence, and output are isolated so a slow visual or clipboard client cannot block recognition.
+No-speech sessions return to idle once realtime or final ASR confirms that no transcript exists. Audio capture, ASR, HUD rendering, persistence, and output are isolated so a slow visual or clipboard client cannot block recognition.
 
 ## Quick setup
 

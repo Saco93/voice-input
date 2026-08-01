@@ -37,8 +37,6 @@ const MAX_CONTROLS_PER_TICK: usize = 8;
 const MAX_AUDIO_SENDS_PER_TICK: usize = 8;
 const REPLAY_SPEED_MULTIPLIER: f64 = 4.0;
 const TRANSCRIPTION_STALL_TIMEOUT: Duration = Duration::from_secs(8);
-const STALL_MIN_ACTIVE_SPEECH_SECS: usize = 2;
-const LOCAL_SPEECH_BURST_GAP: Duration = Duration::from_secs(1);
 
 pub struct QwenRealtimeBackend;
 
@@ -108,8 +106,7 @@ fn run_session(
     let mut speech_stopped_count = 0_u64;
     let mut appended_sample_count = 0_u64;
     let mut noise_gate = PcmNoiseGate::new((spec.sample_rate_hz as usize) / 2);
-    let mut active_local_speech_samples = 0_usize;
-    let mut last_local_speech_activity = Some(Instant::now());
+    let mut server_speech_active = false;
     let mut last_transcription_activity = Instant::now();
     let mut retained_audio = RetainedAudio::default();
     let mut retry_budget = RetryBudget::default();
@@ -147,8 +144,7 @@ fn run_session(
                     speech_stopped_count = 0;
                     appended_sample_count = 0;
                     noise_gate = PcmNoiseGate::new((spec.sample_rate_hz as usize) / 2);
-                    active_local_speech_samples = 0;
-                    last_local_speech_activity = Some(Instant::now());
+                    server_speech_active = false;
                     last_transcription_activity = Instant::now();
                     retained_audio.rewind();
                     replay_pacing = true;
@@ -208,23 +204,6 @@ fn run_session(
             let packet_duration = Duration::from_secs_f64(
                 samples.len() as f64 / f64::from(spec.sample_rate_hz) / REPLAY_SPEED_MULTIPLIER,
             );
-            let has_local_speech = pcm_chunk_has_local_speech(samples);
-            let (speech_samples, starts_new_burst) = update_local_speech_burst(
-                active_local_speech_samples,
-                samples.len(),
-                has_local_speech,
-                last_local_speech_activity.map(|activity: Instant| now.duration_since(activity)),
-            );
-            if starts_new_burst {
-                // A long user pause starts a new observation window. An old
-                // partial must not make the new speech look stalled.
-                last_transcription_activity = now;
-            }
-            active_local_speech_samples = speech_samples;
-            if has_local_speech {
-                last_local_speech_activity = Some(now);
-            }
-
             let filtered_samples = noise_gate.filter(samples);
             if send_json(
                 &mut socket,
@@ -322,16 +301,18 @@ fn run_session(
                             }
                         }
                         ServerEvent::SpeechStarted => {
-                            if noise_gate.speech_observed() {
-                                speech_started_count += 1;
-                                let _ = event_tx.send(AsrEvent::SpeechStarted);
-                            }
+                            speech_started_count += 1;
+                            server_speech_active = true;
+                            // Server VAD is authoritative for watchdog timing.
+                            // A new speech segment gets a fresh observation
+                            // window even if the previous segment produced text.
+                            last_transcription_activity = Instant::now();
+                            let _ = event_tx.send(AsrEvent::SpeechStarted);
                         }
                         ServerEvent::SpeechStopped => {
-                            if noise_gate.speech_observed() {
-                                speech_stopped_count += 1;
-                                let _ = event_tx.send(AsrEvent::SpeechStopped);
-                            }
+                            speech_stopped_count += 1;
+                            server_speech_active = false;
+                            let _ = event_tx.send(AsrEvent::SpeechStopped);
                         }
                         ServerEvent::InputCommitted => {
                             if waiting_for_commit {
@@ -362,35 +343,29 @@ fn run_session(
                             text,
                             stash,
                         } => {
-                            if noise_gate.speech_observed() {
-                                partial_event_count += 1;
-                                last_transcription_activity = Instant::now();
-                                active_local_speech_samples = 0;
-                                if partial_event_count == 1 {
-                                    eprintln!(
-                                        "voice-input realtime ASR: attempt {attempt_number} first partial after {} ms",
-                                        session_started.elapsed().as_millis()
-                                    );
-                                }
-                                let (committed, unstable) =
-                                    assembler.apply_partial(item_id, text, stash);
-                                let _ = event_tx.send(AsrEvent::Partial {
-                                    committed,
-                                    unstable,
-                                });
+                            partial_event_count += 1;
+                            last_transcription_activity = Instant::now();
+                            if partial_event_count == 1 {
+                                eprintln!(
+                                    "voice-input realtime ASR: attempt {attempt_number} first partial after {} ms",
+                                    session_started.elapsed().as_millis()
+                                );
                             }
+                            let (committed, unstable) =
+                                assembler.apply_partial(item_id, text, stash);
+                            let _ = event_tx.send(AsrEvent::Partial {
+                                committed,
+                                unstable,
+                            });
                         }
                         ServerEvent::Completed {
                             item_id,
                             transcript,
                         } => {
-                            if noise_gate.speech_observed() {
-                                completed_event_count += 1;
-                                last_transcription_activity = Instant::now();
-                                active_local_speech_samples = 0;
-                                let text = assembler.apply_completed(item_id, transcript);
-                                let _ = event_tx.send(AsrEvent::SegmentFinal { text });
-                            }
+                            completed_event_count += 1;
+                            last_transcription_activity = Instant::now();
+                            let text = assembler.apply_completed(item_id, transcript);
+                            let _ = event_tx.send(AsrEvent::SegmentFinal { text });
                         }
                         ServerEvent::TranscriptionFailed { message } => {
                             let _ = event_tx.send(AsrEvent::Error {
@@ -445,16 +420,15 @@ fn run_session(
             }
         }
 
-        // A connected server can stop producing transcription events while it
-        // continues accepting audio. Once local speech is still active and the
-        // gap is long enough, reconstruct the stream once from retained PCM.
+        // Reconstruct only while Server VAD says a speech segment is active.
+        // Local RMS is hardware-dependent and can classify steady microphone
+        // noise as speech; it must not start the eight-second watchdog by
+        // itself. If the server never acknowledges speech, stop-time full-audio
+        // recovery remains available without an unnecessary reconnect loop.
         if should_mark_realtime_stalled(
             finish_requested,
             matches!(config.asr.alibaba.turn_mode, AlibabaTurnMode::ServerVad),
-            active_local_speech_samples
-                >= (spec.sample_rate_hz as usize) * STALL_MIN_ACTIVE_SPEECH_SECS,
-            last_local_speech_activity
-                .is_some_and(|activity| activity.elapsed() <= LOCAL_SPEECH_BURST_GAP),
+            server_speech_active,
             last_transcription_activity.elapsed() >= TRANSCRIPTION_STALL_TIMEOUT,
         ) {
             reconstruct_or_stop!('session, InterruptionReason::TranscriptStall);
@@ -695,7 +669,6 @@ fn terminal_stream_failure(
 struct PcmNoiseGate {
     hangover_samples: usize,
     remaining_hangover_samples: usize,
-    speech_observed: bool,
     reopen_count: u64,
     suppressed_sample_count: u64,
 }
@@ -705,7 +678,6 @@ impl PcmNoiseGate {
         Self {
             hangover_samples,
             remaining_hangover_samples: 0,
-            speech_observed: false,
             reopen_count: 0,
             suppressed_sample_count: 0,
         }
@@ -723,7 +695,6 @@ impl PcmNoiseGate {
                 self.reopen_count += 1;
             }
             self.remaining_hangover_samples = self.hangover_samples;
-            self.speech_observed = true;
         } else if self.remaining_hangover_samples > 0 {
             self.remaining_hangover_samples = self
                 .remaining_hangover_samples
@@ -733,10 +704,6 @@ impl PcmNoiseGate {
             samples.fill(0);
         }
         samples
-    }
-
-    fn speech_observed(&self) -> bool {
-        self.speech_observed
     }
 
     fn reopen_count(&self) -> u64 {
@@ -759,46 +726,13 @@ fn pcm_chunk_exceeds_rms(samples: &[i16], minimum_rms: i64) -> bool {
     squared_energy >= minimum_rms.pow(2) * samples.len() as i64
 }
 
-fn pcm_chunk_has_local_speech(samples: &[i16]) -> bool {
-    // This stricter threshold gates stalled-stream recovery; opening the audio
-    // noise gate itself uses a lower threshold to preserve quiet speech.
-    const LOCAL_SPEECH_RMS: i64 = 197; // approximately 0.006 of i16 full scale
-    pcm_chunk_exceeds_rms(samples, LOCAL_SPEECH_RMS)
-}
-
-fn update_local_speech_burst(
-    current: usize,
-    packet_samples: usize,
-    has_speech: bool,
-    time_since_last_speech: Option<Duration>,
-) -> (usize, bool) {
-    let starts_new_burst =
-        has_speech && time_since_last_speech.is_some_and(|gap| gap > LOCAL_SPEECH_BURST_GAP);
-    let current = if time_since_last_speech.is_some_and(|gap| gap > LOCAL_SPEECH_BURST_GAP) {
-        0
-    } else {
-        current
-    };
-    let current = if has_speech {
-        current.saturating_add(packet_samples)
-    } else {
-        current
-    };
-    (current, starts_new_burst)
-}
-
 fn should_mark_realtime_stalled(
     finish_requested: bool,
     server_vad: bool,
-    has_active_local_speech: bool,
-    has_recent_local_speech: bool,
+    server_speech_active: bool,
     inactive_long_enough: bool,
 ) -> bool {
-    !finish_requested
-        && server_vad
-        && has_active_local_speech
-        && has_recent_local_speech
-        && inactive_long_enough
+    !finish_requested && server_vad && server_speech_active && inactive_long_enough
 }
 
 fn send_json(socket: &mut QwenSocket, payload: Value) -> Result<()> {
@@ -1068,12 +1002,9 @@ fn push_transcript_piece(target: &mut String, piece: &str) {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
-
     use super::{
         AsrControl, Message, PcmNoiseGate, RetainedAudio, RetryBudget, TranscriptAssembler,
-        parse_server_event, pcm_chunk_has_local_speech, push_transcript_piece,
-        should_mark_realtime_stalled, update_local_speech_burst,
+        parse_server_event, push_transcript_piece, should_mark_realtime_stalled,
     };
 
     #[test]
@@ -1081,10 +1012,8 @@ mod tests {
         let mut gate = PcmNoiseGate::new(4);
 
         assert_eq!(gate.filter(&[40; 4]), vec![0; 4]);
-        assert!(!gate.speech_observed());
         assert_eq!(gate.suppressed_sample_count(), 4);
         assert_eq!(gate.filter(&[300; 4]), vec![300; 4]);
-        assert!(gate.speech_observed());
         assert_eq!(gate.reopen_count(), 1);
         assert_eq!(gate.filter(&[40; 4]), vec![40; 4]);
         assert_eq!(gate.filter(&[40; 4]), vec![0; 4]);
@@ -1092,48 +1021,15 @@ mod tests {
     }
 
     #[test]
-    fn local_speech_gate_rejects_silence_and_accepts_voice_energy() {
-        assert!(!pcm_chunk_has_local_speech(&[]));
-        assert!(!pcm_chunk_has_local_speech(&[0; 320]));
-        assert!(!pcm_chunk_has_local_speech(&[120; 320]));
-        assert!(pcm_chunk_has_local_speech(&[600; 320]));
-    }
-
-    #[test]
-    fn stalled_stream_requires_active_recent_speech_and_inactivity() {
-        assert!(should_mark_realtime_stalled(false, true, true, true, true));
-        assert!(!should_mark_realtime_stalled(true, true, true, true, true));
-        assert!(!should_mark_realtime_stalled(
-            false, false, true, true, true
-        ));
-        assert!(!should_mark_realtime_stalled(
-            false, true, false, true, true
-        ));
-        assert!(!should_mark_realtime_stalled(
-            false, true, true, false, true
-        ));
-        assert!(!should_mark_realtime_stalled(
-            false, true, true, true, false
-        ));
-
-        let (burst, starts_new_burst) = update_local_speech_burst(0, 2_048, true, None);
-        assert!(!starts_new_burst);
-        assert_eq!(
-            update_local_speech_burst(burst, 2_048, true, Some(Duration::from_millis(500))),
-            (4_096, false)
-        );
-        assert_eq!(
-            update_local_speech_burst(burst, 2_048, true, Some(Duration::from_secs(2))),
-            (2_048, true)
-        );
-        assert_eq!(
-            update_local_speech_burst(0, 2_048, true, Some(Duration::from_secs(2))),
-            (2_048, true)
-        );
-        assert_eq!(
-            update_local_speech_burst(burst, 2_048, false, Some(Duration::from_secs(2))),
-            (0, false)
-        );
+    fn stalled_stream_requires_authoritative_server_speech_and_inactivity() {
+        assert!(should_mark_realtime_stalled(false, true, true, true));
+        assert!(!should_mark_realtime_stalled(true, true, true, true));
+        assert!(!should_mark_realtime_stalled(false, false, true, true));
+        // Hardware-dependent local RMS is intentionally absent: without a
+        // Server VAD speech_started event, silence or loud stationary noise
+        // cannot trigger buffered-audio replay.
+        assert!(!should_mark_realtime_stalled(false, true, false, true));
+        assert!(!should_mark_realtime_stalled(false, true, true, false));
     }
 
     #[test]
