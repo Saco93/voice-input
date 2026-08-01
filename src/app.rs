@@ -14,7 +14,7 @@ use crate::{
         LlmCommand, OutputFormat, SetupCommand,
     },
     config::Config,
-    daemon, llm, output, paths, setup,
+    daemon, focused_window, llm, output, paths, setup,
     state::Snapshot,
 };
 
@@ -60,26 +60,48 @@ pub fn run() -> Result<()> {
 }
 
 fn record_control_command(action: crate::args::RecordAction) -> String {
+    // Capture the destination before any output-target probing so toggle-off
+    // describes the window focused as close as possible to the key press.
+    let focused_window_hint = matches!(
+        action,
+        crate::args::RecordAction::Stop | crate::args::RecordAction::Toggle
+    )
+    .then(|| {
+        focused_window::capture()
+            .ok()
+            .map(|window| window.control_hint())
+    })
+    .flatten();
     let base = match action {
         crate::args::RecordAction::Start => "start",
         crate::args::RecordAction::Stop => "stop",
         crate::args::RecordAction::Toggle => "toggle",
         crate::args::RecordAction::Cancel => "cancel",
+        crate::args::RecordAction::Restart => "restart",
     };
 
     if matches!(
         action,
-        crate::args::RecordAction::Start | crate::args::RecordAction::Toggle
+        crate::args::RecordAction::Start
+            | crate::args::RecordAction::Toggle
+            | crate::args::RecordAction::Restart
     ) && let Ok(target_hint) = output::detect_output_target_hint()
     {
         let label = match target_hint {
             output::OutputTargetHint::Wayland => "wayland",
             output::OutputTargetHint::XWayland => "xwayland",
         };
-        return format!("{base} {label}");
+        let mut command = format!("{base} {label}");
+        if let Some(hint) = focused_window_hint {
+            command.push(' ');
+            command.push_str(&hint);
+        }
+        return command;
     }
 
-    base.into()
+    focused_window_hint
+        .map(|hint| format!("{base} {hint}"))
+        .unwrap_or_else(|| base.into())
 }
 
 fn run_status(options: crate::args::StatusOptions) -> Result<()> {

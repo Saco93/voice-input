@@ -19,6 +19,7 @@ use std::{
 use crate::{
     agent_context, backend,
     config::{AsrProvider, Config, HudConfig, HudPosition},
+    focused_window::{self, RefinementCategory},
     llm, output, paths,
     state::{Phase, Snapshot, StateHandle},
     wav,
@@ -31,6 +32,7 @@ use anyhow::{Context, Result, anyhow, bail};
 
 const PROCESSING_WAVEFORM: [f32; WAVEFORM_BAR_COUNT] = [0.22; WAVEFORM_BAR_COUNT];
 const SPEECH_EVENT_GRACE_MS: u64 = 350;
+const CAPTURE_STOP_DRAIN: Duration = Duration::from_millis(120);
 const CONTROL_COMMAND_MAX_BYTES: u64 = 4 * 1024;
 const CONTROL_READ_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -145,7 +147,12 @@ fn handle_control(
     };
     // Log receipt before waiting for the daemon mutex. This distinguishes a
     // compositor/keybinding miss from a request queued behind finalization.
-    let is_recording_control = matches!(head, "start" | "stop" | "toggle" | "cancel");
+    let is_recording_control = matches!(head, "start" | "stop" | "toggle" | "cancel" | "restart");
+    let focused_window_hint = if is_recording_control {
+        focused_window::parse_control_hint(&parts[1..])?
+    } else {
+        None
+    };
     if is_recording_control {
         eprintln!(
             "voice-input control: received {head} in generation {}",
@@ -167,24 +174,38 @@ fn handle_control(
     let mut completed_session = false;
     let result = match head {
         "start" => daemon
-            .start_recording(parse_output_target_hint_arg(parts.get(1).copied())?)
+            .start_recording(parse_output_target_hint_args(&parts[1..])?)
             .map(|_| "ok\n".to_string()),
         "stop" => {
             completed_session = daemon.has_session();
-            daemon.finish_recording(false).map(|_| "ok\n".to_string())
+            daemon
+                .finish_recording(false, focused_window_hint)
+                .map(|_| "ok\n".to_string())
         }
         "toggle" => if daemon.has_session() {
             completed_session = true;
-            daemon.finish_recording(false)
+            daemon.finish_recording(false, focused_window_hint)
         } else {
-            parse_output_target_hint_arg(parts.get(1).copied())
+            parse_output_target_hint_args(&parts[1..])
                 .and_then(|target_hint| daemon.start_recording(target_hint))
         }
         .map(|_| "ok\n".to_string()),
         "cancel" => {
             completed_session = daemon.has_session();
-            daemon.finish_recording(true).map(|_| "ok\n".to_string())
+            daemon
+                .finish_recording(true, None)
+                .map(|_| "ok\n".to_string())
         }
+        "restart" => if daemon.has_session() {
+            completed_session = true;
+            parse_output_target_hint_args(&parts[1..]).and_then(|target_hint| {
+                daemon.finish_recording(true, None)?;
+                daemon.start_recording(target_hint)
+            })
+        } else {
+            return Ok("ignored idle restart\n".to_string());
+        }
+        .map(|_| "ok\n".to_string()),
         "hud" => handle_hud_control(&mut daemon, &parts[1..]),
         other => bail!("unknown control command `{other}`"),
     };
@@ -292,13 +313,25 @@ fn unix_time_ms() -> u128 {
         .as_millis()
 }
 
-fn parse_output_target_hint_arg(value: Option<&str>) -> Result<Option<output::OutputTargetHint>> {
+fn parse_output_target_hint_args(args: &[&str]) -> Result<Option<output::OutputTargetHint>> {
+    let value = args
+        .iter()
+        .copied()
+        .find(|value| !value.starts_with("focus="));
     match value {
         None => Ok(None),
         Some("wayland") => Ok(Some(output::OutputTargetHint::Wayland)),
         Some("xwayland") => Ok(Some(output::OutputTargetHint::XWayland)),
         Some(other) => bail!("unknown output target hint `{other}`"),
     }
+}
+
+fn should_drain_capture(cancel: bool, already_stopped: bool) -> bool {
+    !cancel && !already_stopped
+}
+
+fn should_capture_focused_window(cancel: bool, llm_enabled: bool) -> bool {
+    !cancel && llm_enabled
 }
 
 fn should_capture_agent_context(
@@ -309,23 +342,60 @@ fn should_capture_agent_context(
     !cancel && llm_enabled && agent_context_enabled
 }
 
-fn capture_agent_context_at_stop(
+#[derive(Default)]
+struct StopRefinementContext {
+    category: RefinementCategory,
+    agent_handle: Option<thread::JoinHandle<Option<agent_context::AgentSessionLocator>>>,
+}
+
+fn capture_refinement_context_at_stop(
     config: &Config,
     cancel: bool,
-) -> Option<thread::JoinHandle<Option<agent_context::AgentSessionLocator>>> {
-    if !should_capture_agent_context(cancel, config.llm.enabled, config.llm.agent_context_enabled) {
-        return None;
+    focused_window_hint: Option<focused_window::FocusedWindowSnapshot>,
+) -> StopRefinementContext {
+    if !should_capture_focused_window(cancel, config.llm.enabled) {
+        return StopRefinementContext::default();
     }
 
-    let snapshot = match agent_context::capture_focused_agent() {
+    let window = match focused_window_hint
+        .map(Ok)
+        .unwrap_or_else(focused_window::capture)
+    {
+        Ok(window) => window,
+        Err(_) => {
+            eprintln!("voice-input refinement context: focused-window capture failed at stop");
+            return StopRefinementContext::default();
+        }
+    };
+    let category = window.refinement_category();
+    if category != RefinementCategory::Default {
+        eprintln!(
+            "voice-input refinement context: captured {} destination at stop",
+            category.label()
+        );
+    }
+
+    if !should_capture_agent_context(cancel, config.llm.enabled, config.llm.agent_context_enabled) {
+        return StopRefinementContext {
+            category,
+            agent_handle: None,
+        };
+    }
+
+    let snapshot = match agent_context::capture_focused_agent(&window) {
         Ok(Some(snapshot)) => snapshot,
         Ok(None) => {
-            eprintln!("voice-input agent context: no supported focused session captured at stop");
-            return None;
+            return StopRefinementContext {
+                category,
+                agent_handle: None,
+            };
         }
         Err(_) => {
             eprintln!("voice-input agent context: focused-session capture failed at stop");
-            return None;
+            return StopRefinementContext {
+                category,
+                agent_handle: None,
+            };
         }
     };
     eprintln!(
@@ -333,7 +403,7 @@ fn capture_agent_context_at_stop(
         snapshot.agent().label()
     );
 
-    Some(thread::spawn(
+    let agent_handle = Some(thread::spawn(
         move || match agent_context::resolve_focused_session(snapshot) {
             Ok(Some(locator)) => Some(locator),
             Ok(None) => {
@@ -345,7 +415,11 @@ fn capture_agent_context_at_stop(
                 None
             }
         },
-    ))
+    ));
+    StopRefinementContext {
+        category,
+        agent_handle,
+    }
 }
 
 struct Daemon {
@@ -777,7 +851,11 @@ impl Daemon {
         Ok(())
     }
 
-    fn finish_recording(&mut self, cancel: bool) -> Result<()> {
+    fn finish_recording(
+        &mut self,
+        cancel: bool,
+        focused_window_hint: Option<focused_window::FocusedWindowSnapshot>,
+    ) -> Result<()> {
         let Some(mut session) = self.session.take() else {
             return Ok(());
         };
@@ -785,14 +863,27 @@ impl Daemon {
         let realtime_overloaded_flag = session.realtime_overloaded.clone();
         let mut realtime_overloaded = realtime_overloaded_flag.load(Ordering::SeqCst);
 
+        let stopped_at_ms = unix_time_ms();
+        let capture_drain_deadline =
+            should_drain_capture(cancel, session.stop_flag.load(Ordering::SeqCst))
+                .then(|| Instant::now() + CAPTURE_STOP_DRAIN);
+        let refinement_context =
+            capture_refinement_context_at_stop(&self.config, cancel, focused_window_hint);
+        self.state
+            .update(|snapshot| snapshot.stop_recording_clock_at(stopped_at_ms))?;
+        // PipeWire capture runs ahead of this control thread. Keep accepting a
+        // short post-key interval so samples already buffered in the audio
+        // stack, including a final syllable, reach both full-audio and realtime
+        // ASR before Stop. The displayed duration still ends at the key press.
+        if let Some(remaining) = capture_drain_deadline
+            .and_then(|deadline| deadline.checked_duration_since(Instant::now()))
+        {
+            thread::sleep(remaining);
+        }
         if cancel {
             session.cancel_flag.store(true, Ordering::SeqCst);
         }
         session.stop_flag.store(true, Ordering::SeqCst);
-        let stopped_at_ms = unix_time_ms();
-        let agent_context_handle = capture_agent_context_at_stop(&self.config, cancel);
-        self.state
-            .update(|snapshot| snapshot.stop_recording_clock_at(stopped_at_ms))?;
         match session.capture_mode {
             SessionCaptureMode::Dedicated {
                 mut child,
@@ -1051,13 +1142,16 @@ impl Daemon {
             snapshot.refinement_changed = None;
         })?;
 
-        let agent_locator = agent_context_handle.and_then(|handle| match handle.join() {
-            Ok(locator) => locator,
-            Err(_) => {
-                eprintln!("voice-input agent context: session discovery worker panicked");
-                None
-            }
-        });
+        let agent_locator =
+            refinement_context
+                .agent_handle
+                .and_then(|handle| match handle.join() {
+                    Ok(locator) => locator,
+                    Err(_) => {
+                        eprintln!("voice-input agent context: session discovery worker panicked");
+                        None
+                    }
+                });
         let agent_reference = agent_locator.as_ref().and_then(|locator| {
             match agent_context::load_reference(
                 locator,
@@ -1094,7 +1188,12 @@ impl Daemon {
                 snapshot.refinement_status = Some("running".into());
             })?;
 
-            match llm::maybe_refine(&self.config, &raw_transcript, agent_reference.as_ref()) {
+            match llm::maybe_refine(
+                &self.config,
+                &raw_transcript,
+                refinement_context.category,
+                agent_reference.as_ref(),
+            ) {
                 Ok(value) => {
                     let changed = value.trim() != raw_transcript.trim();
                     let status = if changed { "applied" } else { "unchanged" };
@@ -1528,12 +1627,20 @@ fn spawn_reader_thread(
                 break;
             }
             let read = match stdout.read(&mut bytes) {
+                Ok(0) if stop_flag.load(Ordering::SeqCst) || cancel_flag.load(Ordering::SeqCst) => {
+                    break;
+                }
                 Ok(0) => {
                     stop_flag.store(true, Ordering::SeqCst);
                     request_session_finish(&automatic_finish_requested, "audio stream ended");
                     break;
                 }
                 Ok(read) => read,
+                Err(_)
+                    if stop_flag.load(Ordering::SeqCst) || cancel_flag.load(Ordering::SeqCst) =>
+                {
+                    break;
+                }
                 Err(error) => {
                     stop_flag.store(true, Ordering::SeqCst);
                     request_session_finish(&automatic_finish_requested, "audio stream failed");
@@ -1942,7 +2049,18 @@ mod tests {
     }
 
     #[test]
-    fn agent_context_capture_requires_stop_and_enabled_refinement() {
+    fn capture_drain_only_applies_to_normal_manual_stop() {
+        assert!(should_drain_capture(false, false));
+        assert!(!should_drain_capture(true, false));
+        assert!(!should_drain_capture(false, true));
+    }
+
+    #[test]
+    fn focused_window_and_agent_capture_have_independent_policies() {
+        assert!(should_capture_focused_window(false, true));
+        assert!(!should_capture_focused_window(true, true));
+        assert!(!should_capture_focused_window(false, false));
+
         assert!(should_capture_agent_context(false, true, true));
         assert!(!should_capture_agent_context(true, true, true));
         assert!(!should_capture_agent_context(false, false, true));

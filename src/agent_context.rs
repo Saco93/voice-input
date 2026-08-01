@@ -7,9 +7,11 @@ use std::{
     process::{Command, Stdio},
 };
 
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow};
 use serde::Deserialize;
 use serde_json::Value;
+
+use crate::focused_window::FocusedWindowSnapshot;
 
 const MAX_SESSION_SCAN_BYTES: u64 = 8 * 1024 * 1024;
 const KITTY_QUERY_TIMEOUT_SECS: &str = "1";
@@ -58,13 +60,14 @@ impl FocusedAgentSnapshot {
     }
 }
 
-pub fn capture_focused_agent() -> Result<Option<FocusedAgentSnapshot>> {
-    let active = active_window()?;
-    if !active.class.eq_ignore_ascii_case("kitty") {
+pub fn capture_focused_agent(
+    window: &FocusedWindowSnapshot,
+) -> Result<Option<FocusedAgentSnapshot>> {
+    if !window.class().eq_ignore_ascii_case("kitty") {
         return Ok(None);
     }
 
-    focused_kitty_agent(active.pid).map(|process| {
+    focused_kitty_agent(window.pid()).map(|process| {
         process.map(|process| FocusedAgentSnapshot {
             kind: process.kind,
             pid: process.pid,
@@ -123,26 +126,6 @@ pub fn load_reference(
         agent: locator.kind,
         text,
     }))
-}
-
-#[derive(Deserialize)]
-struct ActiveWindow {
-    #[serde(default)]
-    class: String,
-    pid: u32,
-}
-
-fn active_window() -> Result<ActiveWindow> {
-    let output = Command::new("hyprctl")
-        .args(["activewindow", "-j"])
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-        .context("failed to query Hyprland active window")?;
-    if !output.status.success() {
-        bail!("Hyprland active-window query failed");
-    }
-    serde_json::from_slice(&output.stdout).context("failed to parse Hyprland active window")
 }
 
 struct FocusedAgentProcess {

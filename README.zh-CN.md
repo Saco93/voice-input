@@ -26,7 +26,7 @@ flowchart LR
 1. 常驻 PipeWire capture service 保留一小段 pre-roll，避免快捷键按下后最开始的语音被截掉。录音达到配置的时长上限后会自动停止并进入最终处理；默认上限为五分钟。
 2. Qwen Realtime 持续把 partial transcript 发送到 HUD，Server VAD 控制波形是否可见。实时音频使用容量受限的非阻塞 queue，并公平处理双向 WebSocket 消息。如果结束录音前发生传输错误、Server VAD 确认语音段处于 active 状态但 transcript 停滞八秒，或者已经出现文本后检测到持续且具有音高相关性的本地语音，但连续八秒没有收到服务器事件，worker 可以重建一次实时会话。重建期间，worker 会从头重放所有已缓冲的原始 PCM packet，同时继续录音。
 3. Toggle off 后，可选择让 Final ASR 对完整录音重新识别一次。如果受控重建失败、唯一一次重试已经用完，或者实时传输落后，程序会拒绝不完整的远程文本，并通过已启用的 final pass 或本地 fallback 对完整音频进行恢复识别。
-4. OpenAI-compatible LLM 对文本做轻量整理。Refinement 使用配置的 timeout（默认 15 秒，最多 30 秒）；预算达到 10 秒时，包含 coding agent 上下文的请求会为纯 transcript 清理重试预留 5 秒，最终失败时使用 Final ASR。
+4. OpenAI-compatible LLM 对文本做轻量整理。Toggle off 时聚焦的窗口决定 refinement 风格：系统中已安装的原生即时通讯客户端（WeChat、飞书/Lark、Signal 和 Telegram Desktop）使用自然的聊天标点，保留具有表达作用的口语语气词，并去掉消息末尾的句号，同时保留问号、感叹号和有意使用的省略号；其他窗口继续采用轻度书面化的默认风格。Refinement 使用配置的 timeout（默认 15 秒，最多 30 秒）；预算达到 10 秒时，包含 coding agent 上下文的请求会为纯 transcript 清理重试预留 5 秒，最终失败时使用 Final ASR。
 5. 短文本通过 `wtype` 输入；长文本和 XWayland 窗口自动使用剪贴板粘贴，并在结束后恢复原剪贴板。
 
 Realtime 或 Final ASR 确认没有 transcript 后，无语音 session 会直接回到 idle。音频采集、ASR、HUD、状态持久化和文本输出彼此隔离，缓慢的界面或剪贴板客户端不会阻塞识别。
@@ -68,7 +68,7 @@ source = ~/.local/share/voice-input/omarchy-hyprland-snippet.conf
 ```text
 F8                 取消当前 dictation
 F9                 开始/结束 dictation
-F10                丢弃并重新开始 dictation
+F10                丢弃并重新开始正在录制的 dictation（idle 时忽略）
 Super+Ctrl+Alt+…   移动或重置 HUD
 ```
 
@@ -84,7 +84,7 @@ systemctl --user status voice-input.service voice-input-hud.service
 - 支持中英文混合输入的 Qwen Realtime + Server VAD
 - 与 ASR packet cadence 解耦的 62.5 FPS 中心对称 PCM 波形
 - 一次受控的实时会话重建与完整缓冲音频重放；重建失败后使用完整音频进行最终恢复
-- 延迟受限且支持纯 transcript 清理重试的保守 LLM refinement
+- 根据目标窗口选择风格的 LLM refinement，包括所有已安装原生即时通讯客户端共用的口语化整理，并保留延迟限制和纯 transcript fallback
 - Pi/Codex 术语上下文：进程验证、脱敏、截断与 prompt-injection 隔离
 - Wayland/XWayland 长文本自动粘贴与剪贴板恢复
 - systemd 加密凭据：配置、argv、日志和 UI 中不保存密钥
@@ -107,7 +107,7 @@ Wiki 还包含 Agent context、桌面集成、安全隐私和开发说明。
 
 ## 隐私
 
-远程 Qwen 模式会把音频发送到配置的 Alibaba endpoint。LLM refinement 会把 transcript 发送到配置的 provider；只有在用户明确启用时，才会附带经过截断与脱敏的 Agent context。公开示例配置默认关闭远程 refinement 和 Agent context。Voice Input 不收集遥测或分析数据。
+远程 Qwen 模式会把音频发送到配置的 Alibaba endpoint。LLM refinement 会把 transcript 和粗粒度的目标类别（目前为 `instant-messaging` 或默认风格）通过 system prompt 发送到配置的 provider；只有在用户明确启用 Agent context 时，才会额外发送经过截断与脱敏的会话片段。LLM 请求不会包含窗口标题、进程 ID 或原始桌面元数据。公开示例配置默认关闭远程 refinement 和 Agent context。Voice Input 不收集遥测或分析数据。
 
 ## 项目状态
 

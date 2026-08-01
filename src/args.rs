@@ -21,6 +21,7 @@ pub enum RecordAction {
     Stop,
     Toggle,
     Cancel,
+    Restart,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -118,9 +119,9 @@ fn require_arg_count(args: &[String], expected: usize, usage: &str) -> Result<()
 }
 
 fn parse_record(args: Vec<String>) -> Result<Command> {
-    require_arg_count(&args, 1, "record <start|stop|toggle|cancel>")?;
+    require_arg_count(&args, 1, "record <start|stop|toggle|cancel|restart>")?;
     let Some(action) = args.first() else {
-        bail!("record requires start|stop|toggle|cancel");
+        bail!("record requires start|stop|toggle|cancel|restart");
     };
 
     let action = match action.as_str() {
@@ -128,6 +129,7 @@ fn parse_record(args: Vec<String>) -> Result<Command> {
         "stop" => RecordAction::Stop,
         "toggle" => RecordAction::Toggle,
         "cancel" => RecordAction::Cancel,
+        "restart" => RecordAction::Restart,
         other => bail!("unknown record action `{other}`"),
     };
 
@@ -294,7 +296,7 @@ pub fn help_text() -> &'static str {
 USAGE:
   voice-input
   voice-input daemon
-  voice-input record <start|stop|toggle|cancel>
+  voice-input record <start|stop|toggle|cancel|restart>
   voice-input hud move <left|right|up|down> [amount]
   voice-input hud position <bottom-center|bottom-left|bottom-right>
   voice-input hud <center|reset>
@@ -326,6 +328,14 @@ mod tests {
         assert!(parse_hud(strings(&["position", "left", "extra"])).is_err());
         assert!(parse_llm(strings(&["test", "extra"])).is_err());
         assert!(parse_setup(strings(&["systemd", "extra"])).is_err());
+    }
+
+    #[test]
+    fn restart_is_a_single_record_action() {
+        assert_eq!(
+            parse_record(strings(&["restart"])).unwrap(),
+            Command::Record(RecordAction::Restart)
+        );
     }
 
     #[test]

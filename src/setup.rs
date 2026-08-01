@@ -181,9 +181,7 @@ pub fn print_hyprland_snippet() -> Result<()> {
     println!("unbind = , F9");
     println!("unbind = , F10");
     println!("binddp = , F8, Cancel voice input, exec, voice-input record cancel");
-    println!(
-        "binddp = , F10, Restart voice input, exec, bash -lc 'voice-input record cancel && voice-input record start'"
-    );
+    println!("binddp = , F10, Restart active voice input, exec, voice-input record restart");
     println!("#");
     match config.hotkey.mode {
         HotkeyMode::Hold => {

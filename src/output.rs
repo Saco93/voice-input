@@ -48,7 +48,10 @@ pub fn emit_text(
     text: &str,
     target_hint: Option<OutputTargetHint>,
 ) -> Result<EmitReport> {
-    eprintln!("voice-input output: begin emit_text");
+    eprintln!(
+        "voice-input output: begin emit_text chars={}",
+        text.chars().count()
+    );
     let ime_guard = ImeGuard::prepare(config)?;
     let settle_delay_ms = effective_output_settle_delay_ms(config);
     let target = resolve_output_target(target_hint);
