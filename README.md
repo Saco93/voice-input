@@ -26,8 +26,8 @@ flowchart LR
 1. A persistent PipeWire capture service keeps a short pre-roll buffer, so speech immediately after the hotkey is not lost. Sessions stop and finalize automatically at the configured duration limit (five minutes by default).
 2. Qwen Realtime streams partial text to the HUD while Server VAD controls waveform visibility. Realtime delivery uses a bounded, nonblocking queue and fair bidirectional WebSocket processing. The worker may reconstruct the realtime session once after a pre-finish transport failure, an eight-second active-speech transcript stall, or sustained pitch-correlated local speech that receives no server event for eight seconds after text has appeared. Reconstruction replays every buffered raw PCM packet from the beginning while recording continues.
 3. On toggle-off, the complete recording is optionally recognized again by the final ASR model. If the controlled reconstruction fails, its single retry is exhausted, or realtime delivery falls behind, incomplete remote text is rejected and the complete audio is recovered through the enabled final pass or local fallback.
-4. The transcript is lightly cleaned by an OpenAI-compatible LLM. The window focused at toggle-off selects the refinement style: installed native messaging clients (WeChat, Feishu/Lark, Signal, and Telegram Desktop) receive conversational punctuation, preserve meaningful spoken particles, and omit a final full stop while retaining question marks, exclamation marks, and intentional ellipses; other destinations retain the lightly formal default. Refinement uses the configured timeout (15 seconds by default, capped at 30 seconds); when the budget is at least 10 seconds, contextual requests reserve five seconds for a transcript-only cleanup retry and ultimately fail open to Final ASR.
-5. Short text is typed with `wtype`; long text and XWayland targets use clipboard paste with automatic restoration.
+4. The transcript is lightly cleaned by an OpenAI-compatible LLM. The window focused at toggle-off selects the refinement style: Pi and Codex receive compact Markdown that turns explicit sequences into ordered lists, unordered enumerations into bullet lists, and distinct parts into separate paragraphs; installed native messaging clients (WeChat, Feishu/Lark, Signal, and Telegram Desktop) receive conversational punctuation, preserve meaningful spoken particles, and omit a final full stop while retaining question marks, exclamation marks, and intentional ellipses; other destinations retain the lightly formal default. Refinement uses the configured timeout (15 seconds by default, capped at 30 seconds); when the budget is at least 10 seconds, contextual requests reserve five seconds for a transcript-only cleanup retry and ultimately fail open to Final ASR.
+5. All text is delivered through clipboard paste with automatic restoration. Wayland paste shortcuts use Hyprland's `sendshortcut` dispatcher, while XWayland uses `xdotool`; Voice Input never creates a `wtype` character keymap.
 
 No-speech sessions return to idle once realtime or final ASR confirms that no transcript exists. Audio capture, ASR, HUD rendering, persistence, and output are isolated so a slow visual or clipboard client cannot block recognition.
 
@@ -36,7 +36,7 @@ No-speech sessions return to idle once realtime or final ASR confirms that no tr
 ### Requirements
 
 - Arch Linux / Omarchy with Hyprland and Wayland
-- Rust toolchain, PipeWire (`pw-record`), `wtype`, and `wl-clipboard`
+- Rust toolchain, PipeWire (`pw-record`), and `wl-clipboard`
 - [Quickshell](https://quickshell.org/) for the HUD and Settings
 - Qt Shader Tools 6.7 or newer (`qt6-shadertools` on Arch) to compile the HUD halo during installation; set `QSB=/path/to/qsb` for a nonstandard Qt installation
 - Optional: `/usr/bin/voxtype` for local fallback; `xclip` + `xdotool` for XWayland
@@ -84,11 +84,12 @@ systemctl --user status voice-input.service voice-input-hud.service
 - Realtime Chinese/English mixed dictation with Server VAD
 - Center-symmetric 62.5 FPS PCM waveform, independent of ASR packet cadence
 - One controlled realtime reconstruction with complete buffered-audio replay, followed by complete-audio final recovery if needed
-- Destination-aware LLM refinement, including a shared conversational style for installed native messaging clients, with bounded latency and a transcript-only fallback
+- Destination-aware LLM refinement, including structured Markdown for Pi/Codex and a shared conversational style for installed native messaging clients, with bounded latency and a transcript-only fallback
 - Pi/Codex terminology context with validation, redaction, truncation, and prompt-injection isolation
-- Automatic long-text paste and clipboard restoration across Wayland/XWayland
+- Clipboard-only text delivery with automatic restoration across Wayland/XWayland; no `wtype` character injection
 - Encrypted systemd credentials; no secrets in config, argv, logs, or UI
 - Theme-aware, monitor-aware, click-through Quickshell HUD with an integrated stage and effective recording timer
+- Bundled Noto Sans SC variable UI font under the SIL Open Font License, with Qt's system-font fallback retained
 - Native Quickshell Settings with validated Rust persistence and encrypted credentials
 - Explicit `/usr/bin/voxtype` local fallback without binary-name ambiguity
 
@@ -107,7 +108,7 @@ The Wiki also covers agent context, desktop integration, privacy, and developmen
 
 ## Privacy
 
-Remote Qwen modes send audio to the configured Alibaba endpoint. LLM refinement sends the transcript and a coarse destination category through its system prompt (currently `instant-messaging` or the default style) to the configured provider; only when agent context is explicitly enabled does it also send a capped and redacted session excerpt. Window titles, process IDs, and raw desktop metadata are never included in the LLM request. The public sample disables remote refinement and agent context. Voice Input performs no telemetry or analytics collection.
+Remote Qwen modes send audio to the configured Alibaba endpoint. LLM refinement sends the transcript and a coarse destination style through its system prompt (structured coding-agent Markdown, `instant-messaging`, or the default style) to the configured provider; only when agent context is explicitly enabled does it also send a capped and redacted session excerpt. Window titles, process IDs, and raw desktop metadata are never included in the LLM request. The public sample disables remote refinement and agent context. Voice Input performs no telemetry or analytics collection.
 
 ## Project status
 

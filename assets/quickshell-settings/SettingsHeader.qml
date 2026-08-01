@@ -31,8 +31,9 @@ Rectangle {
         Label {
             text: root.theme.tr(root.title)
             color: root.theme.foreground
+            font.family: root.theme.fontFamily
             font.pixelSize: 20
-            font.weight: Font.DemiBold
+            font.weight: Font.Black
             Layout.fillWidth: true
         }
 
@@ -40,6 +41,8 @@ Rectangle {
             visible: root.controller.dirty
             text: root.theme.tr("Unsaved")
             color: root.theme.warning
+            font.family: root.theme.fontFamily
+            font.weight: Font.ExtraBold
             font.pixelSize: 11
         }
 
@@ -79,8 +82,9 @@ Rectangle {
             contentItem: Text {
                 text: parent.text
                 color: root.theme.subtle
+                font.family: root.theme.fontFamily
                 font.pixelSize: 11
-                font.weight: Font.Medium
+                font.weight: Font.ExtraBold
                 horizontalAlignment: Text.AlignHCenter
                 verticalAlignment: Text.AlignVCenter
             }
@@ -120,6 +124,8 @@ Rectangle {
             contentItem: Text {
                 text: parent.text
                 color: root.theme.subtle
+                font.family: root.theme.fontFamily
+                font.weight: Font.ExtraBold
                 font.pixelSize: 18
                 horizontalAlignment: Text.AlignHCenter
                 verticalAlignment: Text.AlignVCenter

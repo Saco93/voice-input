@@ -7,6 +7,7 @@ Wants=voice-input.service
 [Service]
 Type=simple
 Environment=XDG_RUNTIME_DIR=%t
+Environment="VOICE_INPUT_FONT_PATH=@VOICE_INPUT_FONT_PATH@"
 ExecStart=/usr/bin/qs --no-duplicate --path @VOICE_INPUT_QUICKSHELL_DIR@
 Restart=on-failure
 RestartSec=2

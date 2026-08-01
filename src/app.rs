@@ -164,6 +164,7 @@ fn open_settings() -> Result<()> {
         .args(["--daemonize", "--no-duplicate", "--path"])
         .arg(settings_dir)
         .env("VOICE_INPUT_BIN", paths::current_executable()?)
+        .env("VOICE_INPUT_FONT_PATH", paths::ui_font_path()?)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())

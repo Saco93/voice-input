@@ -14,21 +14,17 @@ use std::{
 use anyhow::{Context, Result, anyhow, bail};
 use serde::Deserialize;
 
-use crate::config::{Config, HotkeyMode, OutputMode};
+use crate::config::{Config, HotkeyMode};
 
 const ACTIVE_WINDOW_TIMEOUT_MS: u64 = 500;
 const INPUT_METHOD_TIMEOUT_MS: u64 = 800;
 const CLIPBOARD_QUERY_TIMEOUT_MS: u64 = 1_000;
 const CLIPBOARD_COPY_TIMEOUT_MS: u64 = 1_500;
 const KEY_SIMULATION_TIMEOUT_MS: u64 = 1_500;
-const TEXT_INJECTION_BASE_TIMEOUT_MS: u64 = 1_500;
-const TEXT_INJECTION_PER_CHAR_TIMEOUT_MS: u64 = 12;
-const TEXT_INJECTION_MAX_TIMEOUT_MS: u64 = 5_000;
 const X11_CLIPBOARD_TIMEOUT_MS: u64 = 1_500;
 const SESSION_ENV_TIMEOUT_MS: u64 = 800;
 const OUTPUT_TARGET_RETRIES: usize = 6;
 const OUTPUT_TARGET_RETRY_DELAY_MS: u64 = 50;
-const DIRECT_TYPE_MAX_CHARS: usize = 120;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutputTargetHint {
@@ -55,11 +51,9 @@ pub fn emit_text(
     let ime_guard = ImeGuard::prepare(config)?;
     let settle_delay_ms = effective_output_settle_delay_ms(config);
     let target = resolve_output_target(target_hint);
-    let effective_mode = effective_output_mode_for_text(config, &target, text);
     eprintln!(
-        "voice-input output: target={} mode={} hint={}",
+        "voice-input output: target={} mode=paste hint={}",
         target.label(),
-        effective_mode.label(),
         target_hint
             .map(|hint| match hint {
                 OutputTargetHint::Wayland => "wayland",
@@ -68,41 +62,13 @@ pub fn emit_text(
             .unwrap_or("none")
     );
 
-    let primary_result = match effective_mode {
-        EffectiveOutputMode::Type => {
-            eprintln!("voice-input output: type_with_wtype");
-            type_with_wtype(config, text, settle_delay_ms)
-        }
-        OutputMode::Clipboard => {
-            eprintln!("voice-input output: clipboard copy");
-            settle_before_output(settle_delay_ms);
-            copy_to_clipboards(text, &target)
-        }
-        OutputMode::Paste => {
-            eprintln!("voice-input output: paste via clipboard");
-            settle_before_output(settle_delay_ms);
-            paste_via_clipboard(config, text, &target)
-        }
-    };
-
-    let result = match primary_result {
-        Ok(()) => Ok(EmitReport {
-            target: target.label().to_string(),
-            mode: effective_mode.label().to_string(),
-            driver: target.driver_for_mode(&effective_mode).to_string(),
-        }),
-        Err(error) if should_try_clipboard_fallback(config, &effective_mode) => {
-            settle_before_output(settle_delay_ms);
-            paste_via_clipboard(config, text, &target)
-                .map(|()| EmitReport {
-                    target: target.label().to_string(),
-                    mode: "paste-fallback".into(),
-                    driver: target.driver_for_mode(&OutputMode::Paste).to_string(),
-                })
-                .or(Err(error))
-        }
-        Err(error) => Err(error),
-    };
+    eprintln!("voice-input output: paste via clipboard");
+    settle_before_output(settle_delay_ms);
+    let result = paste_via_clipboard(config, text, &target).map(|()| EmitReport {
+        target: target.label().to_string(),
+        mode: "paste".into(),
+        driver: target.paste_driver().to_string(),
+    });
 
     eprintln!("voice-input output: restoring ime");
     ime_guard.restore()?;
@@ -121,56 +87,6 @@ pub fn detect_output_target_hint() -> Result<OutputTargetHint> {
 enum OutputTarget {
     Wayland,
     XWayland { address: Option<String> },
-}
-
-type EffectiveOutputMode = OutputMode;
-
-trait EffectiveOutputModeLabel {
-    fn label(&self) -> &'static str;
-}
-
-impl EffectiveOutputModeLabel for OutputMode {
-    fn label(&self) -> &'static str {
-        match self {
-            OutputMode::Type => "type",
-            OutputMode::Clipboard => "clipboard",
-            OutputMode::Paste => "paste",
-        }
-    }
-}
-
-fn type_with_wtype(config: &Config, text: &str, settle_delay_ms: u64) -> Result<()> {
-    let mut command = Command::new("wtype");
-    command
-        .arg("-s")
-        .arg(settle_delay_ms.to_string())
-        .arg("-d")
-        .arg(config.output.type_delay_ms.to_string())
-        .arg("--")
-        .arg(text)
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped());
-    let output = spawn_and_wait(
-        &mut command,
-        text_injection_timeout_ms(text),
-        "wtype text injection",
-    )?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        bail!(
-            "wtype failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        )
-    }
-}
-
-fn text_injection_timeout_ms(text: &str) -> u64 {
-    TEXT_INJECTION_BASE_TIMEOUT_MS
-        .saturating_add(
-            (text.chars().count() as u64).saturating_mul(TEXT_INJECTION_PER_CHAR_TIMEOUT_MS),
-        )
-        .min(TEXT_INJECTION_MAX_TIMEOUT_MS)
 }
 
 fn effective_output_settle_delay_ms(config: &Config) -> u64 {
@@ -222,38 +138,6 @@ fn selected_paste_keys<'a>(config: &'a Config, target: &OutputTarget) -> &'a str
     }
 }
 
-fn effective_output_mode(config: &Config, target: &OutputTarget) -> EffectiveOutputMode {
-    if target.is_xwayland()
-        && matches!(config.output.mode, OutputMode::Type)
-        && config.output.prefer_paste_for_xwayland
-    {
-        OutputMode::Paste
-    } else {
-        config.output.mode.clone()
-    }
-}
-
-fn effective_output_mode_for_text(
-    config: &Config,
-    target: &OutputTarget,
-    text: &str,
-) -> EffectiveOutputMode {
-    let configured = effective_output_mode(config, target);
-    if matches!(configured, OutputMode::Type) && text.chars().count() > DIRECT_TYPE_MAX_CHARS {
-        eprintln!(
-            "voice-input output: using paste for long text ({} chars)",
-            text.chars().count()
-        );
-        OutputMode::Paste
-    } else {
-        configured
-    }
-}
-
-fn should_try_clipboard_fallback(config: &Config, attempted_mode: &OutputMode) -> bool {
-    matches!(attempted_mode, OutputMode::Type) && config.output.fallback_to_clipboard
-}
-
 fn copy_to_clipboards(text: &str, target: &OutputTarget) -> Result<()> {
     if target.is_xwayland() {
         copy_to_x11_clipboard(text.as_bytes())?;
@@ -294,40 +178,53 @@ fn press_key_chord(chord: &str, target: &OutputTarget) -> Result<()> {
         return press_key_chord_via_xdotool(chord);
     }
 
-    let mut parts: Vec<String> = chord
-        .split('+')
-        .map(|part| part.trim().to_ascii_lowercase())
-        .filter(|part| !part.is_empty())
-        .collect();
-
-    if parts.is_empty() {
-        return Err(anyhow!("paste key chord is empty"));
-    }
-
-    let key = parts.pop().unwrap_or_default();
-    let mut command = Command::new("wtype");
-    for modifier in &parts {
-        command.arg("-M").arg(modifier);
-    }
-    command.arg("-k").arg(key);
-    for modifier in parts.iter().rev() {
-        command.arg("-m").arg(modifier);
-    }
-
-    command.stdout(Stdio::null()).stderr(Stdio::piped());
+    let shortcut = hyprland_shortcut(chord)?;
+    eprintln!("voice-input output: hyprctl sendshortcut {shortcut}");
+    let mut command = hyprctl_command();
+    command
+        .args(["dispatch", "sendshortcut"])
+        .arg(shortcut)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
     let output = spawn_and_wait(
         &mut command,
         KEY_SIMULATION_TIMEOUT_MS,
-        "wtype paste chord injection",
+        "Hyprland paste shortcut",
     )?;
     if output.status.success() {
         Ok(())
     } else {
         bail!(
-            "failed to simulate paste chord: {}",
+            "failed to dispatch Wayland paste chord: {}",
             String::from_utf8_lossy(&output.stderr).trim()
         )
     }
+}
+
+fn hyprland_shortcut(chord: &str) -> Result<String> {
+    let mut parts: Vec<&str> = chord
+        .split('+')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .collect();
+    let key = parts
+        .pop()
+        .ok_or_else(|| anyhow!("paste key chord is empty"))?;
+    if key.contains(',') {
+        bail!("paste key contains an invalid comma");
+    }
+
+    let modifiers = parts
+        .into_iter()
+        .map(|modifier| match modifier.to_ascii_lowercase().as_str() {
+            "ctrl" | "control" => Ok("CTRL"),
+            "shift" => Ok("SHIFT"),
+            "alt" => Ok("ALT"),
+            "super" | "meta" | "win" => Ok("SUPER"),
+            _ => bail!("unknown paste key modifier `{modifier}`"),
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(format!("{},{key},activewindow", modifiers.join(" ")))
 }
 
 fn press_key_chord_via_xdotool(chord: &str) -> Result<()> {
@@ -443,13 +340,10 @@ impl OutputTarget {
         }
     }
 
-    fn driver_for_mode(&self, mode: &OutputMode) -> &'static str {
-        match (self, mode) {
-            (_, OutputMode::Type) => "wtype",
-            (Self::Wayland, OutputMode::Clipboard) => "wl-copy",
-            (Self::Wayland, OutputMode::Paste) => "wl-copy+wtype",
-            (Self::XWayland { .. }, OutputMode::Clipboard) => "xclip",
-            (Self::XWayland { .. }, OutputMode::Paste) => "xclip+xdotool",
+    fn paste_driver(&self) -> &'static str {
+        match self {
+            Self::Wayland => "wl-copy+hyprctl",
+            Self::XWayland { .. } => "xclip+xdotool",
         }
     }
 }
@@ -914,66 +808,29 @@ fn wait_with_output_timeout(mut child: Child, timeout_ms: u64, label: &str) -> R
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        ActiveWindow, EffectiveOutputMode, OutputTarget, effective_output_mode,
-        effective_output_mode_for_text, text_injection_timeout_ms,
-    };
-    use crate::config::{Config, OutputMode};
+    use super::{ActiveWindow, OutputTarget, hyprland_shortcut};
 
     #[test]
-    fn xwayland_prefers_paste_when_enabled() {
-        let config = Config::default();
-        assert!(matches!(
-            effective_output_mode(&config, &OutputTarget::XWayland { address: None }),
-            EffectiveOutputMode::Paste
-        ));
+    fn wayland_paste_shortcut_uses_hyprland_dispatch_syntax() {
+        assert_eq!(
+            hyprland_shortcut("shift+Insert").unwrap(),
+            "SHIFT,Insert,activewindow"
+        );
+        assert_eq!(
+            hyprland_shortcut("ctrl+alt+v").unwrap(),
+            "CTRL ALT,v,activewindow"
+        );
+        assert!(hyprland_shortcut("").is_err());
+        assert!(hyprland_shortcut("hyper+v").is_err());
     }
 
     #[test]
-    fn wayland_keeps_direct_type_mode() {
-        let config = Config::default();
-        assert!(matches!(
-            effective_output_mode(&config, &OutputTarget::Wayland),
-            EffectiveOutputMode::Type
-        ));
-    }
-
-    #[test]
-    fn text_injection_timeout_scales_but_remains_bounded() {
-        assert_eq!(text_injection_timeout_ms(""), 1_500);
-        assert_eq!(text_injection_timeout_ms(&"a".repeat(100)), 2_700);
-        assert_eq!(text_injection_timeout_ms(&"a".repeat(10_000)), 5_000);
-    }
-
-    #[test]
-    fn wayland_uses_paste_for_long_text() {
-        let config = Config::default();
-        let text = "长".repeat(121);
-        assert!(matches!(
-            effective_output_mode_for_text(&config, &OutputTarget::Wayland, &text),
-            EffectiveOutputMode::Paste
-        ));
-    }
-
-    #[test]
-    fn wayland_keeps_type_for_short_text() {
-        let config = Config::default();
-        let text = "short dictation";
-        assert!(matches!(
-            effective_output_mode_for_text(&config, &OutputTarget::Wayland, text),
-            EffectiveOutputMode::Type
-        ));
-    }
-
-    #[test]
-    fn xwayland_prefers_user_mode_when_override_disabled() {
-        let mut config = Config::default();
-        config.output.prefer_paste_for_xwayland = false;
-        config.output.mode = OutputMode::Type;
-        assert!(matches!(
-            effective_output_mode(&config, &OutputTarget::XWayland { address: None }),
-            EffectiveOutputMode::Type
-        ));
+    fn paste_drivers_use_compositor_or_x11_dispatch() {
+        assert_eq!(OutputTarget::Wayland.paste_driver(), "wl-copy+hyprctl");
+        assert_eq!(
+            OutputTarget::XWayland { address: None }.paste_driver(),
+            "xclip+xdotool"
+        );
     }
 
     #[test]

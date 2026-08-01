@@ -17,16 +17,6 @@ SettingsPage {
         return root.theme.tr(value === "alibaba-qwen-realtime" ? "Alibaba Qwen realtime" : "Local CLI");
     }
 
-    function outputLabel(value) {
-        if (value === "clipboard")
-            return root.theme.tr("Clipboard only");
-
-        if (value === "paste")
-            return root.theme.tr("Clipboard paste");
-
-        return root.theme.tr("Direct typing");
-    }
-
     title: "Overview"
     description: "Service status and current configuration."
 
@@ -45,8 +35,9 @@ SettingsPage {
                 Label {
                     text: root.serviceUnit
                     color: root.theme.foreground
+                    font.family: root.theme.fontFamily
                     font.pixelSize: 12
-                    font.weight: Font.Medium
+                    font.weight: Font.ExtraBold
                     elide: Text.ElideRight
                     Layout.fillWidth: true
                 }
@@ -54,6 +45,8 @@ SettingsPage {
                 Label {
                     text: root.runtimeSummary
                     color: root.theme.subtle
+                    font.family: root.theme.fontFamily
+                    font.weight: Font.ExtraBold
                     font.pixelSize: 11
                     wrapMode: Text.WordWrap
                     Layout.fillWidth: true
@@ -64,8 +57,9 @@ SettingsPage {
             Label {
                 text: root.serviceSummary
                 color: root.serviceRunning === false ? root.theme.error : root.theme.foreground
+                font.family: root.theme.fontFamily
                 font.pixelSize: 12
-                font.weight: Font.Medium
+                font.weight: Font.ExtraBold
             }
 
         }
@@ -99,7 +93,7 @@ SettingsPage {
             SummaryCard {
                 theme: root.theme
                 title: "Output"
-                summary: root.outputLabel(root.controller.value("output.mode", "type"))
+                summary: root.theme.tr("Clipboard paste")
                 detail: root.controller.value("ime.manage_fcitx5", true) ? "Coordinates with Fcitx5" : "Leaves Fcitx5 unchanged"
                 onActivated: root.navigateRequested("Output")
             }

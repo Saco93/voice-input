@@ -30,8 +30,9 @@ GridLayout {
         Label {
             text: root.theme.tr(root.label)
             color: root.theme.foreground
+            font.family: root.theme.fontFamily
             font.pixelSize: 12
-            font.weight: Font.Medium
+            font.weight: Font.ExtraBold
             wrapMode: Text.WordWrap
             Layout.fillWidth: true
         }
@@ -40,6 +41,8 @@ GridLayout {
             visible: root.help.length > 0
             text: root.theme.tr(root.help)
             color: root.theme.subtle
+            font.family: root.theme.fontFamily
+            font.weight: Font.ExtraBold
             font.pixelSize: 11
             lineHeight: 1.15
             wrapMode: Text.WordWrap
@@ -64,6 +67,8 @@ GridLayout {
             selectByMouse: true
             color: root.theme.foreground
             placeholderTextColor: root.theme.subtle
+            font.family: root.theme.fontFamily
+            font.weight: Font.ExtraBold
             Accessible.name: root.theme.tr(root.label)
             Accessible.description: root.theme.tr(root.help)
             onTextEdited: root.edited(text)
@@ -82,6 +87,8 @@ GridLayout {
             visible: root.error.length > 0
             text: root.theme.tr(root.error)
             color: root.theme.error
+            font.family: root.theme.fontFamily
+            font.weight: Font.ExtraBold
             font.pixelSize: 11
             wrapMode: Text.WordWrap
             Layout.fillWidth: true

@@ -3,6 +3,7 @@ BIN_DIR ?= $(PREFIX)/bin
 SHARE_DIR ?= $(PREFIX)/share/voice-input
 QUICKSHELL_DIR ?= $(SHARE_DIR)/quickshell
 QUICKSHELL_SETTINGS_DIR ?= $(SHARE_DIR)/quickshell-settings
+FONT_DIR ?= $(dir $(QUICKSHELL_DIR))fonts
 SYSTEMD_USER_DIR ?= $(HOME)/.config/systemd/user
 PI_EXTENSIONS_DIR ?= $(HOME)/.pi/agent/extensions
 CONFIG_HOME ?= $(HOME)/.config
@@ -43,6 +44,8 @@ install-hud-assets: hud-shaders
 	install -Dm644 assets/quickshell/HudSurface.qml $(QUICKSHELL_DIR)/HudSurface.qml
 	install -Dm644 assets/quickshell/WavyHalo.qml $(QUICKSHELL_DIR)/WavyHalo.qml
 	install -Dm644 $(HUD_SHADER_OUTPUT) $(QUICKSHELL_DIR)/shaders/wavy-halo.frag.qsb
+	install -Dm644 assets/fonts/NotoSansSC-Variable.ttf $(FONT_DIR)/NotoSansSC-Variable.ttf
+	install -Dm644 assets/fonts/OFL-NotoSansSC.txt $(FONT_DIR)/OFL-NotoSansSC.txt
 
 install: build install-hud-assets
 	install -Dm755 target/release/voice-input $(BIN_DIR)/voice-input
@@ -65,6 +68,7 @@ install: build install-hud-assets
 		assets/voice-input.service > $(SYSTEMD_USER_DIR)/voice-input.service
 	sed \
 		-e 's|@VOICE_INPUT_QUICKSHELL_DIR@|$(QUICKSHELL_DIR)|g' \
+		-e 's|@VOICE_INPUT_FONT_PATH@|$(FONT_DIR)/NotoSansSC-Variable.ttf|g' \
 		assets/voice-input-hud.service > $(SYSTEMD_USER_DIR)/voice-input-hud.service
 	install -d -m700 $(CONFIG_DIR) $(CREDENTIAL_STORE_DIR)
 	if [ ! -f $(CONFIG_DIR)/config.toml ]; then \

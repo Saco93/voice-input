@@ -289,7 +289,7 @@ impl Default for Config {
                 },
             },
             output: OutputConfig {
-                mode: OutputMode::Type,
+                mode: OutputMode::Paste,
                 fallback_to_clipboard: true,
                 type_delay_ms: 0,
                 pre_type_delay_ms: 140,
@@ -498,13 +498,14 @@ impl Config {
             0,
             10_000,
         );
-        // Type mode also needs a paste chord for long text and clipboard fallback.
+        // Text delivery always uses a clipboard paste shortcut. Legacy output
+        // modes remain parseable so existing configurations continue to load.
         validate_text(
             &mut fields,
             "output.paste_keys",
             &self.output.paste_keys,
             256,
-            matches!(self.output.mode, OutputMode::Clipboard),
+            false,
         );
         // Empty intentionally falls back to the Wayland paste chord.
         validate_text(

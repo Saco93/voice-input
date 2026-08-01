@@ -35,7 +35,7 @@ final_pass_timeout_ms = 20000
 final_pass_enable_itn = false
 
 [output]
-mode = "type"
+mode = "paste"
 fallback_to_clipboard = true
 type_delay_ms = 0
 pre_type_delay_ms = 140

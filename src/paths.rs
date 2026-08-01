@@ -58,6 +58,10 @@ pub fn quickshell_settings_path() -> Result<PathBuf> {
     Ok(asset_dir()?.join("quickshell-settings"))
 }
 
+pub fn ui_font_path() -> Result<PathBuf> {
+    Ok(asset_dir()?.join("fonts").join("NotoSansSC-Variable.ttf"))
+}
+
 pub fn waybar_snippet_path() -> Result<PathBuf> {
     Ok(asset_dir()?.join("omarchy-waybar-snippet.jsonc"))
 }

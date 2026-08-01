@@ -24,8 +24,9 @@ Rectangle {
         Label {
             text: root.theme.tr(root.title)
             color: root.theme.foreground
+            font.family: root.theme.fontFamily
             font.pixelSize: 12
-            font.weight: Font.Medium
+            font.weight: Font.ExtraBold
             Layout.preferredWidth: 110
         }
 
@@ -36,6 +37,8 @@ Rectangle {
             Label {
                 text: root.theme.tr(root.summary)
                 color: root.theme.foreground
+                font.family: root.theme.fontFamily
+                font.weight: Font.ExtraBold
                 font.pixelSize: 12
                 elide: Text.ElideRight
                 Layout.fillWidth: true
@@ -44,6 +47,8 @@ Rectangle {
             Label {
                 text: root.theme.tr(root.detail)
                 color: root.theme.subtle
+                font.family: root.theme.fontFamily
+                font.weight: Font.ExtraBold
                 font.pixelSize: 11
                 elide: Text.ElideRight
                 Layout.fillWidth: true
@@ -60,8 +65,9 @@ Rectangle {
             contentItem: Text {
                 text: parent.text
                 color: root.theme.accent
+                font.family: root.theme.fontFamily
                 font.pixelSize: 11
-                font.weight: Font.Medium
+                font.weight: Font.ExtraBold
                 verticalAlignment: Text.AlignVCenter
             }
 

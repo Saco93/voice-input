@@ -86,7 +86,7 @@ QtObject {
                 }
             },
             "output": {
-                "mode": "type",
+                "mode": "paste",
                 "fallback_to_clipboard": true,
                 "type_delay_ms": 0,
                 "pre_type_delay_ms": 140,

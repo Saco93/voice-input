@@ -14,6 +14,8 @@ Dialog {
     y: Math.round((parent.height - height) / 2)
     modal: true
     title: root.theme.tr("Discard unsaved changes?")
+    font.family: root.theme.fontFamily
+    font.weight: Font.ExtraBold
     standardButtons: Dialog.NoButton
 
     background: Rectangle {
@@ -28,6 +30,8 @@ Dialog {
         Label {
             text: root.theme.tr("Your configuration or credential replacements have not been saved.")
             color: root.theme.foreground
+            font.family: root.theme.fontFamily
+            font.weight: Font.ExtraBold
             wrapMode: Text.WordWrap
             Layout.preferredWidth: 380
         }

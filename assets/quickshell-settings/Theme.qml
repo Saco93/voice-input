@@ -8,6 +8,7 @@ QtObject {
     id: root
 
     readonly property string themePath: Quickshell.env("HOME") + "/.config/omarchy/current/theme/colors.toml"
+    readonly property string fontPath: Quickshell.env("VOICE_INPUT_FONT_PATH") || ""
     // Safe, high-contrast defaults are retained if the Omarchy theme is missing
     // or is being replaced while this window is open.
     property var palette: ({
@@ -32,6 +33,8 @@ QtObject {
     readonly property color warning: palette.warning
     readonly property color border: Qt.alpha(foreground, 0.14)
     readonly property color subtle: Qt.alpha(foreground, 0.68)
+    readonly property string fontFamily: uiFont.status === FontLoader.Ready ? uiFont.name : ""
+    property FontLoader uiFont
     property I18n i18n
     property FileView themeFile
     property Timer refreshTimer
@@ -63,6 +66,10 @@ QtObject {
             };
         } catch (error) {
         }
+    }
+
+    uiFont: FontLoader {
+        source: root.fontPath.length > 0 ? "file://" + root.fontPath : ""
     }
 
     i18n: I18n {

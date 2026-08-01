@@ -12,6 +12,7 @@ PanelWindow {
 
     required property ShellScreen screenModel
     required property StateStore store
+    required property string fontFamily
     readonly property bool isFocusedScreen: {
         const focused = Hyprland.focusedMonitor;
         const monitor = Hyprland.monitorFor(screenModel);
@@ -539,8 +540,9 @@ PanelWindow {
                 y: implicitHeight <= parent.height ? (parent.height - implicitHeight) / 2 : parent.height - implicitHeight
                 text: panel.displayText
                 color: store.themeForeground
+                font.family: panel.fontFamily
                 font.pixelSize: 14
-                font.weight: Font.Medium
+                font.weight: Font.Bold
                 lineHeight: 1.28
                 lineHeightMode: Text.ProportionalHeight
                 horizontalAlignment: panel.expanded ? Text.AlignLeft : Text.AlignHCenter
@@ -650,8 +652,9 @@ PanelWindow {
                 Text {
                     text: panel.phaseLabel
                     color: Qt.alpha(store.themeForeground, 0.68)
+                    font.family: panel.fontFamily
                     font.pixelSize: 11
-                    font.weight: Font.Medium
+                    font.weight: Font.Bold
                 }
 
             }
@@ -662,9 +665,9 @@ PanelWindow {
                 anchors.verticalCenterOffset: 1
                 text: panel.formatRecordingDuration(panel.displayedRecordingDurationMs)
                 color: Qt.alpha(store.themeForeground, 0.62)
-                font.family: "monospace"
+                font.family: panel.fontFamily
                 font.pixelSize: 11
-                font.weight: Font.Medium
+                font.weight: Font.Bold
             }
 
         }

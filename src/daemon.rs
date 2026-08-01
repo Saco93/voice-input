@@ -345,6 +345,7 @@ fn should_capture_agent_context(
 #[derive(Default)]
 struct StopRefinementContext {
     category: RefinementCategory,
+    agent: Option<agent_context::AgentKind>,
     agent_handle: Option<thread::JoinHandle<Option<agent_context::AgentSessionLocator>>>,
 }
 
@@ -375,33 +376,35 @@ fn capture_refinement_context_at_stop(
         );
     }
 
-    if !should_capture_agent_context(cancel, config.llm.enabled, config.llm.agent_context_enabled) {
-        return StopRefinementContext {
-            category,
-            agent_handle: None,
-        };
-    }
-
     let snapshot = match agent_context::capture_focused_agent(&window) {
         Ok(Some(snapshot)) => snapshot,
         Ok(None) => {
             return StopRefinementContext {
                 category,
-                agent_handle: None,
+                ..StopRefinementContext::default()
             };
         }
         Err(_) => {
-            eprintln!("voice-input agent context: focused-session capture failed at stop");
+            eprintln!("voice-input refinement context: focused-agent capture failed at stop");
             return StopRefinementContext {
                 category,
-                agent_handle: None,
+                ..StopRefinementContext::default()
             };
         }
     };
+    let agent = snapshot.agent();
     eprintln!(
-        "voice-input agent context: captured focused {} process at stop",
-        snapshot.agent().label()
+        "voice-input refinement context: captured focused {} destination at stop",
+        agent.label()
     );
+
+    if !should_capture_agent_context(cancel, config.llm.enabled, config.llm.agent_context_enabled) {
+        return StopRefinementContext {
+            category,
+            agent: Some(agent),
+            agent_handle: None,
+        };
+    }
 
     let agent_handle = Some(thread::spawn(
         move || match agent_context::resolve_focused_session(snapshot) {
@@ -418,6 +421,7 @@ fn capture_refinement_context_at_stop(
     ));
     StopRefinementContext {
         category,
+        agent: Some(agent),
         agent_handle,
     }
 }
@@ -1192,6 +1196,7 @@ impl Daemon {
                 &self.config,
                 &raw_transcript,
                 refinement_context.category,
+                refinement_context.agent,
                 agent_reference.as_ref(),
             ) {
                 Ok(value) => {

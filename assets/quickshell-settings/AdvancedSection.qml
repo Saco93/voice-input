@@ -42,13 +42,16 @@ Rectangle {
                     Label {
                         text: root.theme.tr("Advanced")
                         color: root.theme.foreground
+                        font.family: root.theme.fontFamily
                         font.pixelSize: 14
-                        font.weight: Font.DemiBold
+                        font.weight: Font.Black
                     }
 
                     Label {
                         text: root.theme.tr(root.description)
                         color: root.theme.subtle
+                        font.family: root.theme.fontFamily
+                        font.weight: Font.ExtraBold
                         font.pixelSize: 11
                         wrapMode: Text.WordWrap
                         Layout.fillWidth: true
@@ -59,8 +62,9 @@ Rectangle {
                 Label {
                     text: root.theme.tr(root.expanded ? "Hide" : "Show")
                     color: root.theme.accent
+                    font.family: root.theme.fontFamily
                     font.pixelSize: 11
-                    font.weight: Font.Medium
+                    font.weight: Font.ExtraBold
                 }
 
             }

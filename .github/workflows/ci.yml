@@ -46,6 +46,8 @@ jobs:
           make install-hud-assets QSB="$qsb_path" QUICKSHELL_DIR="$stage"
           test -s "$stage/WavyHalo.qml"
           test -s "$stage/shaders/wavy-halo.frag.qsb"
+          test -s "$RUNNER_TEMP/fonts/NotoSansSC-Variable.ttf"
+          test -s "$RUNNER_TEMP/fonts/OFL-NotoSansSC.txt"
           shader_dump=$(qsb --dump "$stage/shaders/wavy-halo.frag.qsb")
           grep -q 'GLSL' <<<"$shader_dump"
           grep -q 'HLSL' <<<"$shader_dump"

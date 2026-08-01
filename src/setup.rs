@@ -255,10 +255,18 @@ pub fn install_systemd_unit() -> Result<()> {
 
     let hud_template = fs::read_to_string(asset_dir.join("voice-input-hud.service"))
         .context("failed to load Voice Input HUD service template")?;
-    let hud_rendered = hud_template.replace(
-        "@VOICE_INPUT_QUICKSHELL_DIR@",
-        &asset_dir.join("quickshell").display().to_string(),
-    );
+    let hud_rendered = hud_template
+        .replace(
+            "@VOICE_INPUT_QUICKSHELL_DIR@",
+            &asset_dir.join("quickshell").display().to_string(),
+        )
+        .replace(
+            "@VOICE_INPUT_FONT_PATH@",
+            &asset_dir
+                .join("fonts/NotoSansSC-Variable.ttf")
+                .display()
+                .to_string(),
+        );
     let hud_target = unit_dir.join("voice-input-hud.service");
     fs::write(&hud_target, hud_rendered)
         .with_context(|| format!("failed to write {}", hud_target.display()))?;

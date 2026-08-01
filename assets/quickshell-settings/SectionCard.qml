@@ -26,8 +26,9 @@ Rectangle {
         Label {
             text: root.theme.tr(root.title)
             color: root.theme.foreground
+            font.family: root.theme.fontFamily
             font.pixelSize: 15
-            font.weight: Font.DemiBold
+            font.weight: Font.Black
             Layout.fillWidth: true
         }
 
@@ -35,6 +36,8 @@ Rectangle {
             visible: root.description.length > 0
             text: root.theme.tr(root.description)
             color: root.theme.subtle
+            font.family: root.theme.fontFamily
+            font.weight: Font.ExtraBold
             font.pixelSize: 11
             lineHeight: 1.2
             wrapMode: Text.WordWrap

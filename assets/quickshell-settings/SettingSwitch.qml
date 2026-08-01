@@ -23,8 +23,9 @@ RowLayout {
         Label {
             text: root.theme.tr(root.label)
             color: root.theme.foreground
+            font.family: root.theme.fontFamily
             font.pixelSize: 12
-            font.weight: Font.Medium
+            font.weight: Font.ExtraBold
             wrapMode: Text.WordWrap
             Layout.fillWidth: true
         }
@@ -33,6 +34,8 @@ RowLayout {
             visible: root.help.length > 0
             text: root.theme.tr(root.help)
             color: root.theme.subtle
+            font.family: root.theme.fontFamily
+            font.weight: Font.ExtraBold
             font.pixelSize: 11
             wrapMode: Text.WordWrap
             Layout.fillWidth: true

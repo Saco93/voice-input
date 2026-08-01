@@ -27,8 +27,9 @@ MenuItem {
             Layout.preferredWidth: 16
             text: root.leadingText
             color: root.checked ? root.theme.accent : root.theme.subtle
+            font.family: root.theme.fontFamily
             font.pixelSize: 12
-            font.weight: Font.DemiBold
+            font.weight: Font.Black
             horizontalAlignment: Text.AlignHCenter
             verticalAlignment: Text.AlignVCenter
         }
@@ -37,8 +38,9 @@ MenuItem {
             Layout.fillWidth: true
             text: root.text
             color: root.enabled ? root.theme.foreground : root.theme.subtle
+            font.family: root.theme.fontFamily
             font.pixelSize: 11
-            font.weight: root.checked ? Font.DemiBold : Font.Normal
+            font.weight: root.checked ? Font.Black : Font.Bold
             elide: Text.ElideRight
             verticalAlignment: Text.AlignVCenter
         }

@@ -11,12 +11,15 @@ Button {
     implicitHeight: 34
     leftPadding: 14
     rightPadding: 14
-    font.weight: primary ? Font.DemiBold : Font.Medium
+    font.family: root.theme.fontFamily
+    font.weight: primary ? Font.Black : Font.ExtraBold
     Accessible.name: root.theme.tr(text)
 
     contentItem: Text {
         text: root.theme.tr(root.text)
         color: root.primary ? root.theme.background : root.theme.foreground
+        font.family: root.theme.fontFamily
+        font.weight: Font.ExtraBold
         font.pixelSize: 11
         horizontalAlignment: Text.AlignHCenter
         verticalAlignment: Text.AlignVCenter
