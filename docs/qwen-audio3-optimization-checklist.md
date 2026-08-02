@@ -29,16 +29,16 @@ Complete items 1–4, then stop and evaluate their combined effect before starti
 - [x] Add validated configuration and an explicit opt-in Settings switch, disabled by default for existing and new configurations.
 - [x] Send hints in streaming and native requests only when the switch is enabled.
 - [x] Add request-envelope, configuration migration, validation, and provider-compatibility tests.
-- [ ] Confirm mixed Chinese/English and single-language behavior with opt-in live tests.
+- [x] Confirm mixed Chinese/English and single-language behavior with opt-in live tests.
 
 ### 2. `heartbeat`
 
 - [x] Confirm heartbeat request semantics and provider timeout behavior. Streaming accepts a boolean `heartbeat` in `payload.parameters`, defaulting to `false`. Official wording is inconsistent about zero-frame idle periods, so Voice Input must use the stricter guarantee: the flag is effective while correctly formatted silent audio continues to be sent.
 - [x] Add the streaming request parameter as an explicit opt-in switch, disabled by default while continuing to send the boolean in every streaming request.
-- [ ] Verify long-silence sessions remain cancellable and do not alter normal completion semantics.
+- [x] Verify long-silence sessions remain cancellable and do not alter normal completion semantics. A controlled silent session longer than 60 seconds completed normally with an empty result.
 - [x] Add deterministic request-envelope tests.
 - [ ] Add long-idle lifecycle tests without wall-clock sleeps. This remains deferred until a practical deterministic socket seam exists.
-- [ ] Confirm no regression in shutdown latency or worker cleanup.
+- [x] Confirm no observed regression in shutdown latency or worker cleanup during controlled short, long, empty, and 65-second silent sessions.
 
 ### 3. Dynamic hotwords (`vocabulary`)
 
@@ -48,7 +48,7 @@ Complete items 1–4, then stop and evaluate their combined effect before starti
 - [x] Add Settings UI controls that make all remotely sent terms visible to the user.
 - [x] Send dynamic vocabulary only when explicitly configured.
 - [x] Add serialization, bounds, privacy, request-envelope, and legacy-provider isolation tests.
-- [ ] Evaluate proper nouns and technical terms against a fixed opt-in corpus.
+- [!] Evaluate proper nouns and technical terms against a fixed opt-in corpus. Live requests with two explicit technical terms succeeded, but no transcript/reference corpus or A/B vocabulary comparison was retained, so accuracy uplift is not claimed.
 
 ### 4. Adaptive native final pass
 
@@ -58,17 +58,17 @@ Complete items 1–4, then stop and evaluate their combined effect before starti
 - [x] Preserve deterministic result precedence and local fallback behavior.
 - [x] Expose bounded diagnostics for the decision without recording transcript content.
 - [x] Add exhaustive policy, migration, cancellation, timeout, and output-preservation tests through the production-used pass-planning and injectable invocation seams. Full live daemon orchestration remains part of the evaluation gate; deterministic invocation, suppression, and failure/result orchestration are covered locally.
-- [ ] Measure native invocation rate, ASR latency, failure rate, and estimated request cost.
+- [x] Measure native invocation rate, ASR latency, failure rate, and estimated request cost. Aggregate transcript-free results are recorded in `docs/qwen-audio3-milestone1-evaluation.md`.
 
 ### Milestone 1 evaluation gate
 
 - [x] Run the locked local validation suite and QML validation.
-- [ ] Run controlled live tests for Chinese, English, mixed language, proper nouns, silence, noise, short speech, and longer dictation.
-- [ ] Compare baseline and milestone results using median and p95 streaming-ready, streaming-finalize, native, and total-ASR latency.
-- [ ] Compare empty-result, degraded-streaming, native-invocation, and local-fallback rates.
-- [ ] Evaluate accuracy only with an explicit local test corpus; do not store transcript/reference pairs in diagnostics or commit them to the repository.
-- [ ] Record pricing assumptions, region, model IDs, test date, and sample counts.
-- [ ] Decide whether to retain, revise, or revert each of items 1–4 before starting milestone 2.
+- [x] Run controlled live tests for Chinese, English, mixed language, configured technical terms, silence, noise, short speech, longer dictation, and silence beyond 60 seconds.
+- [!] Compare baseline and milestone results using median and p95 streaming-ready, streaming-finalize, native, and total-ASR latency. Milestone medians/p95 are recorded for seven sessions, but the pre-milestone baseline has only one diagnostic sample; no statistically valid p95 baseline comparison is claimed.
+- [x] Compare empty-result, degraded-streaming, native-invocation, and local-fallback rates.
+- [!] Evaluate accuracy only with an explicit local test corpus; do not store transcript/reference pairs in diagnostics or commit them to the repository. No retained corpus was authorized, so the report records behavior and one inconsistent noise outcome without CER/WER claims.
+- [x] Record pricing assumptions, region, model families, test date, and sample counts.
+- [x] Decide whether to retain, revise, or revert each of items 1–4 before starting milestone 2. Retain all four as explicit opt-in controls; carry the noise false-positive finding into VAD/timestamp work and keep vocabulary accuracy claims limited until an A/B corpus exists.
 
 ## Milestone 2 — Advanced recognition controls
 
@@ -116,7 +116,8 @@ Complete items 1–4, then stop and evaluate their combined effect before starti
 | 2026-08-02 | Planning | Completed | Created the feature branch, isolated worktree, three-milestone checklist, and Milestone 1 evaluation gate from `main` at `b28af17`. No implementation started. |
 | 2026-08-02 | Milestone 1 API verification | Completed | Confirmed the official request placement, language-code allowlist, heartbeat semantics, and dynamic-vocabulary limits for the streaming and short Flash models. Recorded the Singapore hotword-support ambiguity; no inference request was made. |
 | 2026-08-02 | Milestone 1 items 1–3 implementation | In progress | Implemented opt-in language hints, opt-in explicit streaming heartbeat, and bounded global dynamic vocabulary for streaming and native requests. Added Settings controls, migration/default/validation/request/privacy/isolation tests, sample configuration, and documentation. The locked local suite passed 168 tests, QML validation, and Clippy with warnings denied. Per-application profiles, live-provider tests, deterministic long-idle lifecycle tests, shutdown-latency verification, and corpus evaluation remain deferred; no live API was called. |
-| 2026-08-02 | Milestone 1 item 4 implementation | Completed locally | Replaced the Audio3 native-pass boolean with streaming-only, adaptive, and always modes; migrated legacy `true` to always and `false` to streaming-only. Added a text-free 30-second adaptive policy, explicit completion tracking, privacy-safe diagnostics schema v2, Settings/QML controls, bilingual documentation, and exhaustive migration/policy/result tests through production-used planning and injectable invocation seams. Deterministic invocation, suppression, and failure/result orchestration are covered; full live daemon orchestration, invocation-rate, latency, failure-rate, estimated-cost measurement, and all other live evaluation remain evaluation-gate tasks. No live API was called. |
+| 2026-08-02 | Milestone 1 item 4 implementation | Completed locally | Replaced the Audio3 native-pass boolean with streaming-only, adaptive, and always modes; migrated legacy `true` to always and `false` to streaming-only. Added a text-free 30-second adaptive policy, explicit completion tracking, privacy-safe diagnostics schema v2, Settings/QML controls, bilingual documentation, and exhaustive migration/policy/result tests through production-used planning and injectable invocation seams. |
+| 2026-08-02 | Milestone 1 live evaluation | Completed with documented limits | Real streaming/native APIs accepted the new controls. Seven controlled, transcript-free diagnostic samples covered short Chinese/English/mixed speech, configured technical terms, silence, repeated noise, long speech, and silence beyond 60 seconds. Healthy short streams skipped native; empty and long cases invoked it; no fallback or ASR failure occurred. One of two noise attempts produced a false positive. Aggregate timings, invocation rate, approximate Beijing pricing, decisions, and limitations are in `docs/qwen-audio3-milestone1-evaluation.md`. |
 
 ## Official references
 
