@@ -25,28 +25,29 @@ Complete items 1–4, then stop and evaluate their combined effect before starti
 ### 1. `language_hints`
 
 - [x] Confirm the current official parameter shape, supported codes, and four-language limit. Both streaming and short Flash accept `language_hints` in their `parameters` object; omission preserves automatic detection. Supported codes are `zh en ja ko vi th id ms tl hi ar fr de es pt ru it nl sv da fi no el pl cs hu ro bg hr sk`.
-- [ ] Define how Voice Input language settings map to ASR hints while preserving automatic detection when no hint is configured.
-- [ ] Add validated configuration and Settings UI behavior.
-- [ ] Send hints in streaming and native requests where officially supported.
-- [ ] Add request-envelope, configuration migration, validation, and provider-compatibility tests.
+- [x] Define how Voice Input language settings map to ASR hints when the explicit switch is enabled. English maps to `en`, Simplified/Traditional Chinese to `zh,en`, Japanese to `ja,en`, and Korean to `ko,en`; leaving the switch disabled omits the field and preserves automatic detection.
+- [x] Add validated configuration and an explicit opt-in Settings switch, disabled by default for existing and new configurations.
+- [x] Send hints in streaming and native requests only when the switch is enabled.
+- [x] Add request-envelope, configuration migration, validation, and provider-compatibility tests.
 - [ ] Confirm mixed Chinese/English and single-language behavior with opt-in live tests.
 
 ### 2. `heartbeat`
 
 - [x] Confirm heartbeat request semantics and provider timeout behavior. Streaming accepts a boolean `heartbeat` in `payload.parameters`, defaulting to `false`. Official wording is inconsistent about zero-frame idle periods, so Voice Input must use the stricter guarantee: the flag is effective while correctly formatted silent audio continues to be sent.
-- [ ] Add the streaming request parameter with a safe default.
+- [x] Add the streaming request parameter as an explicit opt-in switch, disabled by default while continuing to send the boolean in every streaming request.
 - [ ] Verify long-silence sessions remain cancellable and do not alter normal completion semantics.
-- [ ] Add deterministic request-envelope and long-idle lifecycle tests.
+- [x] Add deterministic request-envelope tests.
+- [ ] Add long-idle lifecycle tests without wall-clock sleeps. This remains deferred until a practical deterministic socket seam exists.
 - [ ] Confirm no regression in shutdown latency or worker cleanup.
 
 ### 3. Dynamic hotwords (`vocabulary`)
 
 - [x] Confirm term limits, weight range, super-hotword behavior, precedence, and request schema. Streaming and short Flash accept an object mapping term text to integer weight in their `parameters` object. Each request permits at most 2,000 unique terms; weights are `1–5` or exactly `50`, with at most 50 weight-50 terms. A term containing non-ASCII characters is limited to 15 total characters; a pure-ASCII term is limited to 7 space-separated segments. Dynamic `vocabulary` takes precedence over `vocabulary_id` when both are present. Singapore child-workspace support is officially ambiguous, so Milestone 1 treats hotwords as Beijing-confirmed only.
-- [ ] Design bounded global and optional per-application configuration without automatically collecting private text.
-- [ ] Validate and normalize terms locally; define duplicate-term and invalid-weight behavior.
-- [ ] Add Settings UI controls that make all remotely sent terms visible to the user.
-- [ ] Send dynamic vocabulary only when explicitly configured.
-- [ ] Add serialization, bounds, privacy, request-envelope, and legacy-provider isolation tests.
+- [!] Design bounded global and optional per-application configuration without automatically collecting private text. Milestone 1 implements only bounded global entries. Any future profile must exact-match a locally captured application class, override same-named global terms locally, and never send or log the class or title. Focused-window capture is deliberately deferred.
+- [x] Validate and trim terms locally; define duplicate-term and invalid-weight behavior. No normalization beyond trimming is performed.
+- [x] Add Settings UI controls that make all remotely sent terms visible to the user.
+- [x] Send dynamic vocabulary only when explicitly configured.
+- [x] Add serialization, bounds, privacy, request-envelope, and legacy-provider isolation tests.
 - [ ] Evaluate proper nouns and technical terms against a fixed opt-in corpus.
 
 ### 4. Adaptive native final pass
@@ -61,7 +62,7 @@ Complete items 1–4, then stop and evaluate their combined effect before starti
 
 ### Milestone 1 evaluation gate
 
-- [ ] Run the locked local validation suite and QML validation.
+- [x] Run the locked local validation suite and QML validation.
 - [ ] Run controlled live tests for Chinese, English, mixed language, proper nouns, silence, noise, short speech, and longer dictation.
 - [ ] Compare baseline and milestone results using median and p95 streaming-ready, streaming-finalize, native, and total-ASR latency.
 - [ ] Compare empty-result, degraded-streaming, native-invocation, and local-fallback rates.
@@ -114,6 +115,7 @@ Complete items 1–4, then stop and evaluate their combined effect before starti
 | --- | --- | --- | --- |
 | 2026-08-02 | Planning | Completed | Created the feature branch, isolated worktree, three-milestone checklist, and Milestone 1 evaluation gate from `main` at `b28af17`. No implementation started. |
 | 2026-08-02 | Milestone 1 API verification | Completed | Confirmed the official request placement, language-code allowlist, heartbeat semantics, and dynamic-vocabulary limits for the streaming and short Flash models. Recorded the Singapore hotword-support ambiguity; no inference request was made. |
+| 2026-08-02 | Milestone 1 items 1–3 implementation | In progress | Implemented opt-in language hints, opt-in explicit streaming heartbeat, and bounded global dynamic vocabulary for streaming and native requests. Added Settings controls, migration/default/validation/request/privacy/isolation tests, sample configuration, and documentation. The locked local suite passed 168 tests, QML validation, and Clippy with warnings denied. Per-application profiles, live-provider tests, deterministic long-idle lifecycle tests, shutdown-latency verification, and corpus evaluation remain deferred; no live API was called. |
 
 ## Official references
 

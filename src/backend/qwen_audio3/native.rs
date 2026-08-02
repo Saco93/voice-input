@@ -5,7 +5,10 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use reqwest::StatusCode;
 use serde_json::{Value, json};
 
-use crate::{config::Config, http_client};
+use crate::{
+    config::{Audio3VocabularyTerm, Config, Language},
+    http_client,
+};
 
 use super::super::text::apply_script_conversion;
 
@@ -18,7 +21,13 @@ pub(crate) fn transcribe_full_audio(config: &Config, wav_path: &Path) -> Result<
     }
 
     let wav_bytes = read_bounded_wav(wav_path)?;
-    let body = request_body(&audio3.native_model, &wav_bytes)?;
+    let body = request_body(
+        &audio3.native_model,
+        &wav_bytes,
+        config.asr.language,
+        audio3.language_hints_enabled,
+        &audio3.vocabulary,
+    )?;
     let response = http_client::post_json_sanitized(
         audio3.native_endpoint.as_str(),
         audio3.api_key.trim(),
@@ -52,10 +61,16 @@ fn enforce_raw_audio_limit(byte_count: usize) -> Result<()> {
     Ok(())
 }
 
-fn request_body(model: &str, wav_bytes: &[u8]) -> Result<Value> {
+fn request_body(
+    model: &str,
+    wav_bytes: &[u8],
+    language: Language,
+    language_hints_enabled: bool,
+    vocabulary: &[Audio3VocabularyTerm],
+) -> Result<Value> {
     enforce_raw_audio_limit(wav_bytes.len())?;
     let audio_uri = format!("data:audio/wav;base64,{}", STANDARD.encode(wav_bytes));
-    Ok(json!({
+    let mut body = json!({
         "model": model,
         "input": {
             "messages": [{
@@ -72,7 +87,14 @@ fn request_body(model: &str, wav_bytes: &[u8]) -> Result<Value> {
             "format": "wav",
             "sample_rate": "16000"
         }
-    }))
+    });
+    if language_hints_enabled {
+        body["parameters"]["language_hints"] = super::language_hints(language);
+    }
+    if let Some(vocabulary) = super::vocabulary_value(vocabulary) {
+        body["parameters"]["vocabulary"] = vocabulary;
+    }
+    Ok(body)
 }
 
 fn parse_response(status: StatusCode, body: &[u8], config: &Config) -> Result<Option<String>> {
@@ -127,12 +149,19 @@ mod tests {
         MAX_RAW_AUDIO_BYTES, enforce_raw_audio_limit, parse_response, request_body,
         transcribe_full_audio,
     };
-    use crate::config::{Config, Language};
+    use crate::config::{Audio3VocabularyTerm, Config, Language};
 
     #[test]
     fn request_body_matches_official_native_shape_and_data_uri() {
         assert_eq!(
-            request_body("qwen-audio-3.0-asr-flash", b"wav").unwrap(),
+            request_body(
+                "qwen-audio-3.0-asr-flash",
+                b"wav",
+                Language::SimplifiedChinese,
+                true,
+                &[],
+            )
+            .unwrap(),
             json!({
                 "model": "qwen-audio-3.0-asr-flash",
                 "input": {
@@ -148,7 +177,8 @@ mod tests {
                 },
                 "parameters": {
                     "format": "wav",
-                    "sample_rate": "16000"
+                    "sample_rate": "16000",
+                    "language_hints": ["zh", "en"]
                 }
             })
         );
@@ -158,7 +188,40 @@ mod tests {
     fn raw_audio_limit_accepts_ten_mib_and_rejects_one_byte_more() {
         assert!(enforce_raw_audio_limit(MAX_RAW_AUDIO_BYTES).is_ok());
         assert!(enforce_raw_audio_limit(MAX_RAW_AUDIO_BYTES + 1).is_err());
-        assert!(request_body("model", &vec![0; MAX_RAW_AUDIO_BYTES + 1]).is_err());
+        assert!(
+            request_body(
+                "model",
+                &vec![0; MAX_RAW_AUDIO_BYTES + 1],
+                Language::English,
+                false,
+                &[],
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn native_controls_include_vocabulary_only_when_configured_and_never_heartbeat() {
+        let disabled = request_body("model", b"wav", Language::English, false, &[]).unwrap();
+        assert!(disabled["parameters"].get("language_hints").is_none());
+        assert!(disabled["parameters"].get("vocabulary").is_none());
+        assert!(disabled["parameters"].get("heartbeat").is_none());
+
+        let vocabulary = [Audio3VocabularyTerm {
+            term: " Voice Input ".into(),
+            weight: 5,
+        }];
+        let configured =
+            request_body("model", b"wav", Language::Korean, true, &vocabulary).unwrap();
+        assert_eq!(
+            configured["parameters"]["language_hints"],
+            json!(["ko", "en"])
+        );
+        assert_eq!(
+            configured["parameters"]["vocabulary"],
+            json!({"Voice Input": 5})
+        );
+        assert!(configured["parameters"].get("heartbeat").is_none());
     }
 
     #[test]
@@ -290,8 +353,14 @@ mod tests {
         let wav_path = temp.path().join("input.wav");
         std::fs::write(&wav_path, b"wav").unwrap();
         let mut config = Config::default();
-        config.asr.language = Language::English;
+        config.asr.language = Language::Korean;
         config.asr.alibaba_audio3.api_key = "test-bearer-token".into();
+        config.asr.alibaba_audio3.language_hints_enabled = true;
+        config.asr.alibaba_audio3.heartbeat_enabled = true;
+        config.asr.alibaba_audio3.vocabulary = vec![Audio3VocabularyTerm {
+            term: "Voice Input".into(),
+            weight: 5,
+        }];
         config.asr.alibaba_audio3.native_endpoint = endpoint;
         config.asr.alibaba_audio3.native_model = "test-native-model".into();
 
@@ -309,9 +378,23 @@ mod tests {
                 .lines()
                 .any(|line| line.eq_ignore_ascii_case("authorization: Bearer test-bearer-token"))
         );
+        let body: Value = serde_json::from_str(body).unwrap();
+        assert_eq!(body["parameters"]["language_hints"], json!(["ko", "en"]));
+        assert_eq!(body["parameters"]["vocabulary"], json!({"Voice Input": 5}));
+        assert!(body["parameters"].get("heartbeat").is_none());
         assert_eq!(
-            serde_json::from_str::<Value>(body).unwrap(),
-            request_body("test-native-model", b"wav").unwrap()
+            body,
+            request_body(
+                "test-native-model",
+                b"wav",
+                Language::Korean,
+                true,
+                &[Audio3VocabularyTerm {
+                    term: "Voice Input".into(),
+                    weight: 5,
+                }],
+            )
+            .unwrap()
         );
     }
 

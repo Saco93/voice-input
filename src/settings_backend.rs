@@ -812,6 +812,9 @@ mod tests {
                 "experimental_enabled": false,
                 "endpoint": "wss://dashscope.aliyuncs.com/api-ws/v1/inference",
                 "model": "qwen-audio-3.0-asr-flash-streaming",
+                "language_hints_enabled": false,
+                "heartbeat_enabled": false,
+                "vocabulary": [],
                 "native_endpoint": "https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation",
                 "native_model": "qwen-audio-3.0-asr-flash",
                 "native_final_pass_enabled": false,
@@ -832,6 +835,12 @@ mod tests {
             "experimental_enabled": true,
             "endpoint": "wss://audio3.example.test/stream",
             "model": "audio3-stream-test",
+            "language_hints_enabled": true,
+            "heartbeat_enabled": true,
+            "vocabulary": [
+                {"term": "Voice Input", "weight": 5},
+                {"term": "语音输入", "weight": 50}
+            ],
             "native_endpoint": "https://audio3.example.test/native",
             "native_model": "audio3-native-test",
             "native_final_pass_enabled": true,
@@ -866,8 +875,47 @@ mod tests {
             crate::config::AsrProvider::AlibabaQwenAudio3
         );
         assert!(saved.asr.alibaba_audio3.experimental_enabled);
+        assert!(saved.asr.alibaba_audio3.language_hints_enabled);
+        assert!(saved.asr.alibaba_audio3.heartbeat_enabled);
+        assert_eq!(saved.asr.alibaba_audio3.vocabulary.len(), 2);
         assert!(saved.asr.alibaba_audio3.native_final_pass_enabled);
         assert_eq!(saved.asr.alibaba_audio3.native_timeout_ms, 42_000);
+    }
+
+    #[test]
+    fn audio3_vocabulary_validation_response_never_echoes_private_terms() {
+        const SENTINEL: &str = "private-settings-vocabulary-sentinel";
+        let temp = tempfile::tempdir().unwrap();
+        let store = ConfigStore::new(temp.path().join("config.toml"));
+        let loaded = store.load().unwrap();
+        let mut config = serde_json::to_value(&loaded.config).unwrap();
+        config["asr"]["provider"] = json!("alibaba-qwen-audio3");
+        config["asr"]["alibaba_audio3"]["experimental_enabled"] = json!(true);
+        config["asr"]["alibaba_audio3"]["vocabulary"] = json!([
+            {"term": SENTINEL, "weight": 1},
+            {"term": format!(" {SENTINEL} "), "weight": 2}
+        ]);
+        let request = json!({
+            "version": 1,
+            "id": 31,
+            "method": "settings.save",
+            "params": {
+                "revision": loaded.revision,
+                "config": config,
+                "credentials": {},
+                "restart": false
+            }
+        });
+        let response: Value =
+            serde_json::from_slice(&handle_line(request.to_string().as_bytes(), &store)).unwrap();
+
+        assert_eq!(response["ok"], false);
+        assert_eq!(response["error"]["code"], "validation_failed");
+        assert_eq!(
+            response["error"]["fields"]["asr.alibaba_audio3.vocabulary"],
+            "entry 2 duplicates an earlier entry after trimming"
+        );
+        assert!(!response.to_string().contains(SENTINEL));
     }
 
     #[test]

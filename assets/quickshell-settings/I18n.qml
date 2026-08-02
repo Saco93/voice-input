@@ -89,6 +89,7 @@ QtObject {
         "Recognition provider, language, and fallback.": "设置识别提供商、语言和备用方案。",
         "Provider": "提供商",
         "Language": "语言",
+        "When Audio3 language hints are enabled, this selection guides recognition; Chinese, Japanese, and Korean also retain English mixing.": "启用 Audio3 语言提示后，此选项会引导识别；中文、日语和韩语还会保留英语混合识别。",
         "Fallback to local": "失败时使用本地识别",
         "Use local recognition when remote recognition fails.": "远程识别失败时使用本地识别。",
         "Local recognition": "本地识别",
@@ -112,6 +113,13 @@ QtObject {
         "Experimental provider; behavior and API compatibility may change.": "此提供商仍处于实验阶段，其行为和 API 兼容性可能发生变化。",
         "I understand and enable experimental Qwen-Audio-3": "我了解相关风险并启用实验性 Qwen-Audio-3",
         "Selecting the provider does not enable this acknowledgement.": "仅选择此提供商不会自动确认并启用实验功能。",
+        "Enable language hints": "启用语言提示",
+        "Opt in to sending the selected language as an Audio3 recognition hint.": "选择将所选语言作为 Audio3 识别提示发送。",
+        "Enable streaming heartbeat": "启用流式 heartbeat",
+        "Opt in to keeping long silent push-to-talk sessions alive while audio frames continue.": "选择在音频帧持续发送时，使长时间静音的按键说话 session 保持连接。",
+        "Dynamic vocabulary": "动态词汇表",
+        "Optional global Audio3 terms. Enter one JSON object per line with term and weight; weights are 1–5 or 50. Every listed term is sent remotely.": "可选的全局 Audio3 词条。每行输入一个包含 term 和 weight 的 JSON 对象；权重可以是 1–5 或 50。列出的每个词条都会发送给远程服务。",
+        "{\"term\":\"Voice Input\",\"weight\":5}": "{\"term\":\"语音输入\",\"weight\":5}",
         "Enable native final pass": "启用原生最终处理",
         "After streaming, send the complete recording remotely. No words is authoritative unless streaming text is usable; failures keep streaming text or use local fallback.": "流式识别结束后，将完整录音发送给远程服务。流式文本不可用时，无词结果具有最终效力；请求失败时保留可用的流式文本，或使用本地备用识别。",
         "Technical settings for this page.": "此页面的技术设置。",
@@ -232,6 +240,7 @@ QtObject {
         "Settings backend is not running.": "设置后端未运行。",
         "VOICE_INPUT_BIN is not set; cannot start the settings backend.": "未设置 VOICE_INPUT_BIN，无法启动设置后端。",
         "Fix the highlighted numeric fields before continuing.": "请先修正突出显示的数值字段。",
+        "Fix the highlighted fields before continuing.": "请先修正突出显示的字段。",
         "Invalid value.": "值无效。",
         "The settings backend returned malformed JSON.": "设置后端返回了格式错误的 JSON。",
         "The settings backend returned an invalid response.": "设置后端返回了无效响应。",
@@ -357,6 +366,42 @@ QtObject {
         match = source.match(/^Enter a finite number(?: of at least (.+))?\.$/);
         if (match)
             return match[1] === undefined ? "请输入有限数值。" : "请输入不小于 " + match[1] + " 的有限数值。";
+
+        match = source.match(/^Vocabulary line (.+) must be a JSON object with term and weight\.$/);
+        if (match)
+            return "动态词汇表第 " + match[1] + " 行必须是包含 term 和 weight 的 JSON 对象。";
+
+        match = source.match(/^entry (.+) must not contain control characters$/);
+        if (match)
+            return "第 " + match[1] + " 个词条不得包含控制字符";
+
+        match = source.match(/^entry (.+) must not be empty$/);
+        if (match)
+            return "第 " + match[1] + " 个词条不得为空";
+
+        match = source.match(/^entry (.+) must contain at most (.+)$/);
+        if (match)
+            return "第 " + match[1] + " 个词条最多只能包含 " + match[2];
+
+        match = source.match(/^entry (.+) weight must be between 1 and 5 or exactly 50$/);
+        if (match)
+            return "第 " + match[1] + " 个词条的权重必须介于 1 到 5 之间，或恰好为 50";
+
+        match = source.match(/^entry (.+) duplicates an earlier entry after trimming$/);
+        if (match)
+            return "第 " + match[1] + " 个词条去除首尾空白后与前面的词条重复";
+
+        match = source.match(/^must contain at most (.+) configured term bytes$/);
+        if (match)
+            return "配置的词条最多只能包含 " + match[1] + " 字节";
+
+        match = source.match(/^must contain at most (.+) entries with weight 50$/);
+        if (match)
+            return "权重为 50 的词条最多只能有 " + match[1] + " 个";
+
+        match = source.match(/^must contain at most (.+) entries$/);
+        if (match)
+            return "最多只能包含 " + match[1] + " 个词条";
 
         match = source.match(/^must be at most (.+) bytes$/);
         if (match)

@@ -22,7 +22,7 @@ use tungstenite::{
 
 use crate::{
     backend::{ASR_CONTROL_QUEUE_CAPACITY, AsrControl, AsrEvent, AsrSessionHandle, AudioSpec},
-    config::Config,
+    config::{Audio3VocabularyTerm, Config, Language},
     diagnostics::FailureKind,
 };
 
@@ -75,7 +75,15 @@ fn run_session(
     configure_socket(socket.get_mut())?;
     send_json(
         &mut socket,
-        run_task_envelope(&task_id, &audio3.model, spec),
+        run_task_envelope(
+            &task_id,
+            &audio3.model,
+            spec,
+            config.asr.language,
+            audio3.language_hints_enabled,
+            audio3.heartbeat_enabled,
+            &audio3.vocabulary,
+        ),
     )?;
     await_task_started(
         &mut socket,
@@ -316,8 +324,16 @@ fn send_json(socket: &mut Audio3Socket, payload: Value) -> Result<()> {
         .context("failed to send Qwen-Audio-3 websocket event")
 }
 
-fn run_task_envelope(task_id: &str, model: &str, spec: AudioSpec) -> Value {
-    json!({
+fn run_task_envelope(
+    task_id: &str,
+    model: &str,
+    spec: AudioSpec,
+    language: Language,
+    language_hints_enabled: bool,
+    heartbeat_enabled: bool,
+    vocabulary: &[Audio3VocabularyTerm],
+) -> Value {
+    let mut envelope = json!({
         "header": {
             "action": "run-task",
             "task_id": task_id,
@@ -331,10 +347,18 @@ fn run_task_envelope(task_id: &str, model: &str, spec: AudioSpec) -> Value {
             "input": {},
             "parameters": {
                 "format": "pcm",
-                "sample_rate": spec.sample_rate_hz
+                "sample_rate": spec.sample_rate_hz,
+                "heartbeat": heartbeat_enabled
             }
         }
-    })
+    });
+    if language_hints_enabled {
+        envelope["payload"]["parameters"]["language_hints"] = super::language_hints(language);
+    }
+    if let Some(vocabulary) = super::vocabulary_value(vocabulary) {
+        envelope["payload"]["parameters"]["vocabulary"] = vocabulary;
+    }
+    envelope
 }
 
 fn finish_task_envelope(task_id: &str) -> Value {
@@ -557,7 +581,11 @@ mod tests {
 
     use std::sync::mpsc;
 
-    use crate::{backend::AsrEvent, diagnostics::FailureKind};
+    use crate::{
+        backend::AsrEvent,
+        config::{Audio3VocabularyTerm, Language},
+        diagnostics::FailureKind,
+    };
 
     use super::{
         AudioSpec, ServerEvent, TranscriptAssembler, finish_task_envelope, new_task_id,
@@ -585,6 +613,10 @@ mod tests {
                 AudioSpec {
                     sample_rate_hz: 16_000,
                 },
+                Language::SimplifiedChinese,
+                true,
+                true,
+                &[],
             ),
             json!({
                 "header": {
@@ -600,10 +632,68 @@ mod tests {
                     "input": {},
                     "parameters": {
                         "format": "pcm",
-                        "sample_rate": 16_000
+                        "sample_rate": 16_000,
+                        "language_hints": ["zh", "en"],
+                        "heartbeat": true
                     }
                 }
             })
+        );
+    }
+
+    #[test]
+    fn run_task_envelope_sends_explicit_controls_and_omits_empty_vocabulary() {
+        let disabled = run_task_envelope(
+            TASK_ID,
+            "model",
+            AudioSpec {
+                sample_rate_hz: 16_000,
+            },
+            Language::English,
+            false,
+            false,
+            &[],
+        );
+        assert!(
+            disabled["payload"]["parameters"]
+                .get("language_hints")
+                .is_none()
+        );
+        assert_eq!(disabled["payload"]["parameters"]["heartbeat"], false);
+        assert!(
+            disabled["payload"]["parameters"]
+                .get("vocabulary")
+                .is_none()
+        );
+
+        let vocabulary = [
+            Audio3VocabularyTerm {
+                term: " Voice Input ".into(),
+                weight: 5,
+            },
+            Audio3VocabularyTerm {
+                term: "语音输入".into(),
+                weight: 50,
+            },
+        ];
+        let configured = run_task_envelope(
+            TASK_ID,
+            "model",
+            AudioSpec {
+                sample_rate_hz: 16_000,
+            },
+            Language::Japanese,
+            true,
+            true,
+            &vocabulary,
+        );
+        assert_eq!(
+            configured["payload"]["parameters"]["language_hints"],
+            json!(["ja", "en"])
+        );
+        assert_eq!(
+            configured["payload"]["parameters"]["vocabulary"],
+            json!({"Voice Input": 5, "语音输入": 50})
         );
     }
 

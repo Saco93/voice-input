@@ -738,6 +738,21 @@ mod tests {
     }
 
     #[test]
+    fn audio3_vocabulary_terms_never_enter_support_diagnostics() {
+        const SENTINEL: &str = "private-diagnostics-vocabulary-sentinel";
+        let mut config = Config::default();
+        config.asr.provider = AsrProvider::AlibabaQwenAudio3;
+        config.asr.alibaba_audio3.vocabulary = vec![crate::config::Audio3VocabularyTerm {
+            term: SENTINEL.into(),
+            weight: 50,
+        }];
+
+        let payload = SupportPayload::new(&config, None);
+        assert!(!payload.format_text().contains(SENTINEL));
+        assert!(!serde_json::to_string(&payload).unwrap().contains(SENTINEL));
+    }
+
+    #[test]
     fn terminal_session_skips_only_stages_that_were_never_invoked() {
         let mut diagnostics = Diagnostics::inactive();
         diagnostics.start_session(

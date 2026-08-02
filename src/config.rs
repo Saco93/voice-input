@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashSet},
     error::Error,
     fmt, fs,
     io::Write,
@@ -105,11 +105,26 @@ pub struct AlibabaAudio3Config {
     #[serde(default, skip_serializing)]
     pub api_key: String,
     pub model: String,
+    #[serde(default)]
+    pub language_hints_enabled: bool,
+    #[serde(default)]
+    pub heartbeat_enabled: bool,
+    #[serde(default)]
+    pub vocabulary: Vec<Audio3VocabularyTerm>,
     pub native_endpoint: String,
     pub native_model: String,
     pub native_final_pass_enabled: bool,
     pub native_timeout_ms: u64,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Audio3VocabularyTerm {
+    pub term: String,
+    pub weight: i64,
+}
+
+pub const MAX_AUDIO3_VOCABULARY_TERMS: usize = 2_000;
+pub const MAX_AUDIO3_VOCABULARY_BYTES: usize = 256 * 1024;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
@@ -308,6 +323,9 @@ impl Default for Config {
                     endpoint: "wss://dashscope.aliyuncs.com/api-ws/v1/inference".into(),
                     api_key: String::new(),
                     model: "qwen-audio-3.0-asr-flash-streaming".into(),
+                    language_hints_enabled: false,
+                    heartbeat_enabled: false,
+                    vocabulary: Vec::new(),
                     native_endpoint: "https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation".into(),
                     native_model: "qwen-audio-3.0-asr-flash".into(),
                     native_final_pass_enabled: false,
@@ -550,6 +568,9 @@ impl Config {
                 512,
                 false,
             );
+            if let Some(message) = validate_audio3_vocabulary(&self.asr.alibaba_audio3.vocabulary) {
+                fields.insert("asr.alibaba_audio3.vocabulary".into(), message);
+            }
             if self.asr.alibaba_audio3.native_final_pass_enabled {
                 range(
                     &mut fields,
@@ -892,6 +913,65 @@ fn missing_revision() -> String {
     "missing:fnv1a64:cbf29ce484222325".into()
 }
 
+fn validate_audio3_vocabulary(vocabulary: &[Audio3VocabularyTerm]) -> Option<String> {
+    if vocabulary.len() > MAX_AUDIO3_VOCABULARY_TERMS {
+        return Some(format!(
+            "must contain at most {MAX_AUDIO3_VOCABULARY_TERMS} entries"
+        ));
+    }
+    let configured_bytes = vocabulary.iter().fold(0_usize, |total, entry| {
+        total.saturating_add(entry.term.len())
+    });
+    if configured_bytes > MAX_AUDIO3_VOCABULARY_BYTES {
+        return Some(format!(
+            "must contain at most {MAX_AUDIO3_VOCABULARY_BYTES} configured term bytes"
+        ));
+    }
+
+    let mut seen = HashSet::with_capacity(vocabulary.len());
+    let mut weight_50_count = 0_usize;
+    for (index, entry) in vocabulary.iter().enumerate() {
+        let entry_number = index + 1;
+        if entry.term.chars().any(char::is_control) {
+            return Some(format!(
+                "entry {entry_number} must not contain control characters"
+            ));
+        }
+        let term = entry.term.trim();
+        if term.is_empty() {
+            return Some(format!("entry {entry_number} must not be empty"));
+        }
+        if term.is_ascii() {
+            if term.split_whitespace().count() > 7 {
+                return Some(format!(
+                    "entry {entry_number} must contain at most 7 whitespace-separated segments"
+                ));
+            }
+        } else if term.chars().count() > 15 {
+            return Some(format!(
+                "entry {entry_number} must contain at most 15 Unicode characters"
+            ));
+        }
+        if !matches!(entry.weight, 1..=5 | 50) {
+            return Some(format!(
+                "entry {entry_number} weight must be between 1 and 5 or exactly 50"
+            ));
+        }
+        if !seen.insert(term) {
+            return Some(format!(
+                "entry {entry_number} duplicates an earlier entry after trimming"
+            ));
+        }
+        if entry.weight == 50 {
+            weight_50_count += 1;
+        }
+    }
+    if weight_50_count > 50 {
+        return Some("must contain at most 50 entries with weight 50".into());
+    }
+    None
+}
+
 fn validate_text(
     fields: &mut BTreeMap<String, String>,
     field: &str,
@@ -1029,6 +1109,15 @@ impl AsrConfig {
 }
 
 impl Language {
+    pub fn audio3_language_hints(self) -> &'static [&'static str] {
+        match self {
+            Language::English => &["en"],
+            Language::SimplifiedChinese | Language::TraditionalChinese => &["zh", "en"],
+            Language::Japanese => &["ja", "en"],
+            Language::Korean => &["ko", "en"],
+        }
+    }
+
     pub fn asr_code(self) -> &'static str {
         match self {
             Language::English => "en",
@@ -1070,7 +1159,10 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
-    use super::{AsrProvider, Config, ConfigStore, HudPosition, RevisionConflict};
+    use super::{
+        AsrProvider, Audio3VocabularyTerm, Config, ConfigStore, HudPosition, Language,
+        MAX_AUDIO3_VOCABULARY_BYTES, RevisionConflict,
+    };
 
     #[test]
     fn validation_reports_field_map() {
@@ -1205,6 +1297,9 @@ mod tests {
             config.asr.alibaba_audio3.model,
             "qwen-audio-3.0-asr-flash-streaming"
         );
+        assert!(!config.asr.alibaba_audio3.language_hints_enabled);
+        assert!(!config.asr.alibaba_audio3.heartbeat_enabled);
+        assert!(config.asr.alibaba_audio3.vocabulary.is_empty());
         assert_eq!(
             config.asr.alibaba_audio3.native_endpoint,
             "https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation"
@@ -1315,6 +1410,9 @@ model = "legacy-model"
             asr.alibaba_audio3.model,
             "qwen-audio-3.0-asr-flash-streaming"
         );
+        assert!(!asr.alibaba_audio3.language_hints_enabled);
+        assert!(!asr.alibaba_audio3.heartbeat_enabled);
+        assert!(asr.alibaba_audio3.vocabulary.is_empty());
         assert!(!asr.alibaba_audio3.native_final_pass_enabled);
         assert_eq!(asr.alibaba_audio3.native_timeout_ms, 20_000);
     }
@@ -1331,8 +1429,181 @@ native_model = "native-model"
 "#,
         )
         .expect("pre-milestone Audio3 config");
+        assert!(!audio3.language_hints_enabled);
+        assert!(!audio3.heartbeat_enabled);
+        assert!(audio3.vocabulary.is_empty());
         assert!(!audio3.native_final_pass_enabled);
         assert_eq!(audio3.native_timeout_ms, 20_000);
+    }
+
+    #[test]
+    fn config_store_loads_pre_milestone_audio3_controls_as_disabled_and_empty() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("config.toml");
+        fs::write(
+            &path,
+            r#"
+state_file = "auto"
+
+[asr]
+provider = "alibaba-qwen-audio3"
+backend_command = "/usr/bin/voxtype"
+engine = "sensevoice"
+model = ""
+language = "simplified-chinese"
+connect_timeout_ms = 5000
+finalize_timeout_ms = 8000
+fallback_to_local = true
+
+[asr.alibaba_audio3]
+experimental_enabled = true
+endpoint = "wss://dashscope.aliyuncs.com/api-ws/v1/inference"
+model = "qwen-audio-3.0-asr-flash-streaming"
+native_endpoint = "https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation"
+native_model = "qwen-audio-3.0-asr-flash"
+native_final_pass_enabled = false
+native_timeout_ms = 20000
+"#,
+        )
+        .unwrap();
+
+        let audio3 = ConfigStore::new(path)
+            .load()
+            .expect("representative pre-milestone config")
+            .config
+            .asr
+            .alibaba_audio3;
+        assert!(!audio3.language_hints_enabled);
+        assert!(!audio3.heartbeat_enabled);
+        assert!(audio3.vocabulary.is_empty());
+    }
+
+    #[test]
+    fn audio3_language_hints_are_deterministic_and_preserve_english_mixing() {
+        for (language, expected) in [
+            (Language::English, &["en"][..]),
+            (Language::SimplifiedChinese, &["zh", "en"][..]),
+            (Language::TraditionalChinese, &["zh", "en"][..]),
+            (Language::Japanese, &["ja", "en"][..]),
+            (Language::Korean, &["ko", "en"][..]),
+        ] {
+            assert_eq!(language.audio3_language_hints(), expected);
+            assert!(language.audio3_language_hints().len() <= 4);
+        }
+    }
+
+    #[test]
+    fn audio3_vocabulary_serializes_as_typed_entries_and_trims_only_for_identity() {
+        let mut config = Config::default();
+        config.asr.provider = AsrProvider::AlibabaQwenAudio3;
+        config.asr.alibaba_audio3.experimental_enabled = true;
+        config.asr.alibaba_audio3.vocabulary = vec![
+            Audio3VocabularyTerm {
+                term: " Voice Input ".into(),
+                weight: 5,
+            },
+            Audio3VocabularyTerm {
+                term: "语音输入".into(),
+                weight: 50,
+            },
+        ];
+        config.validate().expect("valid dynamic vocabulary");
+
+        let serialized = toml::to_string(&config).unwrap();
+        assert!(serialized.contains("[[asr.alibaba_audio3.vocabulary]]"));
+        let round_trip: Config = toml::from_str(&serialized).unwrap();
+        assert_eq!(
+            round_trip.asr.alibaba_audio3.vocabulary,
+            config.asr.alibaba_audio3.vocabulary
+        );
+    }
+
+    #[test]
+    fn audio3_vocabulary_enforces_term_weight_duplicate_and_super_hotword_limits() {
+        let valid = |term: &str, weight| Audio3VocabularyTerm {
+            term: term.into(),
+            weight,
+        };
+        for (vocabulary, expected) in [
+            (vec![valid("   ", 1)], "entry 1 must not be empty"),
+            (
+                vec![valid("private\tterm", 1)],
+                "entry 1 must not contain control characters",
+            ),
+            (
+                vec![valid("one two three four five six seven eight", 1)],
+                "entry 1 must contain at most 7 whitespace-separated segments",
+            ),
+            (
+                vec![valid("一二三四五六七八九十一二三四五六", 1)],
+                "entry 1 must contain at most 15 Unicode characters",
+            ),
+            (
+                vec![valid("valid", 6)],
+                "entry 1 weight must be between 1 and 5 or exactly 50",
+            ),
+            (
+                vec![valid("same", 1), valid(" same ", 2)],
+                "entry 2 duplicates an earlier entry after trimming",
+            ),
+        ] {
+            let mut config = Config::default();
+            config.asr.provider = AsrProvider::AlibabaQwenAudio3;
+            config.asr.alibaba_audio3.experimental_enabled = true;
+            config.asr.alibaba_audio3.vocabulary = vocabulary;
+            let error = config.validate().expect_err("invalid vocabulary");
+            assert_eq!(error.fields["asr.alibaba_audio3.vocabulary"], expected);
+        }
+
+        let mut config = Config::default();
+        config.asr.provider = AsrProvider::AlibabaQwenAudio3;
+        config.asr.alibaba_audio3.experimental_enabled = true;
+        config.asr.alibaba_audio3.vocabulary = (0..51)
+            .map(|index| valid(&format!("term{index}"), 50))
+            .collect();
+        assert_eq!(
+            config.validate().unwrap_err().fields["asr.alibaba_audio3.vocabulary"],
+            "must contain at most 50 entries with weight 50"
+        );
+
+        config.asr.alibaba_audio3.vocabulary = (0..2_000)
+            .map(|index| valid(&format!("term{index}"), 1))
+            .collect();
+        config.validate().expect("2,000 unique terms are valid");
+        config
+            .asr
+            .alibaba_audio3
+            .vocabulary
+            .push(valid("one-too-many", 1));
+        assert_eq!(
+            config.validate().unwrap_err().fields["asr.alibaba_audio3.vocabulary"],
+            "must contain at most 2000 entries"
+        );
+    }
+
+    #[test]
+    fn audio3_vocabulary_is_bounded_and_validation_errors_do_not_expose_terms() {
+        const SENTINEL: &str = "private-vocabulary-sentinel";
+        let mut config = Config::default();
+        config.asr.provider = AsrProvider::AlibabaQwenAudio3;
+        config.asr.alibaba_audio3.experimental_enabled = true;
+        config.asr.alibaba_audio3.vocabulary = vec![Audio3VocabularyTerm {
+            term: format!("{SENTINEL}{}", "x".repeat(MAX_AUDIO3_VOCABULARY_BYTES)),
+            weight: 1,
+        }];
+        let error = config.validate().expect_err("oversized vocabulary");
+        let formatted = format!("{error}: {:?}", error.fields);
+        assert!(formatted.contains("configured term bytes"));
+        assert!(!formatted.contains(SENTINEL));
+
+        config.asr.provider = AsrProvider::LocalCli;
+        config
+            .validate()
+            .expect("legacy providers ignore Audio3-only vocabulary controls");
+        config.asr.provider = AsrProvider::AlibabaQwenRealtime;
+        config
+            .validate()
+            .expect("Alibaba realtime ignores Audio3-only vocabulary controls");
     }
 
     #[test]
