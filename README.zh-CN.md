@@ -83,7 +83,7 @@ systemctl --user status voice-input.service voice-input-hud.service
 
 提交支持报告时，请使用 `voice-input diagnostics [--format text|json]` 作为标准诊断输出。该命令只提供当前 session 或最近完成的 session，并使用固定字段记录各阶段状态、失败类别、耗时和安全的配置摘要。完成后的摘要会保留到下一次录音开始，并在新录音开始时重置。输出不包含音频、识别或整理后的文本、凭据、tooltip，也不包含 session 历史记录。
 
-请勿把 `voice-input status --extended` 的输出粘贴到报告中。扩展状态用于本地 UI 集成，可能包含当前 transcript 和 tooltip 文本。
+请勿把 `voice-input status` 的输出粘贴到报告中，无论是否使用 `--extended`。状态输出用于本地 UI 集成，可能包含当前或最近一次 transcript 和 tooltip 文本。
 
 ## 实验性 Qwen-Audio-3
 

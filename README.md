@@ -83,7 +83,7 @@ systemctl --user status voice-input.service voice-input-hud.service
 
 Use `voice-input diagnostics [--format text|json]` as the canonical output for support reports. It contains bounded stage status, failure categories, timings, and a safe configuration summary for one session only: the active or most recently completed session. That session summary remains available after completion and is reset when the next recording starts. It contains no audio, recognized or refined text, credentials, tooltips, or session history.
 
-Do not paste `voice-input status --extended` into reports. Extended status is intended for local UI integration and can include the current transcript and tooltip text.
+Do not paste `voice-input status` output into reports, with or without `--extended`. Status output is intended for local UI integration and can include the current or most recent transcript and tooltip text.
 
 ## Experimental Qwen-Audio-3
 
