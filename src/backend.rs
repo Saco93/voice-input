@@ -1,4 +1,5 @@
 mod local_cli;
+mod qwen_audio3;
 mod qwen_batch;
 mod qwen_realtime;
 mod text;
@@ -15,8 +16,12 @@ use std::{
 
 use anyhow::Result;
 
-use crate::config::{AsrProvider, Config};
+use crate::{
+    config::{AsrProvider, Config},
+    diagnostics::FailureKind,
+};
 
+pub(crate) use qwen_audio3::transcribe_full_audio as transcribe_qwen_audio3_full_audio;
 pub use qwen_batch::transcribe_full_audio as transcribe_alibaba_full_audio;
 pub use text::apply_script_conversion;
 
@@ -46,7 +51,8 @@ pub enum AsrEvent {
     Partial { committed: String, unstable: String },
     SegmentFinal { text: String },
     Final { text: String },
-    Error { message: String },
+    Finished,
+    Error { kind: FailureKind },
 }
 
 pub struct AsrSessionHandle {
@@ -66,6 +72,7 @@ pub fn build(config: &Config) -> Box<dyn AsrBackend> {
     match config.asr.provider {
         AsrProvider::LocalCli => Box::new(local_cli::LocalCliBackend::new()),
         AsrProvider::AlibabaQwenRealtime => Box::new(qwen_realtime::QwenRealtimeBackend::new()),
+        AsrProvider::AlibabaQwenAudio3 => Box::new(qwen_audio3::QwenAudio3Backend::new()),
     }
 }
 

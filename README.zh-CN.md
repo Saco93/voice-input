@@ -79,6 +79,27 @@ voice-input status
 systemctl --user status voice-input.service voice-input-hud.service
 ```
 
+## 安全的支持诊断信息
+
+提交支持报告时，请使用 `voice-input diagnostics [--format text|json]` 作为标准诊断输出。该命令只提供当前 session 或最近完成的 session，并使用固定字段记录各阶段状态、失败类别、耗时和安全的配置摘要。完成后的摘要会保留到下一次录音开始，并在新录音开始时重置。输出不包含音频、识别或整理后的文本、凭据、tooltip，也不包含 session 历史记录。
+
+请勿把 `voice-input status` 的输出粘贴到报告中，无论是否使用 `--extended`。状态输出用于本地 UI 集成，可能包含当前或最近一次 transcript 和 tooltip 文本。
+
+## 实验性 Qwen-Audio-3
+
+Qwen-Audio-3 目前作为需要明确启用的实验性提供商使用。该选项默认关闭，稳定安装向导也不会提供它。在 beta 准备期间，明确的实验功能开关以及安装向导不提供该选项都是有意保留的设计。如需试用，请打开 Settings，选择 **Qwen-Audio-3（实验性）**，确认实验功能警告后保存。该提供商与现有 Alibaba 实时识别共用同一份加密凭据。
+
+流式模型负责提供实时文本。用户还可以启用**原生最终处理**：流式识别结束后，程序会把完整录音发送给 `qwen-audio-3.0-asr-flash`。成功的原生 transcript 优先级最高。如果原生服务返回无词结果，并且没有可用的流式 transcript，该结果具有最终效力；如果已有可用的流式 transcript，程序会保留它。原生请求失败时，程序会保留可用的流式文本；仍无可用文本时，可以使用已配置的本地备用识别。原生请求最多接受 10 MiB 的原始 WAV 音频。
+
+开发者可以使用预先录制的 16 kHz、单声道、PCM16 WAV 分别测试两个 API。以下命令不会启动守护进程，也不会把识别文本输入其他应用：
+
+```bash
+voice-input asr stream-test --file sample.wav  # WebSocket 流式识别
+voice-input asr test --file sample.wav         # 原生完整音频识别
+```
+
+两个命令都要求当前配置已经选择并明确启用 Qwen-Audio-3。远程测试会把指定音频发送到配置的 Alibaba endpoint，并且可能产生 API 费用。在该选项仍处于实验阶段时，提供商行为、模型名称、端点兼容性和识别结果都可能发生变化。
+
 ## 主要能力
 
 - 支持中英文混合输入的 Qwen Realtime + Server VAD

@@ -12,6 +12,10 @@ use crate::{
 };
 
 pub fn run_model_wizard(config: &mut Config) -> Result<()> {
+    if config.asr.provider == AsrProvider::AlibabaQwenAudio3 {
+        bail!("model setup is unavailable for the configured ASR provider");
+    }
+
     println!("Voice Input model setup");
     println!();
     println!("Select language:");
@@ -47,6 +51,7 @@ pub fn run_model_wizard(config: &mut Config) -> Result<()> {
         match config.asr.provider {
             AsrProvider::LocalCli => "local-cli",
             AsrProvider::AlibabaQwenRealtime => "alibaba-qwen-realtime",
+            AsrProvider::AlibabaQwenAudio3 => unreachable!("provider was rejected above"),
         }
     );
     io::stdout().flush().ok();
@@ -145,6 +150,7 @@ pub fn run_model_wizard(config: &mut Config) -> Result<()> {
                 value => bail!("unknown fallback choice `{value}`"),
             }
         }
+        AsrProvider::AlibabaQwenAudio3 => unreachable!("provider was rejected above"),
     }
 
     config.save()?;

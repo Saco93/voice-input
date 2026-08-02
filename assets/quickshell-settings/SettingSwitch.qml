@@ -8,6 +8,7 @@ RowLayout {
     required property QtObject theme
     property string label: ""
     property string help: ""
+    property string error: ""
     property bool checked: false
     property bool enabled: true
 
@@ -41,6 +42,18 @@ RowLayout {
             Layout.fillWidth: true
         }
 
+        Label {
+            visible: root.error.length > 0
+            text: root.theme.tr(root.error)
+            color: root.theme.error
+            font.family: root.theme.fontFamily
+            font.weight: Font.ExtraBold
+            font.pixelSize: 11
+            wrapMode: Text.WordWrap
+            Layout.fillWidth: true
+            Accessible.role: Accessible.AlertMessage
+        }
+
     }
 
     Switch {
@@ -64,7 +77,7 @@ RowLayout {
             anchors.fill: parent
             radius: height / 2
             color: control.checked ? root.theme.accent : root.theme.elevated
-            border.color: control.checked ? root.theme.accent : root.theme.border
+            border.color: root.error.length > 0 ? root.theme.error : (control.checked ? root.theme.accent : root.theme.border)
 
             Rectangle {
                 width: 18

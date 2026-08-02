@@ -39,7 +39,7 @@ pub fn transcribe_full_audio(config: &Config, wav_path: &Path) -> Result<Option<
     if config.asr.alibaba.api_key.trim().is_empty() {
         bail!("Alibaba final-pass ASR requires a configured credential");
     }
-    let response = http_client::post_json(
+    let response = http_client::post_json_sanitized(
         endpoint.as_str(),
         config.asr.alibaba.api_key.trim(),
         config.asr.connect_timeout_ms,
@@ -52,11 +52,9 @@ pub fn transcribe_full_audio(config: &Config, wav_path: &Path) -> Result<Option<
 
 fn parse_response(status: StatusCode, body: &[u8], config: &Config) -> Result<Option<String>> {
     if status != StatusCode::OK {
-        bail!(
-            "Alibaba final-pass ASR returned HTTP {}: {}",
-            status.as_u16(),
-            truncate_for_error(&String::from_utf8_lossy(body))
-        );
+        // Provider bodies are untrusted and may contain recognized text or
+        // request details. Retain only the bounded HTTP status.
+        bail!("Alibaba final-pass ASR returned HTTP {}", status.as_u16());
     }
 
     let payload: Value =
@@ -110,15 +108,6 @@ fn resolve_base_url(config: &Config) -> Result<String> {
     Ok(base_url.to_string())
 }
 
-fn truncate_for_error(text: &str) -> String {
-    const MAX_LEN: usize = 240;
-    let mut shortened = text.chars().take(MAX_LEN).collect::<String>();
-    if text.chars().count() > MAX_LEN {
-        shortened.push('…');
-    }
-    shortened
-}
-
 #[cfg(test)]
 mod tests {
     use reqwest::StatusCode;
@@ -156,6 +145,20 @@ mod tests {
             parse_response(StatusCode::OK, response.as_bytes(), &config).expect("transcript"),
             Some("请帮我把 Python JSON API 部署到 Kubernetes。".into())
         );
+    }
+
+    #[test]
+    fn non_ok_response_body_is_not_exposed() {
+        const SENTINEL: &str = "private-batch-response-sentinel";
+        let config = Config::default();
+        let error = parse_response(StatusCode::BAD_GATEWAY, SENTINEL.as_bytes(), &config)
+            .expect_err("non-OK response must fail");
+
+        assert_eq!(
+            error.to_string(),
+            "Alibaba final-pass ASR returned HTTP 502"
+        );
+        assert!(!format!("{error:#}").contains(SENTINEL));
     }
 
     #[test]

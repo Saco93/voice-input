@@ -1,6 +1,7 @@
 use std::{
     fs,
-    path::PathBuf,
+    io::Write,
+    path::Path,
     sync::{
         Arc, Mutex,
         atomic::{AtomicU64, Ordering},
@@ -11,9 +12,11 @@ use std::{
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use tempfile::NamedTempFile;
 
 use crate::{
     config::{Config, HudPosition},
+    diagnostics::Diagnostics,
     paths,
     waveform::WAVEFORM_BAR_COUNT,
 };
@@ -71,6 +74,8 @@ pub struct Snapshot {
     pub output_mode: Option<String>,
     #[serde(default)]
     pub output_driver: Option<String>,
+    #[serde(default)]
+    pub diagnostics: Diagnostics,
     pub error: Option<String>,
     #[serde(default)]
     pub revision: u64,
@@ -110,10 +115,20 @@ impl Snapshot {
             output_target_resolved: None,
             output_mode: None,
             output_driver: None,
+            diagnostics: Diagnostics::inactive(),
             error: None,
             revision: 0,
             updated_at_ms: now_ms(),
         }
+    }
+
+    pub fn idle_preserving_completed_diagnostics(
+        config: &Config,
+        diagnostics: Diagnostics,
+    ) -> Self {
+        let mut snapshot = Self::idle(config);
+        snapshot.diagnostics = diagnostics;
+        snapshot
     }
 
     pub fn as_waybar_json(&self, extended: bool) -> Value {
@@ -146,6 +161,7 @@ impl Snapshot {
             payload["output_target_resolved"] = json!(self.output_target_resolved);
             payload["output_mode"] = json!(self.output_mode);
             payload["output_driver"] = json!(self.output_driver);
+            payload["diagnostics"] = json!(self.diagnostics);
             payload["revision"] = json!(self.revision);
         }
 
@@ -187,8 +203,7 @@ struct StateInner {
 
 impl StateHandle {
     pub fn new(config: Config) -> Result<Self> {
-        fs::create_dir_all(paths::runtime_dir()?)
-            .context("failed to create runtime directory for voice-input")?;
+        make_private_runtime_directory(&paths::runtime_dir()?)?;
         let mut snapshot = Snapshot::idle(&config);
         snapshot.revision = 1;
         let handle = Self {
@@ -250,20 +265,51 @@ impl StateHandle {
         Ok(())
     }
 
-    fn write_snapshot(&self, path: &PathBuf, snapshot: &Snapshot) -> Result<()> {
-        let payload =
-            serde_json::to_vec_pretty(snapshot).context("failed to serialize runtime state")?;
-        let file_name = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .ok_or_else(|| anyhow::anyhow!("state path has no valid file name"))?;
-        let temporary_path = path.with_file_name(format!(".{file_name}.tmp"));
-
-        fs::write(&temporary_path, payload)
-            .with_context(|| format!("failed to write {}", temporary_path.display()))?;
-        fs::rename(&temporary_path, path)
-            .with_context(|| format!("failed to replace {}", path.display()))
+    fn write_snapshot(&self, path: &Path, snapshot: &Snapshot) -> Result<()> {
+        write_snapshot_file(path, snapshot)
     }
+}
+
+fn make_private_runtime_directory(path: &Path) -> Result<()> {
+    fs::create_dir_all(path)
+        .with_context(|| format!("failed to create runtime directory {}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+            .with_context(|| format!("failed to secure runtime directory {}", path.display()))?;
+    }
+    Ok(())
+}
+
+fn write_snapshot_file(path: &Path, snapshot: &Snapshot) -> Result<()> {
+    let payload =
+        serde_json::to_vec_pretty(snapshot).context("failed to serialize runtime state")?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("state path has no parent directory"))?;
+    let mut temporary = NamedTempFile::new_in(parent).with_context(|| {
+        format!(
+            "failed to create temporary state file in {}",
+            parent.display()
+        )
+    })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        temporary
+            .as_file()
+            .set_permissions(fs::Permissions::from_mode(0o600))
+            .context("failed to secure temporary state file")?;
+    }
+    temporary
+        .write_all(&payload)
+        .context("failed to write temporary state file")?;
+    temporary
+        .persist(path)
+        .map_err(|error| error.error)
+        .with_context(|| format!("failed to replace {}", path.display()))?;
+    Ok(())
 }
 
 fn assign_next_revision(snapshot: &mut Snapshot, next_revision: &AtomicU64) {
@@ -292,11 +338,18 @@ fn now_ms() -> u128 {
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::AtomicU64;
+    #[cfg(unix)]
+    use std::{fs, os::unix::fs::PermissionsExt};
 
-    use serde_json::Value;
+    use serde_json::{Value, json};
 
     use super::{Snapshot, assign_next_revision};
-    use crate::config::Config;
+    #[cfg(unix)]
+    use super::{make_private_runtime_directory, write_snapshot_file};
+    use crate::{
+        config::Config,
+        diagnostics::{Diagnostics, FinalPassKind, OverallOutcome, Provider},
+    };
 
     #[test]
     fn snapshot_carries_hud_configuration_in_extended_json() {
@@ -311,7 +364,18 @@ mod tests {
         assert_eq!(extended["hud_height"], 64);
         assert_eq!(extended["recording_started_at_ms"], Value::Null);
         assert_eq!(extended["recording_duration_ms"], 0);
+        assert_eq!(extended["diagnostics"]["schema_version"], 1);
         assert_eq!(extended["revision"], 0);
+
+        assert_eq!(
+            snapshot.as_waybar_json(false),
+            json!({
+                "text": "",
+                "class": "idle",
+                "tooltip": snapshot.tooltip,
+                "icon": "",
+            })
+        );
     }
 
     #[test]
@@ -334,6 +398,7 @@ mod tests {
         object.remove("hud_height");
         object.remove("recording_started_at_ms");
         object.remove("recording_duration_ms");
+        object.remove("diagnostics");
         object.remove("revision");
         let snapshot: Snapshot = serde_json::from_value(Value::Object(object.clone())).unwrap();
         assert!(snapshot.hud_enabled);
@@ -341,7 +406,55 @@ mod tests {
         assert_eq!(snapshot.hud_height, 56);
         assert_eq!(snapshot.recording_started_at_ms, None);
         assert_eq!(snapshot.recording_duration_ms, 0);
+        assert_eq!(snapshot.diagnostics, Diagnostics::inactive());
         assert_eq!(snapshot.revision, 0);
+    }
+
+    #[test]
+    fn idle_helper_preserves_completed_diagnostics() {
+        let mut diagnostics = Diagnostics {
+            schema_version: crate::diagnostics::DIAGNOSTICS_SCHEMA_VERSION,
+            session: Some(crate::diagnostics::SessionDiagnostics::new(
+                91,
+                Provider::AlibabaQwenAudio3,
+                FinalPassKind::QwenAudio3Native,
+                true,
+            )),
+        };
+        diagnostics.session.as_mut().unwrap().asr_outcome = OverallOutcome::Completed;
+
+        let snapshot =
+            Snapshot::idle_preserving_completed_diagnostics(&Config::default(), diagnostics);
+        assert_eq!(
+            snapshot.diagnostics.session.as_ref().unwrap().asr_outcome,
+            OverallOutcome::Completed
+        );
+        assert_eq!(
+            snapshot.diagnostics.session.as_ref().unwrap().session_id,
+            91
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn newly_written_state_file_and_runtime_directory_are_private() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime_dir = temp.path().join("runtime").join("voice-input");
+        make_private_runtime_directory(&runtime_dir).unwrap();
+        let path = runtime_dir.join("state.json");
+        fs::write(&path, b"old state").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o666)).unwrap();
+
+        write_snapshot_file(&path, &Snapshot::idle(&Config::default())).unwrap();
+
+        assert_eq!(
+            fs::metadata(runtime_dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::metadata(path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
     }
 
     #[test]

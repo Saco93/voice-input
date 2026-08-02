@@ -77,9 +77,7 @@ impl AsrBackend for LocalCliBackend {
             .with_context(|| format!("failed to run backend `{}`", config.asr.backend_command))?;
 
         if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let summary = stderr.trim().chars().take(4_096).collect::<String>();
-            bail!("ASR backend failed: {summary}");
+            return Err(failed_backend_output(&output));
         }
 
         let transcript = extract_transcript(&String::from_utf8_lossy(&output.stdout));
@@ -89,6 +87,12 @@ impl AsrBackend for LocalCliBackend {
 
         apply_script_conversion(config.asr.language, &transcript)
     }
+}
+
+fn failed_backend_output(output: &Output) -> anyhow::Error {
+    // stderr can contain recognized speech or provider diagnostics. Keep only
+    // the bounded process status, which is sufficient to categorize failure.
+    anyhow!("ASR backend failed with {}", output.status)
 }
 
 fn local_backend_timeout(config: &Config) -> Duration {
@@ -209,6 +213,19 @@ mod tests {
     fn empty_transcript_marker_survives_error_context() {
         let error = anyhow::Error::new(EmptyTranscriptError).context("local ASR failed");
         assert!(crate::backend::is_empty_transcript_error(&error));
+    }
+
+    #[test]
+    fn failed_backend_stderr_is_not_exposed() {
+        const SENTINEL: &str = "private-local-stderr-sentinel";
+        let output = Command::new("sh")
+            .args(["-c", &format!("printf {SENTINEL} >&2; exit 23")])
+            .output()
+            .unwrap();
+        let error = failed_backend_output(&output);
+
+        assert!(error.to_string().contains("exit status: 23"));
+        assert!(!format!("{error:#}").contains(SENTINEL));
     }
 
     #[test]

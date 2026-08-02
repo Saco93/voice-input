@@ -83,6 +83,15 @@ QtObject {
                     "final_pass_model": "qwen3-asr-flash-2026-02-10",
                     "final_pass_timeout_ms": 20000,
                     "final_pass_enable_itn": false
+                },
+                "alibaba_audio3": {
+                    "experimental_enabled": false,
+                    "endpoint": "wss://dashscope.aliyuncs.com/api-ws/v1/inference",
+                    "model": "qwen-audio-3.0-asr-flash-streaming",
+                    "native_endpoint": "https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation",
+                    "native_model": "qwen-audio-3.0-asr-flash",
+                    "native_final_pass_enabled": false,
+                    "native_timeout_ms": 20000
                 }
             },
             "output": {
@@ -127,6 +136,9 @@ QtObject {
         const safe = clone(config);
         if (safe.asr && safe.asr.alibaba)
             delete safe.asr.alibaba.api_key;
+
+        if (safe.asr && safe.asr.alibaba_audio3)
+            delete safe.asr.alibaba_audio3.api_key;
 
         if (safe.llm)
             delete safe.llm.api_key;
@@ -231,7 +243,8 @@ QtObject {
     }
 
     function fieldNeedsAdvanced(path) {
-        return path === "audio.sample_rate" || path === "audio.partial_interval_ms" || path === "audio.pre_roll_ms" || path === "asr.connect_timeout_ms" || path === "asr.finalize_timeout_ms" || path.indexOf("asr.alibaba.endpoint") === 0 || path.indexOf("asr.alibaba.vad_") === 0 || path.indexOf("asr.alibaba.silence_") === 0 || path.indexOf("asr.alibaba.final_pass_") === 0 || path === "llm.api_base_url" || path === "llm.timeout_ms" || path === "llm.provider_sort" || path === "llm.agent_context_max_chars" || path === "output.type_delay_ms" || path === "output.pre_type_delay_ms" || path === "output.paste_keys" || path === "output.prefer_paste_for_xwayland" || path === "output.xwayland_paste_keys" || path === "hud.margin_bottom" || path === "hud.height" || path === "hud.offset_x" || path === "hud.offset_y" || path === "hud.nudge_step";
+        const audio3Advanced = path.indexOf("asr.alibaba_audio3.") === 0 && path !== "asr.alibaba_audio3.experimental_enabled" && path !== "asr.alibaba_audio3.native_final_pass_enabled";
+        return path === "audio.sample_rate" || path === "audio.partial_interval_ms" || path === "audio.pre_roll_ms" || path === "asr.connect_timeout_ms" || path === "asr.finalize_timeout_ms" || path.indexOf("asr.alibaba.endpoint") === 0 || path.indexOf("asr.alibaba.vad_") === 0 || path.indexOf("asr.alibaba.silence_") === 0 || path.indexOf("asr.alibaba.final_pass_") === 0 || audio3Advanced || path === "llm.api_base_url" || path === "llm.timeout_ms" || path === "llm.provider_sort" || path === "llm.agent_context_max_chars" || path === "output.type_delay_ms" || path === "output.pre_type_delay_ms" || path === "output.paste_keys" || path === "output.prefer_paste_for_xwayland" || path === "output.xwayland_paste_keys" || path === "hud.margin_bottom" || path === "hud.height" || path === "hud.offset_x" || path === "hud.offset_y" || path === "hud.nudge_step";
     }
 
     function errorCountForPage(page) {
@@ -363,7 +376,7 @@ QtObject {
         fieldErrors = ({
         });
         const config = withoutPlaintextSecrets(draft);
-        const unsignedIntegers = [["audio.sample_rate", 1], ["audio.max_duration_secs", 0], ["audio.partial_interval_ms", 0], ["audio.pre_roll_ms", 0], ["asr.connect_timeout_ms", 0], ["asr.finalize_timeout_ms", 0], ["asr.alibaba.silence_duration_ms", 0], ["asr.alibaba.final_pass_timeout_ms", 0], ["output.type_delay_ms", 0], ["output.pre_type_delay_ms", 0], ["llm.timeout_ms", 0], ["llm.agent_context_max_chars", 0]];
+        const unsignedIntegers = [["audio.sample_rate", 1], ["audio.max_duration_secs", 0], ["audio.partial_interval_ms", 0], ["audio.pre_roll_ms", 0], ["asr.connect_timeout_ms", 0], ["asr.finalize_timeout_ms", 0], ["asr.alibaba.silence_duration_ms", 0], ["asr.alibaba.final_pass_timeout_ms", 0], ["asr.alibaba_audio3.native_timeout_ms", 0], ["output.type_delay_ms", 0], ["output.pre_type_delay_ms", 0], ["llm.timeout_ms", 0], ["llm.agent_context_max_chars", 0]];
         const signedIntegers = ["hud.margin_bottom", "hud.height", "hud.offset_x", "hud.offset_y", "hud.nudge_step"];
         let valid = true;
         for (let i = 0; i < unsignedIntegers.length; ++i) valid = asNumber(config, unsignedIntegers[i][0], true, unsignedIntegers[i][1]) && valid

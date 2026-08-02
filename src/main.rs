@@ -5,6 +5,7 @@ mod backend;
 mod config;
 mod credentials;
 mod daemon;
+mod diagnostics;
 mod focused_window;
 mod http_client;
 mod llm;

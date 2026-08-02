@@ -333,7 +333,7 @@ fn settings_get(store: &ConfigStore) -> std::result::Result<Value, ProtocolError
         "credentials": credential_statuses,
         "choices": {
             "hotkey.mode": ["hold", "toggle"],
-            "asr.provider": ["local-cli", "alibaba-qwen-realtime"],
+            "asr.provider": ["local-cli", "alibaba-qwen-realtime", "alibaba-qwen-audio3"],
             "asr.language": ["english", "simplified-chinese", "traditional-chinese", "japanese", "korean"],
             "asr.alibaba.turn_mode": ["server-vad", "manual"],
             "output.mode": ["type", "clipboard", "paste"],
@@ -794,7 +794,7 @@ mod tests {
     }
 
     #[test]
-    fn settings_get_excludes_secrets_and_supplies_defaults() {
+    fn settings_get_excludes_secrets_and_supplies_audio3_choices_and_defaults() {
         let temp = tempfile::tempdir().unwrap();
         let store = ConfigStore::new(temp.path().join("config.toml"));
         let request = json!({"version": 1, "id": 2, "method": "settings.get", "params": {}});
@@ -802,7 +802,102 @@ mod tests {
             serde_json::from_slice(&handle_line(request.to_string().as_bytes(), &store)).unwrap();
         assert_eq!(response["ok"], true);
         assert_eq!(response["result"]["config"]["audio"]["sample_rate"], 16_000);
+        assert_eq!(
+            response["result"]["choices"]["asr.provider"],
+            json!(["local-cli", "alibaba-qwen-realtime", "alibaba-qwen-audio3"])
+        );
+        assert_eq!(
+            response["result"]["config"]["asr"]["alibaba_audio3"],
+            json!({
+                "experimental_enabled": false,
+                "endpoint": "wss://dashscope.aliyuncs.com/api-ws/v1/inference",
+                "model": "qwen-audio-3.0-asr-flash-streaming",
+                "native_endpoint": "https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation",
+                "native_model": "qwen-audio-3.0-asr-flash",
+                "native_final_pass_enabled": false,
+                "native_timeout_ms": 20_000
+            })
+        );
         assert!(!response.to_string().contains("api_key"));
+    }
+
+    #[test]
+    fn audio3_save_round_trip_requires_and_preserves_explicit_gate() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = ConfigStore::new(temp.path().join("config.toml"));
+        let loaded = store.load().unwrap();
+        let mut config = serde_json::to_value(loaded.config).unwrap();
+        config["asr"]["provider"] = json!("alibaba-qwen-audio3");
+        config["asr"]["alibaba_audio3"] = json!({
+            "experimental_enabled": true,
+            "endpoint": "wss://audio3.example.test/stream",
+            "model": "audio3-stream-test",
+            "native_endpoint": "https://audio3.example.test/native",
+            "native_model": "audio3-native-test",
+            "native_final_pass_enabled": true,
+            "native_timeout_ms": 42_000
+        });
+        let request = json!({
+            "version": 1,
+            "id": 3,
+            "method": "settings.save",
+            "params": {
+                "revision": loaded.revision,
+                "config": config,
+                "credentials": {},
+                "restart": false
+            }
+        });
+        let response: Value =
+            serde_json::from_slice(&handle_line(request.to_string().as_bytes(), &store)).unwrap();
+
+        assert_eq!(response["ok"], true);
+        assert_eq!(
+            response["result"]["config"]["asr"]["provider"],
+            "alibaba-qwen-audio3"
+        );
+        assert_eq!(
+            response["result"]["config"]["asr"]["alibaba_audio3"],
+            config["asr"]["alibaba_audio3"]
+        );
+        let saved = store.load().unwrap().config;
+        assert_eq!(
+            saved.asr.provider,
+            crate::config::AsrProvider::AlibabaQwenAudio3
+        );
+        assert!(saved.asr.alibaba_audio3.experimental_enabled);
+        assert!(saved.asr.alibaba_audio3.native_final_pass_enabled);
+        assert_eq!(saved.asr.alibaba_audio3.native_timeout_ms, 42_000);
+    }
+
+    #[test]
+    fn audio3_save_is_rejected_when_experimental_gate_is_false() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = ConfigStore::new(temp.path().join("config.toml"));
+        let loaded = store.load().unwrap();
+        let mut config = serde_json::to_value(loaded.config).unwrap();
+        config["asr"]["provider"] = json!("alibaba-qwen-audio3");
+        let request = json!({
+            "version": 1,
+            "id": 4,
+            "method": "settings.save",
+            "params": {
+                "revision": loaded.revision,
+                "config": config,
+                "credentials": {},
+                "restart": false
+            }
+        });
+        let response: Value =
+            serde_json::from_slice(&handle_line(request.to_string().as_bytes(), &store)).unwrap();
+
+        assert_eq!(response["ok"], false);
+        assert_eq!(response["error"]["code"], "validation_failed");
+        assert_eq!(
+            response["error"]["fields"]["asr.alibaba_audio3.experimental_enabled"],
+            "must be true when the experimental provider is selected"
+        );
+        assert!(!store.path().exists());
     }
 
     #[test]

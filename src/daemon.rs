@@ -19,6 +19,7 @@ use std::{
 use crate::{
     agent_context, backend,
     config::{AsrProvider, Config, HudConfig, HudPosition},
+    diagnostics::{FailureKind, FinalPassKind, OverallOutcome, SelectedResult, StageStatus},
     focused_window::{self, RefinementCategory},
     llm, output, paths,
     state::{Phase, Snapshot, StateHandle},
@@ -35,6 +36,189 @@ const SPEECH_EVENT_GRACE_MS: u64 = 350;
 const CAPTURE_STOP_DRAIN: Duration = Duration::from_millis(120);
 const CONTROL_COMMAND_MAX_BYTES: u64 = 4 * 1024;
 const CONTROL_READ_TIMEOUT: Duration = Duration::from_secs(2);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FullAudioPass {
+    AlibabaCompatible,
+    QwenAudio3Native,
+}
+
+impl FullAudioPass {
+    fn diagnostics_kind(self) -> FinalPassKind {
+        match self {
+            Self::AlibabaCompatible => FinalPassKind::AlibabaCompatible,
+            Self::QwenAudio3Native => FinalPassKind::QwenAudio3Native,
+        }
+    }
+
+    fn selected_result(self) -> SelectedResult {
+        match self {
+            Self::AlibabaCompatible => SelectedResult::AlibabaCompatibleFinal,
+            Self::QwenAudio3Native => SelectedResult::QwenAudio3Native,
+        }
+    }
+}
+
+fn selected_full_audio_pass(config: &Config) -> Option<FullAudioPass> {
+    match config.asr.provider {
+        AsrProvider::AlibabaQwenRealtime if config.asr.alibaba.final_pass_enabled => {
+            Some(FullAudioPass::AlibabaCompatible)
+        }
+        AsrProvider::AlibabaQwenAudio3 if config.asr.alibaba_audio3.native_final_pass_enabled => {
+            Some(FullAudioPass::QwenAudio3Native)
+        }
+        AsrProvider::LocalCli
+        | AsrProvider::AlibabaQwenRealtime
+        | AsrProvider::AlibabaQwenAudio3 => None,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CandidateState {
+    Usable,
+    Empty,
+    Failed,
+    /// A usable realtime result whose worker also reported a failure.
+    Degraded,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResultDecision {
+    Selected(SelectedResult),
+    FallbackNeeded,
+    AuthoritativeEmpty,
+    Failed,
+}
+
+/// Text-free result policy. Transcript values stay in the caller and only
+/// candidate states cross this boundary.
+fn decide_result_source(
+    provider: AsrProvider,
+    final_pass: Option<(FullAudioPass, CandidateState)>,
+    streaming: CandidateState,
+    fallback_enabled: bool,
+    overloaded: bool,
+) -> ResultDecision {
+    if provider == AsrProvider::LocalCli {
+        return match streaming {
+            CandidateState::Usable | CandidateState::Degraded => {
+                ResultDecision::Selected(SelectedResult::LocalPrimary)
+            }
+            CandidateState::Empty => ResultDecision::AuthoritativeEmpty,
+            CandidateState::Failed => ResultDecision::Failed,
+        };
+    }
+
+    let streaming_usable =
+        !overloaded && matches!(streaming, CandidateState::Usable | CandidateState::Degraded);
+    if let Some((pass, final_state)) = final_pass {
+        return match final_state {
+            CandidateState::Usable | CandidateState::Degraded => {
+                ResultDecision::Selected(pass.selected_result())
+            }
+            CandidateState::Empty => {
+                if streaming_usable {
+                    ResultDecision::Selected(SelectedResult::Streaming)
+                } else {
+                    ResultDecision::AuthoritativeEmpty
+                }
+            }
+            CandidateState::Failed => {
+                if streaming_usable {
+                    ResultDecision::Selected(SelectedResult::Streaming)
+                } else if fallback_enabled {
+                    ResultDecision::FallbackNeeded
+                } else {
+                    ResultDecision::Failed
+                }
+            }
+        };
+    }
+
+    if streaming_usable {
+        ResultDecision::Selected(SelectedResult::Streaming)
+    } else if fallback_enabled {
+        ResultDecision::FallbackNeeded
+    } else {
+        ResultDecision::Failed
+    }
+}
+
+fn final_pass_kind(config: &Config) -> FinalPassKind {
+    selected_full_audio_pass(config)
+        .map(FullAudioPass::diagnostics_kind)
+        .unwrap_or(FinalPassKind::None)
+}
+
+fn diagnostics_for_session(config: &Config, session_id: u64) -> crate::diagnostics::Diagnostics {
+    let mut diagnostics = crate::diagnostics::Diagnostics::inactive();
+    diagnostics.start_session(
+        session_id,
+        config.asr.provider.into(),
+        final_pass_kind(config),
+        config.asr.fallback_to_local,
+    );
+    diagnostics
+}
+
+fn elapsed_ms(started_at: Instant) -> u64 {
+    started_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64
+}
+
+fn classify_failure_text(message: &str) -> FailureKind {
+    let message = message.to_ascii_lowercase();
+    if message.contains("timeout") || message.contains("timed out") {
+        FailureKind::Timeout
+    } else if message.contains("rate limit")
+        || message.contains("too many requests")
+        || message.contains("http 429")
+    {
+        FailureKind::RateLimited
+    } else if message.contains("unauthorized")
+        || message.contains("authentication")
+        || message.contains("api key")
+        || message.contains("http 401")
+    {
+        FailureKind::Authentication
+    } else if message.contains("forbidden")
+        || message.contains("permission")
+        || message.contains("http 403")
+    {
+        FailureKind::PermissionDenied
+    } else if message.contains("connect")
+        || message.contains("socket")
+        || message.contains("websocket")
+    {
+        FailureKind::Connection
+    } else if message.contains("protocol") {
+        FailureKind::Protocol
+    } else if message.contains("json")
+        || message.contains("response")
+        || message.contains("transcript")
+    {
+        FailureKind::InvalidResponse
+    } else if message.contains("configuration") || message.contains("configured") {
+        FailureKind::Configuration
+    } else if message.contains("asr backend") || message.contains("local backend") {
+        FailureKind::LocalBackend
+    } else if message.contains("worker") || message.contains("thread") {
+        FailureKind::Worker
+    } else if message.contains("file") || message.contains("read") || message.contains("write") {
+        FailureKind::Io
+    } else {
+        FailureKind::Service
+    }
+}
+
+fn classify_failure(error: &anyhow::Error) -> FailureKind {
+    for cause in error.chain() {
+        let kind = classify_failure_text(&cause.to_string());
+        if kind != FailureKind::Service {
+            return kind;
+        }
+    }
+    FailureKind::Service
+}
 
 pub fn run(config: Config) -> Result<()> {
     let runtime_dir = paths::runtime_dir()?;
@@ -211,8 +395,32 @@ fn handle_control(
     };
 
     if let Err(error) = &result {
+        let failure_kind = classify_failure(error);
         let message = error.to_string();
         let _ = daemon.state.update(|snapshot| {
+            let in_progress_session_id = snapshot
+                .diagnostics
+                .session
+                .as_ref()
+                .filter(|session| session.asr_outcome == OverallOutcome::InProgress)
+                .map(|session| session.session_id);
+            if let Some(session_id) = in_progress_session_id {
+                snapshot.diagnostics.update_session(session_id, |session| {
+                    if matches!(
+                        session.streaming.status,
+                        StageStatus::Pending | StageStatus::InProgress
+                    ) {
+                        session.streaming.status = StageStatus::Failed;
+                        session.streaming.failure_kind = Some(failure_kind);
+                    }
+                });
+                snapshot.diagnostics.finish_session(
+                    session_id,
+                    OverallOutcome::Failed,
+                    SelectedResult::None,
+                    0,
+                );
+            }
             snapshot.phase = Phase::Error;
             snapshot.class = "error".into();
             snapshot.icon = "󰅙".into();
@@ -330,6 +538,17 @@ fn should_drain_capture(cancel: bool, already_stopped: bool) -> bool {
     !cancel && !already_stopped
 }
 
+/// Keeps fallible persistence structurally behind capture shutdown. In
+/// particular, an update error cannot bypass detaching shared capture or
+/// stopping and joining dedicated capture.
+fn update_after_capture_shutdown<T>(
+    shutdown: impl FnOnce() -> Result<()>,
+    update: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    shutdown()?;
+    update()
+}
+
 fn should_capture_focused_window(cancel: bool, llm_enabled: bool) -> bool {
     !cancel && llm_enabled
 }
@@ -436,6 +655,8 @@ struct Daemon {
 }
 
 struct Session {
+    session_id: u64,
+    finalization_started_at: Arc<Mutex<Option<Instant>>>,
     stop_flag: Arc<AtomicBool>,
     cancel_flag: Arc<AtomicBool>,
     realtime_overloaded: Arc<AtomicBool>,
@@ -443,6 +664,7 @@ struct Session {
     output_target_hint: Option<output::OutputTargetHint>,
     asr_packetizer: Option<Arc<Mutex<AsrPacketizer>>>,
     speech_detected: Arc<AtomicBool>,
+    capture_gate: Arc<Mutex<()>>,
     capture_mode: SessionCaptureMode,
     asr_runtime: SessionAsrRuntime,
 }
@@ -479,6 +701,7 @@ struct ActiveCaptureSession {
     asr_ready: Arc<AtomicBool>,
     asr_control_tx: Option<mpsc::SyncSender<backend::AsrControl>>,
     asr_packetizer: Option<Arc<Mutex<AsrPacketizer>>>,
+    capture_gate: Arc<Mutex<()>>,
     waveform_analyzer: Arc<Mutex<WaveformAnalyzer>>,
     waveform: WaveformPublisher,
 }
@@ -606,22 +829,31 @@ impl Daemon {
         if self.session.is_some() {
             return Ok(());
         }
-        if self.config.asr.provider == AsrProvider::AlibabaQwenRealtime
-            && self.config.asr.alibaba.api_key.trim().is_empty()
-        {
-            bail!("Alibaba realtime ASR requires an API key");
+        let remote_api_key = match self.config.asr.provider {
+            AsrProvider::AlibabaQwenRealtime => Some(&self.config.asr.alibaba.api_key),
+            AsrProvider::AlibabaQwenAudio3 => Some(&self.config.asr.alibaba_audio3.api_key),
+            AsrProvider::LocalCli => None,
+        };
+        if remote_api_key.is_some_and(|api_key| api_key.trim().is_empty()) {
+            bail!("Alibaba streaming ASR requires an API key");
         }
 
         let session_id = self.next_session_id.fetch_add(1, Ordering::SeqCst);
+        let asr_started_at = Instant::now();
         let output_target_hint =
             output_target_hint_override.or_else(|| output::detect_output_target_hint().ok());
         let pre_roll_audio = self.capture.seed_audio();
-        let asr_packetizer = (self.config.asr.provider == AsrProvider::AlibabaQwenRealtime)
-            .then(|| Arc::new(Mutex::new(AsrPacketizer::default())));
+        let asr_packetizer = matches!(
+            self.config.asr.provider,
+            AsrProvider::AlibabaQwenRealtime | AsrProvider::AlibabaQwenAudio3
+        )
+        .then(|| Arc::new(Mutex::new(AsrPacketizer::default())));
         let waveform_analyzer = Arc::new(Mutex::new(WaveformAnalyzer::new(
             self.config.audio.sample_rate,
         )));
+        let capture_gate = Arc::new(Mutex::new(()));
         self.waveform.try_reset(session_id);
+        let finalization_started_at = Arc::new(Mutex::new(None));
         let stop_flag = Arc::new(AtomicBool::new(false));
         let cancel_flag = Arc::new(AtomicBool::new(false));
         let automatic_finish_requested = Arc::new(AtomicBool::new(false));
@@ -667,6 +899,7 @@ impl Daemon {
                 output_target_resolved: None,
                 output_mode: None,
                 output_driver: None,
+                diagnostics: diagnostics_for_session(&self.config, session_id),
                 error: None,
                 revision: snapshot.revision,
                 updated_at_ms: snapshot.updated_at_ms,
@@ -686,7 +919,7 @@ impl Daemon {
                 );
                 (None, None, SessionAsrRuntime::Local { partial_handle })
             }
-            AsrProvider::AlibabaQwenRealtime => {
+            AsrProvider::AlibabaQwenRealtime | AsrProvider::AlibabaQwenAudio3 => {
                 let asr = backend::build(&self.config);
                 let session = asr.spawn_session(
                     &self.config,
@@ -706,6 +939,8 @@ impl Daemon {
                     voice_active: voice_active.clone(),
                     speech_detected: speech_detected.clone(),
                     realtime_overloaded: realtime_overloaded.clone(),
+                    asr_started_at,
+                    finalization_started_at: finalization_started_at.clone(),
                     event_rx: session.event_rx,
                 });
                 (
@@ -753,6 +988,7 @@ impl Daemon {
                 asr_ready: asr_ready.clone(),
                 asr_control_tx,
                 asr_packetizer: asr_packetizer.clone(),
+                capture_gate: capture_gate.clone(),
                 waveform_analyzer: waveform_analyzer.clone(),
                 waveform: self.capture.waveform.clone(),
             });
@@ -793,6 +1029,8 @@ impl Daemon {
         };
 
         self.session = Some(Session {
+            session_id,
+            finalization_started_at,
             stop_flag,
             cancel_flag,
             realtime_overloaded,
@@ -800,6 +1038,7 @@ impl Daemon {
             output_target_hint,
             asr_packetizer,
             speech_detected,
+            capture_gate,
             capture_mode,
             asr_runtime,
         });
@@ -863,6 +1102,12 @@ impl Daemon {
         let Some(mut session) = self.session.take() else {
             return Ok(());
         };
+        let session_id = session.session_id;
+        let finalization_started = Instant::now();
+        *session
+            .finalization_started_at
+            .lock()
+            .expect("finalization timer mutex poisoned") = Some(finalization_started);
         let output_target_hint = session.output_target_hint;
         let realtime_overloaded_flag = session.realtime_overloaded.clone();
         let mut realtime_overloaded = realtime_overloaded_flag.load(Ordering::SeqCst);
@@ -873,8 +1118,6 @@ impl Daemon {
                 .then(|| Instant::now() + CAPTURE_STOP_DRAIN);
         let refinement_context =
             capture_refinement_context_at_stop(&self.config, cancel, focused_window_hint);
-        self.state
-            .update(|snapshot| snapshot.stop_recording_clock_at(stopped_at_ms))?;
         // PipeWire capture runs ahead of this control thread. Keep accepting a
         // short post-key interval so samples already buffered in the audio
         // stack, including a final syllable, reach both full-audio and realtime
@@ -884,23 +1127,37 @@ impl Daemon {
         {
             thread::sleep(remaining);
         }
-        if cancel {
-            session.cancel_flag.store(true, Ordering::SeqCst);
-        }
-        session.stop_flag.store(true, Ordering::SeqCst);
-        match session.capture_mode {
-            SessionCaptureMode::Dedicated {
-                mut child,
-                reader_handle,
-            } => {
-                child.kill().ok();
-                let _ = child.wait();
-                join_session_handle(reader_handle, "audio reader")?;
-            }
-            SessionCaptureMode::SharedPreRoll => {
-                self.capture.detach_session();
-            }
-        }
+        update_after_capture_shutdown(
+            || {
+                if cancel {
+                    session.cancel_flag.store(true, Ordering::SeqCst);
+                }
+                session.stop_flag.store(true, Ordering::SeqCst);
+                match session.capture_mode {
+                    SessionCaptureMode::Dedicated {
+                        mut child,
+                        reader_handle,
+                    } => {
+                        child.kill().ok();
+                        let _ = child.wait();
+                        join_session_handle(reader_handle, "audio reader")?;
+                    }
+                    SessionCaptureMode::SharedPreRoll => {
+                        self.capture.detach_session();
+                        let capture_guard = session
+                            .capture_gate
+                            .lock()
+                            .expect("capture gate mutex poisoned");
+                        drop(capture_guard);
+                    }
+                }
+                Ok(())
+            },
+            || {
+                self.state
+                    .update(|snapshot| snapshot.stop_recording_clock_at(stopped_at_ms))
+            },
+        )?;
 
         realtime_overloaded |= realtime_overloaded_flag.load(Ordering::SeqCst);
         if let SessionAsrRuntime::Realtime { backend_handle, .. } = &session.asr_runtime
@@ -955,30 +1212,78 @@ impl Daemon {
             .expect("audio buffer mutex poisoned")
             .clone();
 
-        let raw_transcript = match session.asr_runtime {
+        let (raw_transcript, selected_result) = match session.asr_runtime {
             SessionAsrRuntime::Local { partial_handle } => {
                 join_session_handle(partial_handle, "partial transcriber")?;
 
-                if cancel {
-                    String::new()
+                if cancel || audio.is_empty() {
+                    (String::new(), SelectedResult::None)
                 } else {
-                    if audio.is_empty() {
-                        self.state.update(|snapshot| {
-                            *snapshot = Snapshot::idle(&self.config);
-                            snapshot.tooltip = "Voice Input idle\nNo audio captured".into();
-                        })?;
-                        return Ok(());
-                    }
-
                     self.state.update(|snapshot| {
                         snapshot.phase = Phase::Transcribing;
                         snapshot.class = "transcribing".into();
                         snapshot.icon = "󰔟".into();
                         snapshot.tooltip = "Transcribing…".into();
                         snapshot.bars = PROCESSING_WAVEFORM;
+                        snapshot.diagnostics.update_session(session_id, |session| {
+                            session.local_primary.status = StageStatus::InProgress;
+                            session.local_primary.failure_kind = None;
+                        });
                     })?;
-
-                    self.transcribe_local_audio(&audio)?
+                    let started_at = Instant::now();
+                    let result = self.transcribe_local_audio(&audio);
+                    let latency_ms = elapsed_ms(started_at);
+                    let failure_kind = result.as_ref().err().map(classify_failure);
+                    let _ = self.state.update(|snapshot| {
+                        snapshot.diagnostics.update_session(session_id, |session| {
+                            session.local_primary.latency_ms = Some(latency_ms);
+                            match &result {
+                                Ok(text) if text.trim().is_empty() => {
+                                    session.local_primary.status = StageStatus::Empty;
+                                    session.local_primary.failure_kind = None;
+                                }
+                                Ok(_) => {
+                                    session.local_primary.status = StageStatus::Completed;
+                                    session.local_primary.failure_kind = None;
+                                }
+                                Err(_) => {
+                                    session.local_primary.status = StageStatus::Failed;
+                                    session.local_primary.failure_kind = failure_kind;
+                                }
+                            }
+                        });
+                    });
+                    let text = match result {
+                        Ok(text) => text,
+                        Err(error) => {
+                            self.finish_diagnostics(
+                                session_id,
+                                OverallOutcome::Failed,
+                                SelectedResult::None,
+                                finalization_started,
+                            );
+                            return Err(error);
+                        }
+                    };
+                    let decision = decide_result_source(
+                        AsrProvider::LocalCli,
+                        None,
+                        if text.trim().is_empty() {
+                            CandidateState::Empty
+                        } else {
+                            CandidateState::Usable
+                        },
+                        false,
+                        false,
+                    );
+                    let selected = match decision {
+                        ResultDecision::Selected(selected) => selected,
+                        ResultDecision::AuthoritativeEmpty => SelectedResult::None,
+                        ResultDecision::FallbackNeeded | ResultDecision::Failed => {
+                            unreachable!("local primary policy cannot request fallback")
+                        }
+                    };
+                    (text, selected)
                 }
             }
             SessionAsrRuntime::Realtime {
@@ -1011,127 +1316,248 @@ impl Daemon {
                 realtime_overloaded |= realtime_overloaded_flag.load(Ordering::SeqCst);
 
                 if cancel {
-                    backend_result?;
-                    let _ = event_result?;
-                    String::new()
+                    let join_failure_kind = backend_result
+                        .as_ref()
+                        .err()
+                        .or_else(|| event_result.as_ref().err())
+                        .map(classify_failure);
+                    let _ = self.state.update(|snapshot| {
+                        snapshot.diagnostics.update_session(session_id, |session| {
+                            if session.streaming.status != StageStatus::Failed {
+                                if let Some(failure_kind) = join_failure_kind {
+                                    session.streaming.status = StageStatus::Failed;
+                                    session.streaming.failure_kind = Some(failure_kind);
+                                } else {
+                                    session.streaming.status = StageStatus::Cancelled;
+                                    session.streaming.failure_kind = None;
+                                }
+                            }
+                            session.streaming.finalize_latency_ms =
+                                Some(elapsed_ms(finalization_started));
+                        });
+                    });
+                    (String::new(), SelectedResult::None)
+                } else if audio.is_empty() {
+                    (String::new(), SelectedResult::None)
                 } else {
-                    if audio.is_empty() {
-                        self.state.update(|snapshot| {
-                            *snapshot = Snapshot::idle(&self.config);
-                            snapshot.tooltip = "Voice Input idle\nNo audio captured".into();
-                        })?;
-                        return Ok(());
-                    }
-
-                    if realtime_overloaded
-                        && !self.config.asr.alibaba.final_pass_enabled
-                        && !self.config.asr.fallback_to_local
+                    let full_audio_pass = selected_full_audio_pass(&self.config);
+                    let (streaming_state, remote_transcript, stream_error) = if realtime_overloaded
                     {
-                        bail!(
-                            "realtime audio delivery fell behind and no full-audio recovery is enabled"
-                        );
-                    }
-
-                    let remote_transcript = if realtime_overloaded {
                         let _ = self.state.update(|snapshot| {
                             snapshot.tooltip = "Recovering complete audio…".into();
                         });
-                        None
+                        (
+                            CandidateState::Failed,
+                            None,
+                            Some(anyhow!("realtime audio delivery overloaded")),
+                        )
                     } else {
                         match (backend_result, event_result) {
-                            (Ok(()), Ok(Some(text))) if !text.trim().is_empty() => Some(
-                                backend::apply_script_conversion(self.config.asr.language, &text)?,
+                            (Ok(()), Ok(Some(text))) if !text.trim().is_empty() => (
+                                CandidateState::Usable,
+                                Some(backend::apply_script_conversion(
+                                    self.config.asr.language,
+                                    &text,
+                                )?),
+                                None,
                             ),
-                            (Ok(()), Ok(_)) => None,
-                            (Err(_), Ok(Some(text))) if !text.trim().is_empty() => Some(
-                                backend::apply_script_conversion(self.config.asr.language, &text)?,
+                            (Ok(()), Ok(_)) => (CandidateState::Empty, None, None),
+                            (Err(error), Ok(Some(text))) if !text.trim().is_empty() => (
+                                CandidateState::Degraded,
+                                Some(backend::apply_script_conversion(
+                                    self.config.asr.language,
+                                    &text,
+                                )?),
+                                Some(error),
                             ),
                             (Err(error), Ok(_)) | (Ok(()), Err(error)) => {
-                                if self.config.asr.fallback_to_local {
-                                    let _ = self.state.update(|snapshot| {
-                                        snapshot.tooltip = format!(
-                                            "Realtime ASR failed, falling back locally…\n{error}"
-                                        );
-                                    });
-                                    None
-                                } else {
-                                    return Err(error);
-                                }
+                                (CandidateState::Failed, None, Some(error))
                             }
-                            (Err(error), Err(_)) => {
-                                if self.config.asr.fallback_to_local {
-                                    let _ = self.state.update(|snapshot| {
-                                        snapshot.tooltip = format!(
-                                            "Realtime ASR failed, falling back locally…\n{error}"
-                                        );
-                                    });
-                                    None
-                                } else {
-                                    return Err(error);
-                                }
-                            }
+                            (Err(error), Err(_)) => (CandidateState::Failed, None, Some(error)),
                         }
                     };
+                    let streaming_failure_kind = stream_error.as_ref().map(classify_failure);
+                    let _ = self.state.update(|snapshot| {
+                        snapshot.diagnostics.update_session(session_id, |session| {
+                            let preserve_implicit_degradation = streaming_state
+                                == CandidateState::Usable
+                                && session.streaming.status == StageStatus::Degraded;
+                            if !preserve_implicit_degradation {
+                                session.streaming.status = match streaming_state {
+                                    CandidateState::Usable => StageStatus::Completed,
+                                    CandidateState::Degraded => StageStatus::Degraded,
+                                    CandidateState::Empty => StageStatus::Empty,
+                                    CandidateState::Failed => StageStatus::Failed,
+                                };
+                            }
+                            if !preserve_implicit_degradation {
+                                session.streaming.failure_kind = if realtime_overloaded {
+                                    session
+                                        .streaming
+                                        .failure_kind
+                                        .or(Some(FailureKind::Overloaded))
+                                } else {
+                                    streaming_failure_kind
+                                };
+                            }
+                            session.streaming.finalize_latency_ms =
+                                Some(elapsed_ms(finalization_started));
+                        });
+                    });
 
-                    if self.config.asr.alibaba.final_pass_enabled {
+                    let mut final_text = None;
+                    let mut final_error = None;
+                    let final_state = if let Some(pass) = full_audio_pass {
                         self.state.update(|snapshot| {
                             snapshot.phase = Phase::Transcribing;
                             snapshot.class = "transcribing".into();
                             snapshot.icon = "󰔟".into();
                             snapshot.tooltip = "Retranscribing full audio…".into();
                             snapshot.bars = PROCESSING_WAVEFORM;
+                            snapshot.diagnostics.update_session(session_id, |session| {
+                                session.final_pass.status = StageStatus::InProgress;
+                                session.final_pass.failure_kind = None;
+                            });
                         })?;
-
-                        match self.transcribe_alibaba_full_audio(&audio) {
-                            Ok(Some(text)) => text,
-                            Ok(None) => {
-                                if let Some(text) = remote_transcript {
-                                    // A transcript can arrive during finalization
-                                    // after the pre-Finish speech snapshot.
-                                    text
-                                } else {
-                                    eprintln!(
-                                        "voice-input final ASR: no transcript; cancelling empty dictation"
-                                    );
-                                    String::new()
-                                }
+                        let started_at = Instant::now();
+                        let result = self.transcribe_full_audio(&audio, pass);
+                        let state = match result {
+                            Ok(Some(text)) if !text.trim().is_empty() => {
+                                final_text = Some(text);
+                                CandidateState::Usable
                             }
+                            Ok(_) => CandidateState::Empty,
                             Err(error) => {
-                                if let Some(text) = remote_transcript {
-                                    let _ = self.state.update(|snapshot| {
-                                        snapshot.tooltip = format!(
-                                            "Full-audio retranscription failed, using realtime final text…\n{error}"
-                                        );
-                                    });
-                                    text
-                                } else if self.config.asr.fallback_to_local {
-                                    let _ = self.state.update(|snapshot| {
-                                        snapshot.tooltip = format!(
-                                            "Full-audio retranscription failed, falling back locally…\n{error}"
-                                        );
-                                    });
-                                    self.transcribe_local_audio(&audio)?
-                                } else {
+                                final_error = Some(error);
+                                CandidateState::Failed
+                            }
+                        };
+                        let failure_kind = final_error.as_ref().map(classify_failure);
+                        let _ = self.state.update(|snapshot| {
+                            snapshot.diagnostics.update_session(session_id, |session| {
+                                session.final_pass.status = match state {
+                                    CandidateState::Usable | CandidateState::Degraded => {
+                                        StageStatus::Completed
+                                    }
+                                    CandidateState::Empty => StageStatus::Empty,
+                                    CandidateState::Failed => StageStatus::Failed,
+                                };
+                                session.final_pass.latency_ms = Some(elapsed_ms(started_at));
+                                session.final_pass.failure_kind = failure_kind;
+                            });
+                        });
+                        Some((pass, state))
+                    } else {
+                        None
+                    };
+
+                    let decision = decide_result_source(
+                        self.config.asr.provider,
+                        final_state,
+                        streaming_state,
+                        self.config.asr.fallback_to_local,
+                        realtime_overloaded,
+                    );
+                    match decision {
+                        ResultDecision::Selected(selected)
+                            if selected == SelectedResult::Streaming =>
+                        {
+                            if final_error.is_some() {
+                                let _ = self.state.update(|snapshot| {
+                                    if matches!(snapshot.phase, Phase::Transcribing) {
+                                        snapshot.tooltip =
+                                            "Full-audio ASR failed, using realtime transcript…"
+                                                .into();
+                                    }
+                                });
+                            }
+                            (
+                                remote_transcript.expect("usable streaming candidate"),
+                                selected,
+                            )
+                        }
+                        ResultDecision::Selected(selected) => {
+                            (final_text.expect("usable full-audio candidate"), selected)
+                        }
+                        ResultDecision::FallbackNeeded => {
+                            let recovery_tooltip = if full_audio_pass.is_some() {
+                                "Full-audio ASR failed, falling back locally…"
+                            } else if streaming_state == CandidateState::Failed {
+                                "Realtime ASR failed, falling back locally…"
+                            } else {
+                                "No realtime transcript, falling back locally…"
+                            };
+                            let _ = self.state.update(|snapshot| {
+                                if matches!(snapshot.phase, Phase::Transcribing) {
+                                    snapshot.tooltip = recovery_tooltip.into();
+                                }
+                            });
+                            let text = match self.transcribe_local_fallback(session_id, &audio) {
+                                Ok(text) => text,
+                                Err(error) => {
+                                    self.finish_diagnostics(
+                                        session_id,
+                                        OverallOutcome::Failed,
+                                        SelectedResult::None,
+                                        finalization_started,
+                                    );
                                     return Err(error);
                                 }
-                            }
+                            };
+                            let selected = if text.trim().is_empty() {
+                                SelectedResult::None
+                            } else {
+                                SelectedResult::LocalFallback
+                            };
+                            (text, selected)
                         }
-                    } else if let Some(text) = remote_transcript {
-                        text
-                    } else if self.config.asr.fallback_to_local {
-                        self.transcribe_local_audio(&audio)?
-                    } else {
-                        bail!("Alibaba realtime ASR returned no final transcript");
+                        ResultDecision::AuthoritativeEmpty => (String::new(), SelectedResult::None),
+                        ResultDecision::Failed => {
+                            self.finish_diagnostics(
+                                session_id,
+                                OverallOutcome::Failed,
+                                SelectedResult::None,
+                                finalization_started,
+                            );
+                            if let Some(error) = final_error.or(stream_error) {
+                                return Err(error);
+                            }
+                            bail!("Alibaba realtime ASR returned no final transcript");
+                        }
                     }
                 }
             }
         };
 
         if cancel || raw_transcript.trim().is_empty() {
-            self.state
-                .update(|snapshot| *snapshot = Snapshot::idle(&self.config))?;
+            let outcome = if cancel {
+                OverallOutcome::Cancelled
+            } else {
+                OverallOutcome::Empty
+            };
+            self.finish_diagnostics(
+                session_id,
+                outcome,
+                SelectedResult::None,
+                finalization_started,
+            );
+            self.state.update(|snapshot| {
+                let diagnostics = snapshot.diagnostics.clone();
+                *snapshot =
+                    Snapshot::idle_preserving_completed_diagnostics(&self.config, diagnostics);
+                if !cancel && audio.is_empty() {
+                    snapshot.tooltip = "Voice Input idle\nNo audio captured".into();
+                }
+            })?;
             return Ok(());
         }
+
+        self.finish_diagnostics(
+            session_id,
+            OverallOutcome::Completed,
+            selected_result,
+            finalization_started,
+        );
 
         self.state.update(|snapshot| {
             snapshot.transcript = raw_transcript.clone();
@@ -1251,7 +1677,8 @@ impl Daemon {
                 }
             };
         self.state.update(|snapshot| {
-            *snapshot = Snapshot::idle(&self.config);
+            let diagnostics = snapshot.diagnostics.clone();
+            *snapshot = Snapshot::idle_preserving_completed_diagnostics(&self.config, diagnostics);
             snapshot.transcript = final_transcript.clone();
             snapshot.raw_transcript = Some(raw_transcript.clone());
             snapshot.refined_transcript = Some(final_transcript.clone());
@@ -1274,6 +1701,14 @@ impl Daemon {
     }
 }
 
+fn snapshot_matches_session(snapshot: &Snapshot, session_id: u64) -> bool {
+    snapshot
+        .diagnostics
+        .session
+        .as_ref()
+        .is_some_and(|session| session.session_id == session_id)
+}
+
 fn refresh_recording_readiness(
     state: &StateHandle,
     config: &Config,
@@ -1282,11 +1717,10 @@ fn refresh_recording_readiness(
     asr_ready: bool,
 ) -> Result<()> {
     state.update(|snapshot| {
-        if snapshot.phase == Phase::Idle
-            || snapshot.phase == Phase::Transcribing
-            || snapshot.phase == Phase::Refining
-            || snapshot.phase == Phase::Error
-        {
+        if !snapshot_matches_session(snapshot, session_id) {
+            return;
+        }
+        if !matches!(snapshot.phase, Phase::Arming | Phase::Recording) {
             return;
         }
 
@@ -1407,6 +1841,10 @@ fn run_capture_service(
             .clone();
 
         if let Some(active) = active {
+            let _capture_guard = active
+                .capture_gate
+                .lock()
+                .expect("capture gate mutex poisoned");
             if active.stop_flag.load(Ordering::SeqCst) {
                 continue;
             }
@@ -1596,6 +2034,17 @@ fn mark_realtime_overloaded(
         "voice-input realtime ASR: {log_reason} for session {session_id}; preserving full audio for recovery"
     );
     let _ = state.update(|snapshot| {
+        if !snapshot_matches_session(snapshot, session_id) {
+            return;
+        }
+        snapshot.diagnostics.update_session(session_id, |session| {
+            session.streaming.status = StageStatus::Failed;
+            session.streaming.failure_kind = Some(match enqueue_result {
+                RealtimeAudioEnqueue::Full => FailureKind::Overloaded,
+                RealtimeAudioEnqueue::Disconnected => FailureKind::Worker,
+                RealtimeAudioEnqueue::Sent => return,
+            });
+        });
         if snapshot.phase == Phase::Recording {
             snapshot.tooltip = tooltip.into();
         }
@@ -1732,6 +2181,24 @@ fn spawn_reader_thread(
     })
 }
 
+fn finalize_realtime_events(
+    saw_finished: bool,
+    final_transcript: Option<String>,
+    update_diagnostics: impl FnOnce(StageStatus, Option<FailureKind>) -> Result<()>,
+) -> Option<String> {
+    let has_usable_transcript = final_transcript
+        .as_ref()
+        .is_some_and(|text| !text.trim().is_empty());
+    let (status, failure_kind) = match (saw_finished, has_usable_transcript) {
+        (true, true) => (StageStatus::Completed, None),
+        (true, false) => (StageStatus::Empty, None),
+        (false, true) => (StageStatus::Degraded, Some(FailureKind::Worker)),
+        (false, false) => (StageStatus::Failed, Some(FailureKind::Worker)),
+    };
+    let _ = update_diagnostics(status, failure_kind);
+    final_transcript
+}
+
 struct RealtimeEventThreadContext {
     session_id: u64,
     config: Config,
@@ -1742,6 +2209,8 @@ struct RealtimeEventThreadContext {
     voice_active: Arc<AtomicBool>,
     speech_detected: Arc<AtomicBool>,
     realtime_overloaded: Arc<AtomicBool>,
+    asr_started_at: Instant,
+    finalization_started_at: Arc<Mutex<Option<Instant>>>,
     event_rx: mpsc::Receiver<backend::AsrEvent>,
 }
 
@@ -1759,15 +2228,30 @@ fn spawn_realtime_event_thread(
             voice_active,
             speech_detected,
             realtime_overloaded,
+            asr_started_at,
+            finalization_started_at,
             event_rx,
         } = context;
         let mut final_transcript = None;
         let mut realtime_reconstructing = false;
+        let mut saw_finished = false;
 
         while let Ok(event) = event_rx.recv() {
             match event {
                 backend::AsrEvent::Ready => {
                     asr_ready.store(true, Ordering::SeqCst);
+                    let _ = state.update(|snapshot| {
+                        if snapshot_matches_session(snapshot, session_id) {
+                            snapshot.diagnostics.update_session(session_id, |session| {
+                                if session.streaming.status != StageStatus::Failed {
+                                    session.streaming.status = StageStatus::InProgress;
+                                    session.streaming.failure_kind = None;
+                                }
+                                session.streaming.ready_latency_ms =
+                                    Some(elapsed_ms(asr_started_at));
+                            });
+                        }
+                    });
                     if !realtime_reconstructing {
                         refresh_recording_readiness(
                             &state,
@@ -1786,14 +2270,12 @@ fn spawn_realtime_event_thread(
                     voice_active.store(false, Ordering::Relaxed);
                 }
                 backend::AsrEvent::RealtimeRestarting => {
-                    // Reconstruction is only requested after Server VAD has
-                    // confirmed an active speech segment. Keep stop-time
-                    // full-audio recovery eligible if Stop races the
-                    // replacement before Qwen emits a new speech event.
                     speech_detected.store(true, Ordering::SeqCst);
                     realtime_reconstructing = true;
                     state.update(|snapshot| {
-                        if matches!(snapshot.phase, Phase::Arming | Phase::Recording) {
+                        if snapshot_matches_session(snapshot, session_id)
+                            && matches!(snapshot.phase, Phase::Arming | Phase::Recording)
+                        {
                             snapshot.tooltip = "Realtime reconnecting — recording continues".into();
                         }
                     })?;
@@ -1809,7 +2291,9 @@ fn spawn_realtime_event_thread(
                         true,
                     )?;
                     state.update(|snapshot| {
-                        if matches!(snapshot.phase, Phase::Arming | Phase::Recording) {
+                        if snapshot_matches_session(snapshot, session_id)
+                            && matches!(snapshot.phase, Phase::Arming | Phase::Recording)
+                        {
                             snapshot.tooltip = "Replaying buffered audio…".into();
                         }
                     })?;
@@ -1818,6 +2302,13 @@ fn spawn_realtime_event_thread(
                     speech_detected.store(true, Ordering::SeqCst);
                     realtime_overloaded.store(true, Ordering::SeqCst);
                     state.update(|snapshot| {
+                        if !snapshot_matches_session(snapshot, session_id) {
+                            return;
+                        }
+                        snapshot.diagnostics.update_session(session_id, |session| {
+                            session.streaming.status = StageStatus::Failed;
+                            session.streaming.failure_kind = Some(FailureKind::Overloaded);
+                        });
                         if matches!(snapshot.phase, Phase::Arming | Phase::Recording) {
                             snapshot.tooltip =
                                 "Realtime transcript delayed — recording continues".into();
@@ -1837,9 +2328,11 @@ fn spawn_realtime_event_thread(
                         .lock()
                         .expect("partial transcript mutex poisoned") = transcript.clone();
                     state.update(|snapshot| {
-                        if snapshot.phase == Phase::Arming
-                            || snapshot.phase == Phase::Recording
-                            || snapshot.phase == Phase::Transcribing
+                        if snapshot_matches_session(snapshot, session_id)
+                            && matches!(
+                                snapshot.phase,
+                                Phase::Arming | Phase::Recording | Phase::Transcribing
+                            )
                         {
                             snapshot.transcript = transcript.clone();
                             snapshot.tooltip = if realtime_overloaded.load(Ordering::SeqCst) {
@@ -1868,7 +2361,12 @@ fn spawn_realtime_event_thread(
                         .lock()
                         .expect("partial transcript mutex poisoned") = text.clone();
                     state.update(|snapshot| {
-                        if snapshot.phase != Phase::Idle {
+                        if snapshot_matches_session(snapshot, session_id)
+                            && matches!(
+                                snapshot.phase,
+                                Phase::Arming | Phase::Recording | Phase::Transcribing
+                            )
+                        {
                             snapshot.transcript = text.clone();
                             snapshot.tooltip = if realtime_overloaded.load(Ordering::SeqCst) {
                                 "Realtime transcript delayed — recording continues".into()
@@ -1888,19 +2386,64 @@ fn spawn_realtime_event_thread(
                         .expect("partial transcript mutex poisoned") = text.clone();
                     final_transcript = Some(text.clone());
                     state.update(|snapshot| {
-                        if snapshot.phase != Phase::Idle {
+                        if snapshot_matches_session(snapshot, session_id)
+                            && matches!(
+                                snapshot.phase,
+                                Phase::Arming | Phase::Recording | Phase::Transcribing
+                            )
+                        {
                             snapshot.transcript = text.clone();
                             snapshot.tooltip = text.clone();
                         }
                     })?;
                 }
-                backend::AsrEvent::Error { message } => {
+                backend::AsrEvent::Finished => {
+                    saw_finished = true;
+                    break;
+                }
+                backend::AsrEvent::Error { kind } => {
                     speech_detected.store(true, Ordering::SeqCst);
                     realtime_overloaded.store(true, Ordering::SeqCst);
-                    return Err(anyhow!("Alibaba realtime ASR failed: {message}"));
+                    state.update(|snapshot| {
+                        if snapshot_matches_session(snapshot, session_id) {
+                            snapshot.diagnostics.update_session(session_id, |session| {
+                                session.streaming.status = StageStatus::Failed;
+                                if session.streaming.failure_kind != Some(FailureKind::Overloaded) {
+                                    session.streaming.failure_kind = Some(kind);
+                                }
+                                session.streaming.finalize_latency_ms = finalization_started_at
+                                    .lock()
+                                    .expect("finalization timer mutex poisoned")
+                                    .map(elapsed_ms);
+                            });
+                        }
+                    })?;
+                    return Err(anyhow!("realtime ASR failed ({})", kind.as_str()));
                 }
             }
         }
+
+        let finalize_latency_ms = finalization_started_at
+            .lock()
+            .expect("finalization timer mutex poisoned")
+            .map(elapsed_ms);
+        let final_transcript = finalize_realtime_events(
+            saw_finished,
+            final_transcript,
+            |status, terminal_failure_kind| {
+                state.update(|snapshot| {
+                    if snapshot_matches_session(snapshot, session_id) {
+                        snapshot.diagnostics.update_session(session_id, |session| {
+                            if session.streaming.failure_kind != Some(FailureKind::Overloaded) {
+                                session.streaming.status = status;
+                                session.streaming.failure_kind = terminal_failure_kind;
+                            }
+                            session.streaming.finalize_latency_ms = finalize_latency_ms;
+                        });
+                    }
+                })
+            },
+        );
 
         Ok(final_transcript)
     })
@@ -1944,7 +2487,9 @@ fn spawn_partial_thread(
                     .lock()
                     .expect("partial transcript mutex poisoned") = transcript.clone();
                 state.update(|snapshot| {
-                    if snapshot.phase == Phase::Recording {
+                    if snapshot_matches_session(snapshot, session_id)
+                        && snapshot.phase == Phase::Recording
+                    {
                         snapshot.transcript = transcript.clone();
                         snapshot.tooltip = transcript.clone();
                         snapshot.text = format!("session-{session_id}");
@@ -1981,11 +2526,68 @@ fn truncate_for_tooltip(text: &str) -> String {
 }
 
 impl Daemon {
-    fn transcribe_alibaba_full_audio(&self, audio: &[i16]) -> Result<Option<String>> {
+    fn finish_diagnostics(
+        &self,
+        session_id: u64,
+        outcome: OverallOutcome,
+        selected_result: SelectedResult,
+        finalization_started: Instant,
+    ) {
+        let _ = self.state.update(|snapshot| {
+            snapshot.diagnostics.finish_session(
+                session_id,
+                outcome,
+                selected_result,
+                elapsed_ms(finalization_started),
+            );
+        });
+    }
+
+    fn transcribe_local_fallback(&self, session_id: u64, audio: &[i16]) -> Result<String> {
+        let started_at = Instant::now();
+        let _ = self.state.update(|snapshot| {
+            snapshot.diagnostics.update_session(session_id, |session| {
+                session.local_fallback.status = StageStatus::InProgress;
+                session.local_fallback.failure_kind = None;
+            });
+        });
+        let result = self.transcribe_local_audio(audio);
+        let latency_ms = elapsed_ms(started_at);
+        let failure_kind = result.as_ref().err().map(classify_failure);
+        let _ = self.state.update(|snapshot| {
+            snapshot.diagnostics.update_session(session_id, |session| {
+                session.local_fallback.latency_ms = Some(latency_ms);
+                match &result {
+                    Ok(text) if text.trim().is_empty() => {
+                        session.local_fallback.status = StageStatus::Empty;
+                        session.local_fallback.failure_kind = None;
+                    }
+                    Ok(_) => {
+                        session.local_fallback.status = StageStatus::Completed;
+                        session.local_fallback.failure_kind = None;
+                    }
+                    Err(_) => {
+                        session.local_fallback.status = StageStatus::Failed;
+                        session.local_fallback.failure_kind = failure_kind;
+                    }
+                }
+            });
+        });
+        result
+    }
+
+    fn transcribe_full_audio(&self, audio: &[i16], pass: FullAudioPass) -> Result<Option<String>> {
         let temp_file = tempfile::NamedTempFile::new()
-            .context("failed to create WAV temp file for Alibaba full-audio retranscription")?;
+            .context("failed to create WAV temp file for full-audio retranscription")?;
         wav::write_pcm16_wav(temp_file.path(), self.config.audio.sample_rate, audio)?;
-        backend::transcribe_alibaba_full_audio(&self.config, temp_file.path())
+        match pass {
+            FullAudioPass::AlibabaCompatible => {
+                backend::transcribe_alibaba_full_audio(&self.config, temp_file.path())
+            }
+            FullAudioPass::QwenAudio3Native => {
+                backend::transcribe_qwen_audio3_full_audio(&self.config, temp_file.path())
+            }
+        }
     }
 
     fn transcribe_local_audio(&self, audio: &[i16]) -> Result<String> {
@@ -2006,6 +2608,47 @@ mod tests {
     use std::io::Cursor;
 
     use super::*;
+
+    #[test]
+    fn full_audio_pass_selection_keeps_providers_independent() {
+        let mut config = Config::default();
+        assert_eq!(selected_full_audio_pass(&config), None);
+
+        config.asr.provider = AsrProvider::AlibabaQwenRealtime;
+        config.asr.alibaba.final_pass_enabled = true;
+        assert_eq!(
+            selected_full_audio_pass(&config),
+            Some(FullAudioPass::AlibabaCompatible)
+        );
+
+        config.asr.provider = AsrProvider::AlibabaQwenAudio3;
+        assert_eq!(selected_full_audio_pass(&config), None);
+        config.asr.alibaba_audio3.native_final_pass_enabled = true;
+        assert_eq!(
+            selected_full_audio_pass(&config),
+            Some(FullAudioPass::QwenAudio3Native)
+        );
+
+        config.asr.provider = AsrProvider::AlibabaQwenRealtime;
+        config.asr.alibaba.final_pass_enabled = false;
+        assert_eq!(selected_full_audio_pass(&config), None);
+    }
+
+    #[test]
+    fn sanitized_backend_errors_map_to_bounded_failure_categories() {
+        assert_eq!(
+            classify_failure_text("ASR backend failed with exit status: 23"),
+            FailureKind::LocalBackend
+        );
+        assert_eq!(
+            classify_failure_text("Qwen-Audio-3 native ASR returned HTTP 401"),
+            FailureKind::Authentication
+        );
+        assert_eq!(
+            classify_failure_text("Alibaba final-pass ASR returned HTTP 429"),
+            FailureKind::RateLimited
+        );
+    }
 
     #[test]
     fn control_commands_are_bounded_and_require_utf8() {
@@ -2061,6 +2704,32 @@ mod tests {
     }
 
     #[test]
+    fn state_failure_cannot_bypass_logical_capture_shutdown() {
+        let capture_attached = AtomicBool::new(true);
+        let remote_delivery_running = AtomicBool::new(true);
+        let update_attempted = AtomicBool::new(false);
+
+        let result = update_after_capture_shutdown(
+            || {
+                capture_attached.store(false, Ordering::SeqCst);
+                remote_delivery_running.store(false, Ordering::SeqCst);
+                Ok(())
+            },
+            || {
+                update_attempted.store(true, Ordering::SeqCst);
+                assert!(!capture_attached.load(Ordering::SeqCst));
+                assert!(!remote_delivery_running.load(Ordering::SeqCst));
+                Err::<(), _>(anyhow!("injected state persistence failure"))
+            },
+        );
+
+        assert!(result.is_err());
+        assert!(update_attempted.load(Ordering::SeqCst));
+        assert!(!capture_attached.load(Ordering::SeqCst));
+        assert!(!remote_delivery_running.load(Ordering::SeqCst));
+    }
+
+    #[test]
     fn focused_window_and_agent_capture_have_independent_policies() {
         assert!(should_capture_focused_window(false, true));
         assert!(!should_capture_focused_window(true, true));
@@ -2105,5 +2774,277 @@ mod tests {
             try_enqueue_realtime_audio(&sender, vec![5, 6]),
             RealtimeAudioEnqueue::Disconnected
         );
+    }
+
+    #[test]
+    fn recording_diagnostics_use_actual_session_configuration_and_replace_old_data() {
+        let mut config = Config::default();
+        config.asr.provider = AsrProvider::AlibabaQwenAudio3;
+        config.asr.alibaba_audio3.native_final_pass_enabled = true;
+        config.asr.fallback_to_local = true;
+
+        let mut diagnostics = diagnostics_for_session(&config, 40);
+        diagnostics.finish_session(40, OverallOutcome::Failed, SelectedResult::None, 7);
+        diagnostics = diagnostics_for_session(&config, 41);
+
+        let session = diagnostics.session.unwrap();
+        assert_eq!(session.session_id, 41);
+        assert_eq!(
+            session.provider,
+            crate::diagnostics::Provider::AlibabaQwenAudio3
+        );
+        assert_eq!(session.final_pass.kind, FinalPassKind::QwenAudio3Native);
+        assert_eq!(session.local_fallback.status, StageStatus::Pending);
+        assert_eq!(session.asr_outcome, OverallOutcome::InProgress);
+    }
+
+    #[test]
+    fn stale_worker_snapshot_update_is_rejected_by_session_guard() {
+        let mut snapshot = Snapshot::idle(&Config::default());
+        snapshot.diagnostics = diagnostics_for_session(&Config::default(), 52);
+        snapshot.transcript = "new session".into();
+
+        if snapshot_matches_session(&snapshot, 51) {
+            snapshot.transcript = "stale worker".into();
+        }
+
+        assert_eq!(snapshot.transcript, "new session");
+        assert!(snapshot_matches_session(&snapshot, 52));
+    }
+
+    #[test]
+    fn old_alibaba_final_then_channel_close_keeps_usable_transcript() {
+        let observed = std::cell::Cell::new(None);
+        let transcript = finalize_realtime_events(
+            false,
+            Some("usable final".into()),
+            |status, failure_kind| {
+                observed.set(Some((status, failure_kind)));
+                Err(anyhow!("injected diagnostics persistence failure"))
+            },
+        );
+
+        assert_eq!(transcript.as_deref(), Some("usable final"));
+        assert_eq!(
+            observed.get(),
+            Some((StageStatus::Degraded, Some(FailureKind::Worker)))
+        );
+    }
+
+    #[test]
+    fn native_final_policy_is_table_driven_and_fallback_exact() {
+        let final_states = [
+            CandidateState::Usable,
+            CandidateState::Empty,
+            CandidateState::Failed,
+        ];
+        let streaming_states = [
+            CandidateState::Usable,
+            CandidateState::Empty,
+            CandidateState::Failed,
+            CandidateState::Degraded,
+        ];
+
+        for final_state in final_states {
+            for streaming_state in streaming_states {
+                for fallback_enabled in [false, true] {
+                    let decision = decide_result_source(
+                        AsrProvider::AlibabaQwenAudio3,
+                        Some((FullAudioPass::QwenAudio3Native, final_state)),
+                        streaming_state,
+                        fallback_enabled,
+                        false,
+                    );
+                    let streaming_usable = matches!(
+                        streaming_state,
+                        CandidateState::Usable | CandidateState::Degraded
+                    );
+                    let expected = match final_state {
+                        CandidateState::Usable => {
+                            ResultDecision::Selected(SelectedResult::QwenAudio3Native)
+                        }
+                        CandidateState::Empty if streaming_usable => {
+                            ResultDecision::Selected(SelectedResult::Streaming)
+                        }
+                        CandidateState::Empty => ResultDecision::AuthoritativeEmpty,
+                        CandidateState::Failed if streaming_usable => {
+                            ResultDecision::Selected(SelectedResult::Streaming)
+                        }
+                        CandidateState::Failed if fallback_enabled => {
+                            ResultDecision::FallbackNeeded
+                        }
+                        CandidateState::Failed => ResultDecision::Failed,
+                        CandidateState::Degraded => unreachable!(),
+                    };
+                    assert_eq!(decision, expected);
+                    assert_eq!(
+                        matches!(decision, ResultDecision::FallbackNeeded),
+                        final_state == CandidateState::Failed
+                            && !streaming_usable
+                            && fallback_enabled
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn policy_covers_overload_compatible_pass_disabled_pass_and_local_primary() {
+        for (final_state, fallback_enabled, expected) in [
+            (
+                CandidateState::Usable,
+                false,
+                ResultDecision::Selected(SelectedResult::QwenAudio3Native),
+            ),
+            (
+                CandidateState::Empty,
+                true,
+                ResultDecision::AuthoritativeEmpty,
+            ),
+            (CandidateState::Failed, true, ResultDecision::FallbackNeeded),
+            (CandidateState::Failed, false, ResultDecision::Failed),
+        ] {
+            assert_eq!(
+                decide_result_source(
+                    AsrProvider::AlibabaQwenAudio3,
+                    Some((FullAudioPass::QwenAudio3Native, final_state)),
+                    CandidateState::Usable,
+                    fallback_enabled,
+                    true,
+                ),
+                expected
+            );
+        }
+        for (final_state, streaming, expected) in [
+            (
+                CandidateState::Usable,
+                CandidateState::Failed,
+                ResultDecision::Selected(SelectedResult::AlibabaCompatibleFinal),
+            ),
+            (
+                CandidateState::Failed,
+                CandidateState::Degraded,
+                ResultDecision::Selected(SelectedResult::Streaming),
+            ),
+            (
+                CandidateState::Empty,
+                CandidateState::Failed,
+                ResultDecision::AuthoritativeEmpty,
+            ),
+        ] {
+            assert_eq!(
+                decide_result_source(
+                    AsrProvider::AlibabaQwenRealtime,
+                    Some((FullAudioPass::AlibabaCompatible, final_state)),
+                    streaming,
+                    false,
+                    false,
+                ),
+                expected
+            );
+        }
+        for streaming in [CandidateState::Empty, CandidateState::Failed] {
+            assert_eq!(
+                decide_result_source(AsrProvider::AlibabaQwenAudio3, None, streaming, true, false,),
+                ResultDecision::FallbackNeeded
+            );
+            assert_eq!(
+                decide_result_source(
+                    AsrProvider::AlibabaQwenAudio3,
+                    None,
+                    streaming,
+                    false,
+                    false,
+                ),
+                ResultDecision::Failed
+            );
+        }
+        assert_eq!(
+            decide_result_source(
+                AsrProvider::LocalCli,
+                None,
+                CandidateState::Usable,
+                true,
+                false,
+            ),
+            ResultDecision::Selected(SelectedResult::LocalPrimary)
+        );
+    }
+
+    #[test]
+    fn degraded_streaming_can_be_the_selected_result() {
+        let mut diagnostics = crate::diagnostics::Diagnostics::inactive();
+        diagnostics.start_session(
+            26,
+            crate::diagnostics::Provider::AlibabaQwenRealtime,
+            FinalPassKind::None,
+            false,
+        );
+        diagnostics.update_session(26, |session| {
+            session.streaming.status = StageStatus::Degraded;
+            session.streaming.failure_kind = Some(FailureKind::Worker);
+        });
+        diagnostics.finish_session(26, OverallOutcome::Completed, SelectedResult::Streaming, 9);
+
+        let session = diagnostics.session.unwrap();
+        assert_eq!(session.asr_outcome, OverallOutcome::Completed);
+        assert_eq!(session.streaming.status, StageStatus::Degraded);
+        assert_eq!(session.streaming.failure_kind, Some(FailureKind::Worker));
+        assert_eq!(session.selected_result, SelectedResult::Streaming);
+    }
+
+    #[test]
+    fn representative_audio3_streaming_then_native_diagnostics_are_bounded() {
+        let mut diagnostics = crate::diagnostics::Diagnostics::inactive();
+        diagnostics.start_session(
+            27,
+            crate::diagnostics::Provider::AlibabaQwenAudio3,
+            FinalPassKind::QwenAudio3Native,
+            true,
+        );
+        diagnostics.update_session(27, |session| {
+            session.streaming.status = StageStatus::Completed;
+            session.streaming.ready_latency_ms = Some(5);
+            session.streaming.finalize_latency_ms = Some(8);
+            session.final_pass.status = StageStatus::Completed;
+            session.final_pass.latency_ms = Some(13);
+        });
+        diagnostics.finish_session(
+            27,
+            OverallOutcome::Completed,
+            SelectedResult::QwenAudio3Native,
+            21,
+        );
+
+        let session = diagnostics.session.unwrap();
+        assert_eq!(session.asr_outcome, OverallOutcome::Completed);
+        assert_eq!(session.selected_result, SelectedResult::QwenAudio3Native);
+        assert_eq!(session.local_fallback.status, StageStatus::Skipped);
+        let json = serde_json::to_string(&session).unwrap();
+        assert!(!json.contains("transcript"));
+        assert!(!json.contains("endpoint"));
+        assert!(!json.contains("model"));
+    }
+
+    #[test]
+    fn cancellation_no_audio_and_error_have_terminal_outcomes() {
+        for (session_id, outcome) in [
+            (31, OverallOutcome::Cancelled),
+            (32, OverallOutcome::Empty),
+            (33, OverallOutcome::Failed),
+        ] {
+            let mut diagnostics = crate::diagnostics::Diagnostics::inactive();
+            diagnostics.start_session(
+                session_id,
+                crate::diagnostics::Provider::AlibabaQwenAudio3,
+                FinalPassKind::QwenAudio3Native,
+                true,
+            );
+            diagnostics.finish_session(session_id, outcome, SelectedResult::None, 4);
+            let session = diagnostics.session.unwrap();
+            assert_eq!(session.asr_outcome, outcome);
+            assert_eq!(session.selected_result, SelectedResult::None);
+            assert_eq!(session.total_asr_latency_ms, Some(4));
+        }
     }
 }
