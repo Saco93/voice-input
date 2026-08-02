@@ -606,18 +606,24 @@ impl Daemon {
         if self.session.is_some() {
             return Ok(());
         }
-        if self.config.asr.provider == AsrProvider::AlibabaQwenRealtime
-            && self.config.asr.alibaba.api_key.trim().is_empty()
-        {
-            bail!("Alibaba realtime ASR requires an API key");
+        let remote_api_key = match self.config.asr.provider {
+            AsrProvider::AlibabaQwenRealtime => Some(&self.config.asr.alibaba.api_key),
+            AsrProvider::AlibabaQwenAudio3 => Some(&self.config.asr.alibaba_audio3.api_key),
+            AsrProvider::LocalCli => None,
+        };
+        if remote_api_key.is_some_and(|api_key| api_key.trim().is_empty()) {
+            bail!("Alibaba streaming ASR requires an API key");
         }
 
         let session_id = self.next_session_id.fetch_add(1, Ordering::SeqCst);
         let output_target_hint =
             output_target_hint_override.or_else(|| output::detect_output_target_hint().ok());
         let pre_roll_audio = self.capture.seed_audio();
-        let asr_packetizer = (self.config.asr.provider == AsrProvider::AlibabaQwenRealtime)
-            .then(|| Arc::new(Mutex::new(AsrPacketizer::default())));
+        let asr_packetizer = matches!(
+            self.config.asr.provider,
+            AsrProvider::AlibabaQwenRealtime | AsrProvider::AlibabaQwenAudio3
+        )
+        .then(|| Arc::new(Mutex::new(AsrPacketizer::default())));
         let waveform_analyzer = Arc::new(Mutex::new(WaveformAnalyzer::new(
             self.config.audio.sample_rate,
         )));
@@ -686,7 +692,7 @@ impl Daemon {
                 );
                 (None, None, SessionAsrRuntime::Local { partial_handle })
             }
-            AsrProvider::AlibabaQwenRealtime => {
+            AsrProvider::AlibabaQwenRealtime | AsrProvider::AlibabaQwenAudio3 => {
                 let asr = backend::build(&self.config);
                 let session = asr.spawn_session(
                     &self.config,
@@ -1023,8 +1029,11 @@ impl Daemon {
                         return Ok(());
                     }
 
+                    let final_pass_enabled = self.config.asr.provider
+                        == AsrProvider::AlibabaQwenRealtime
+                        && self.config.asr.alibaba.final_pass_enabled;
                     if realtime_overloaded
-                        && !self.config.asr.alibaba.final_pass_enabled
+                        && !final_pass_enabled
                         && !self.config.asr.fallback_to_local
                     {
                         bail!(
@@ -1073,7 +1082,7 @@ impl Daemon {
                         }
                     };
 
-                    if self.config.asr.alibaba.final_pass_enabled {
+                    if final_pass_enabled {
                         self.state.update(|snapshot| {
                             snapshot.phase = Phase::Transcribing;
                             snapshot.class = "transcribing".into();

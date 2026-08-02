@@ -1,4 +1,5 @@
 mod local_cli;
+mod qwen_audio3;
 mod qwen_batch;
 mod qwen_realtime;
 mod text;
@@ -66,6 +67,7 @@ pub fn build(config: &Config) -> Box<dyn AsrBackend> {
     match config.asr.provider {
         AsrProvider::LocalCli => Box::new(local_cli::LocalCliBackend::new()),
         AsrProvider::AlibabaQwenRealtime => Box::new(qwen_realtime::QwenRealtimeBackend::new()),
+        AsrProvider::AlibabaQwenAudio3 => Box::new(qwen_audio3::QwenAudio3Backend::new()),
     }
 }
 
