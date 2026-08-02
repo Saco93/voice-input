@@ -43,7 +43,7 @@ heartbeat_enabled = false
 vocabulary = []
 native_endpoint = "https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation"
 native_model = "qwen-audio-3.0-asr-flash"
-native_final_pass_enabled = false
+native_final_pass_mode = "streaming-only"
 native_timeout_ms = 20000
 
 [output]

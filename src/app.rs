@@ -441,7 +441,7 @@ mod tests {
             ASR_CONTROL_QUEUE_CAPACITY, AsrBackend, AsrControl, AsrEvent, AsrSessionHandle,
             AudioSpec,
         },
-        config::{AsrProvider, Config},
+        config::{AsrProvider, Config, NativeFinalPassMode},
         diagnostics::{
             DIAGNOSTICS_SCHEMA_VERSION, Diagnostics, FailureKind, FinalPassKind, OverallOutcome,
             Provider, SelectedResult, SessionDiagnostics, StageStatus, SupportPayload,
@@ -499,7 +499,7 @@ mod tests {
             ..Config::default()
         };
         config.asr.provider = AsrProvider::AlibabaQwenAudio3;
-        config.asr.alibaba_audio3.native_final_pass_enabled = true;
+        config.asr.alibaba_audio3.native_final_pass_mode = NativeFinalPassMode::Always;
         config.asr.alibaba_audio3.model = "SENTINEL_MODEL".into();
         config.asr.alibaba_audio3.native_model = "SENTINEL_NATIVE_MODEL".into();
         config.asr.alibaba_audio3.endpoint = "https://SENTINEL_ENDPOINT.example".into();
@@ -545,7 +545,7 @@ mod tests {
         let config = Config::default();
         let unavailable = SupportPayload::new(&config, None);
         let text = format_diagnostics(&unavailable, OutputFormat::Text).unwrap();
-        assert!(text.starts_with("Voice Input diagnostics (schema 1)\n"));
+        assert!(text.starts_with("Voice Input diagnostics (schema 2)\n"));
         assert!(text.contains("Runtime: unavailable\n"));
         assert!(text.contains("Session: none\n"));
 
@@ -578,7 +578,7 @@ mod tests {
 
         let json = format_diagnostics(&payload, OutputFormat::Json).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed["schema_version"], 1);
+        assert_eq!(parsed["schema_version"], 2);
         assert_eq!(parsed["session"]["session_id"], 7);
         assert_eq!(parsed["session"]["asr_outcome"], "completed");
         assert!(parsed["session"].get("outcome").is_none());

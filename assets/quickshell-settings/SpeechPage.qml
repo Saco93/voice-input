@@ -254,15 +254,17 @@ SettingsPage {
                 }
             }
 
-            SettingSwitch {
+            SettingCombo {
                 theme: root.theme
-                label: "Enable native final pass"
-                checked: root.controller.value("asr.alibaba_audio3.native_final_pass_enabled", false)
-                help: "After streaming, send the complete recording remotely. No words is authoritative unless streaming text is usable; failures keep streaming text or use local fallback."
-                error: root.controller.errorFor("asr.alibaba_audio3.native_final_pass_enabled")
+                label: "Native final pass"
+                value: root.controller.value("asr.alibaba_audio3.native_final_pass_mode", "streaming-only")
+                labels: ["Streaming only", "Adaptive", "Always"]
+                values: ["streaming-only", "adaptive", "always"]
+                help: "Adaptive runs native recognition for unhealthy, incomplete, overloaded, or 30-second recordings. Always requests maximum accuracy for every nonempty recording."
+                error: root.controller.errorFor("asr.alibaba_audio3.native_final_pass_mode")
                 enabled: !root.controller.busy
-                onToggled: (checked) => {
-                    return root.controller.setValue("asr.alibaba_audio3.native_final_pass_enabled", checked);
+                onSelected: (value) => {
+                    return root.controller.setValue("asr.alibaba_audio3.native_final_pass_mode", value);
                 }
             }
 

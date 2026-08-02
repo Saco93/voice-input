@@ -52,12 +52,12 @@ Complete items 1–4, then stop and evaluate their combined effect before starti
 
 ### 4. Adaptive native final pass
 
-- [ ] Define explicit modes: streaming only, adaptive, and always run native final pass.
-- [ ] Specify the adaptive decision table using observable states only: empty, degraded, interrupted, overloaded, missing completion, duration, and explicit accuracy request.
-- [ ] Define migration from the existing boolean native-final-pass setting without surprising current users.
-- [ ] Preserve deterministic result precedence and local fallback behavior.
-- [ ] Expose bounded diagnostics for the decision without recording transcript content.
-- [ ] Add exhaustive policy, migration, cancellation, timeout, and output-preservation tests.
+- [x] Define explicit modes: streaming only, adaptive, and always run native final pass.
+- [x] Specify the adaptive decision table using observable states only: empty, degraded, interrupted, overloaded, missing completion, duration, and explicit accuracy request.
+- [x] Define migration from the existing boolean native-final-pass setting without surprising current users.
+- [x] Preserve deterministic result precedence and local fallback behavior.
+- [x] Expose bounded diagnostics for the decision without recording transcript content.
+- [x] Add exhaustive policy, migration, cancellation, timeout, and output-preservation tests through the production-used pass-planning and injectable invocation seams. Full live daemon orchestration remains part of the evaluation gate; deterministic invocation, suppression, and failure/result orchestration are covered locally.
 - [ ] Measure native invocation rate, ASR latency, failure rate, and estimated request cost.
 
 ### Milestone 1 evaluation gate
@@ -116,6 +116,7 @@ Complete items 1–4, then stop and evaluate their combined effect before starti
 | 2026-08-02 | Planning | Completed | Created the feature branch, isolated worktree, three-milestone checklist, and Milestone 1 evaluation gate from `main` at `b28af17`. No implementation started. |
 | 2026-08-02 | Milestone 1 API verification | Completed | Confirmed the official request placement, language-code allowlist, heartbeat semantics, and dynamic-vocabulary limits for the streaming and short Flash models. Recorded the Singapore hotword-support ambiguity; no inference request was made. |
 | 2026-08-02 | Milestone 1 items 1–3 implementation | In progress | Implemented opt-in language hints, opt-in explicit streaming heartbeat, and bounded global dynamic vocabulary for streaming and native requests. Added Settings controls, migration/default/validation/request/privacy/isolation tests, sample configuration, and documentation. The locked local suite passed 168 tests, QML validation, and Clippy with warnings denied. Per-application profiles, live-provider tests, deterministic long-idle lifecycle tests, shutdown-latency verification, and corpus evaluation remain deferred; no live API was called. |
+| 2026-08-02 | Milestone 1 item 4 implementation | Completed locally | Replaced the Audio3 native-pass boolean with streaming-only, adaptive, and always modes; migrated legacy `true` to always and `false` to streaming-only. Added a text-free 30-second adaptive policy, explicit completion tracking, privacy-safe diagnostics schema v2, Settings/QML controls, bilingual documentation, and exhaustive migration/policy/result tests through production-used planning and injectable invocation seams. Deterministic invocation, suppression, and failure/result orchestration are covered; full live daemon orchestration, invocation-rate, latency, failure-rate, estimated-cost measurement, and all other live evaluation remain evaluation-gate tasks. No live API was called. |
 
 ## Official references
 

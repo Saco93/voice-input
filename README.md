@@ -81,7 +81,7 @@ systemctl --user status voice-input.service voice-input-hud.service
 
 ## Safe support diagnostics
 
-Use `voice-input diagnostics [--format text|json]` as the canonical output for support reports. It contains bounded stage status, failure categories, timings, and a safe configuration summary for one session only: the active or most recently completed session. That session summary remains available after completion and is reset when the next recording starts. It contains no audio, recognized or refined text, credentials, tooltips, or session history.
+Use `voice-input diagnostics [--format text|json]` as the canonical output for support reports. It contains bounded stage status, failure categories, timings, the Audio3 native-pass mode/decision/reason, and a safe configuration summary for one session only: the active or most recently completed session. The safe summary reports only whether Audio3 language hints and heartbeat are enabled and the dynamic-vocabulary entry count; it never includes vocabulary terms. That session summary remains available after completion and is reset when the next recording starts. It contains no audio, recognized or refined text, credentials, endpoints, model names, provider messages, window/application data, tooltips, or session history.
 
 Do not paste `voice-input status` output into reports, with or without `--extended`. Status output is intended for local UI integration and can include the current or most recent transcript and tooltip text.
 
@@ -93,7 +93,9 @@ The streaming model supplies realtime text. **Language hints** and **streaming h
 
 Optional **Dynamic vocabulary** entries are global to Audio3 and are sent to both streaming and native requests only when configured. Settings displays every remotely sent entry as one JSON object per line, for example `{"term":"Voice Input","weight":5}`. Terms use weights `1`–`5` or `50`; the local validator enforces the provider's term, duplicate, count, and weight limits. Dynamic terms are deliberately absent from routine support diagnostics.
 
-**Native final pass** sends the complete recording to `qwen-audio-3.0-asr-flash` after streaming ends. A successful native transcript takes precedence. A native no-words result is authoritative when no usable streaming transcript exists; otherwise the usable streaming transcript is retained. If the native request fails, usable streaming text remains available, followed by the configured local fallback when needed. Native requests accept at most 10 MiB of raw WAV audio.
+**Native final pass** has three modes. **Streaming only** (the default) never sends the complete recording. **Adaptive** runs native recognition when realtime delivery is overloaded, a backend/event worker is interrupted, streaming is empty/failed/degraded, the server does not send an explicit `Finished` completion, or captured audio lasts at least 30 seconds. It skips only a usable, non-overloaded, explicitly finished stream shorter than 30 seconds. **Always** is the explicit maximum-accuracy choice and runs native recognition for every non-cancelled, nonempty recording. Existing configurations whose legacy boolean was `true` migrate to **Always**; `false` migrates to **Streaming only**.
+
+When native recognition runs, it sends the complete recording to `qwen-audio-3.0-asr-flash`. A successful native transcript takes precedence. A native no-words result is authoritative when no usable streaming transcript exists; otherwise the usable streaming transcript is retained. If the native request fails or times out, usable streaming text remains available, followed by the configured local fallback only when needed. Cancellation never launches native recognition. Native requests accept at most 10 MiB of raw WAV audio.
 
 Developers can test either API against a prerecorded 16 kHz mono PCM16 WAV without starting the daemon or delivering text to another application:
 

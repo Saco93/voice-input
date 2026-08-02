@@ -336,6 +336,7 @@ fn settings_get(store: &ConfigStore) -> std::result::Result<Value, ProtocolError
             "asr.provider": ["local-cli", "alibaba-qwen-realtime", "alibaba-qwen-audio3"],
             "asr.language": ["english", "simplified-chinese", "traditional-chinese", "japanese", "korean"],
             "asr.alibaba.turn_mode": ["server-vad", "manual"],
+            "asr.alibaba_audio3.native_final_pass_mode": ["streaming-only", "adaptive", "always"],
             "output.mode": ["type", "clipboard", "paste"],
             "hud.position": ["bottom-center", "bottom-left", "bottom-right"]
         }
@@ -807,6 +808,10 @@ mod tests {
             json!(["local-cli", "alibaba-qwen-realtime", "alibaba-qwen-audio3"])
         );
         assert_eq!(
+            response["result"]["choices"]["asr.alibaba_audio3.native_final_pass_mode"],
+            json!(["streaming-only", "adaptive", "always"])
+        );
+        assert_eq!(
             response["result"]["config"]["asr"]["alibaba_audio3"],
             json!({
                 "experimental_enabled": false,
@@ -817,7 +822,7 @@ mod tests {
                 "vocabulary": [],
                 "native_endpoint": "https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation",
                 "native_model": "qwen-audio-3.0-asr-flash",
-                "native_final_pass_enabled": false,
+                "native_final_pass_mode": "streaming-only",
                 "native_timeout_ms": 20_000
             })
         );
@@ -843,7 +848,7 @@ mod tests {
             ],
             "native_endpoint": "https://audio3.example.test/native",
             "native_model": "audio3-native-test",
-            "native_final_pass_enabled": true,
+            "native_final_pass_mode": "adaptive",
             "native_timeout_ms": 42_000
         });
         let request = json!({
@@ -878,7 +883,10 @@ mod tests {
         assert!(saved.asr.alibaba_audio3.language_hints_enabled);
         assert!(saved.asr.alibaba_audio3.heartbeat_enabled);
         assert_eq!(saved.asr.alibaba_audio3.vocabulary.len(), 2);
-        assert!(saved.asr.alibaba_audio3.native_final_pass_enabled);
+        assert_eq!(
+            saved.asr.alibaba_audio3.native_final_pass_mode,
+            crate::config::NativeFinalPassMode::Adaptive
+        );
         assert_eq!(saved.asr.alibaba_audio3.native_timeout_ms, 42_000);
     }
 

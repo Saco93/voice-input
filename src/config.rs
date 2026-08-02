@@ -97,24 +97,115 @@ pub struct AlibabaRealtimeConfig {
     pub final_pass_enable_itn: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[derive(Debug, Clone, Serialize)]
 pub struct AlibabaAudio3Config {
     pub experimental_enabled: bool,
     pub endpoint: String,
     #[serde(default, skip_serializing)]
     pub api_key: String,
     pub model: String,
-    #[serde(default)]
     pub language_hints_enabled: bool,
-    #[serde(default)]
     pub heartbeat_enabled: bool,
-    #[serde(default)]
     pub vocabulary: Vec<Audio3VocabularyTerm>,
     pub native_endpoint: String,
     pub native_model: String,
-    pub native_final_pass_enabled: bool,
+    pub native_final_pass_mode: NativeFinalPassMode,
     pub native_timeout_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum NativeFinalPassMode {
+    #[default]
+    StreamingOnly,
+    Adaptive,
+    Always,
+}
+
+impl NativeFinalPassMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::StreamingOnly => "streaming-only",
+            Self::Adaptive => "adaptive",
+            Self::Always => "always",
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(default)]
+struct RawAlibabaAudio3Config {
+    experimental_enabled: bool,
+    endpoint: String,
+    api_key: String,
+    model: String,
+    language_hints_enabled: bool,
+    heartbeat_enabled: bool,
+    vocabulary: Vec<Audio3VocabularyTerm>,
+    native_endpoint: String,
+    native_model: String,
+    native_final_pass_mode: Option<NativeFinalPassMode>,
+    native_final_pass_enabled: Option<bool>,
+    native_timeout_ms: u64,
+}
+
+impl Default for RawAlibabaAudio3Config {
+    fn default() -> Self {
+        let defaults = AlibabaAudio3Config::default();
+        Self {
+            experimental_enabled: defaults.experimental_enabled,
+            endpoint: defaults.endpoint,
+            api_key: defaults.api_key,
+            model: defaults.model,
+            language_hints_enabled: defaults.language_hints_enabled,
+            heartbeat_enabled: defaults.heartbeat_enabled,
+            vocabulary: defaults.vocabulary,
+            native_endpoint: defaults.native_endpoint,
+            native_model: defaults.native_model,
+            native_final_pass_mode: None,
+            native_final_pass_enabled: None,
+            native_timeout_ms: defaults.native_timeout_ms,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for AlibabaAudio3Config {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = RawAlibabaAudio3Config::deserialize(deserializer)?;
+        let legacy_mode = raw.native_final_pass_enabled.map(|enabled| {
+            if enabled {
+                NativeFinalPassMode::Always
+            } else {
+                NativeFinalPassMode::StreamingOnly
+            }
+        });
+        let native_final_pass_mode = match (raw.native_final_pass_mode, legacy_mode) {
+            (Some(mode), Some(legacy)) if mode != legacy => {
+                return Err(serde::de::Error::custom(
+                    "ambiguous Audio3 native final-pass configuration: mode conflicts with legacy setting",
+                ));
+            }
+            (Some(mode), _) => mode,
+            (None, Some(mode)) => mode,
+            (None, None) => NativeFinalPassMode::StreamingOnly,
+        };
+        Ok(Self {
+            experimental_enabled: raw.experimental_enabled,
+            endpoint: raw.endpoint,
+            api_key: raw.api_key,
+            model: raw.model,
+            language_hints_enabled: raw.language_hints_enabled,
+            heartbeat_enabled: raw.heartbeat_enabled,
+            vocabulary: raw.vocabulary,
+            native_endpoint: raw.native_endpoint,
+            native_model: raw.native_model,
+            native_final_pass_mode,
+            native_timeout_ms: raw.native_timeout_ms,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -328,7 +419,7 @@ impl Default for Config {
                     vocabulary: Vec::new(),
                     native_endpoint: "https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation".into(),
                     native_model: "qwen-audio-3.0-asr-flash".into(),
-                    native_final_pass_enabled: false,
+                    native_final_pass_mode: NativeFinalPassMode::StreamingOnly,
                     native_timeout_ms: 20_000,
                 },
             },
@@ -571,7 +662,8 @@ impl Config {
             if let Some(message) = validate_audio3_vocabulary(&self.asr.alibaba_audio3.vocabulary) {
                 fields.insert("asr.alibaba_audio3.vocabulary".into(), message);
             }
-            if self.asr.alibaba_audio3.native_final_pass_enabled {
+            if self.asr.alibaba_audio3.native_final_pass_mode != NativeFinalPassMode::StreamingOnly
+            {
                 range(
                     &mut fields,
                     "asr.alibaba_audio3.native_timeout_ms",
@@ -1095,7 +1187,8 @@ impl AsrConfig {
                 }
             }
             AsrProvider::AlibabaQwenAudio3 => {
-                if self.alibaba_audio3.native_final_pass_enabled {
+                if self.alibaba_audio3.native_final_pass_mode != NativeFinalPassMode::StreamingOnly
+                {
                     format!(
                         "{} -> {}",
                         self.alibaba_audio3.model, self.alibaba_audio3.native_model
@@ -1161,7 +1254,7 @@ mod tests {
 
     use super::{
         AsrProvider, Audio3VocabularyTerm, Config, ConfigStore, HudPosition, Language,
-        MAX_AUDIO3_VOCABULARY_BYTES, RevisionConflict,
+        MAX_AUDIO3_VOCABULARY_BYTES, NativeFinalPassMode, RevisionConflict,
     };
 
     #[test]
@@ -1308,7 +1401,10 @@ mod tests {
             config.asr.alibaba_audio3.native_model,
             "qwen-audio-3.0-asr-flash"
         );
-        assert!(!config.asr.alibaba_audio3.native_final_pass_enabled);
+        assert_eq!(
+            config.asr.alibaba_audio3.native_final_pass_mode,
+            NativeFinalPassMode::StreamingOnly
+        );
         assert_eq!(config.asr.alibaba_audio3.native_timeout_ms, 20_000);
     }
 
@@ -1354,7 +1450,7 @@ mod tests {
             "qwen-audio-3.0-asr-flash-streaming"
         );
 
-        config.asr.alibaba_audio3.native_final_pass_enabled = true;
+        config.asr.alibaba_audio3.native_final_pass_mode = NativeFinalPassMode::Always;
         assert_eq!(
             config.asr.active_model_label(),
             "qwen-audio-3.0-asr-flash-streaming -> qwen-audio-3.0-asr-flash"
@@ -1375,7 +1471,7 @@ mod tests {
             .validate()
             .expect("disabled Audio3 final pass ignores its timeout");
 
-        config.asr.alibaba_audio3.native_final_pass_enabled = true;
+        config.asr.alibaba_audio3.native_final_pass_mode = NativeFinalPassMode::Adaptive;
         let error = config
             .validate()
             .expect_err("enabled Audio3 final pass validates its timeout");
@@ -1413,7 +1509,10 @@ model = "legacy-model"
         assert!(!asr.alibaba_audio3.language_hints_enabled);
         assert!(!asr.alibaba_audio3.heartbeat_enabled);
         assert!(asr.alibaba_audio3.vocabulary.is_empty());
-        assert!(!asr.alibaba_audio3.native_final_pass_enabled);
+        assert_eq!(
+            asr.alibaba_audio3.native_final_pass_mode,
+            NativeFinalPassMode::StreamingOnly
+        );
         assert_eq!(asr.alibaba_audio3.native_timeout_ms, 20_000);
     }
 
@@ -1432,7 +1531,10 @@ native_model = "native-model"
         assert!(!audio3.language_hints_enabled);
         assert!(!audio3.heartbeat_enabled);
         assert!(audio3.vocabulary.is_empty());
-        assert!(!audio3.native_final_pass_enabled);
+        assert_eq!(
+            audio3.native_final_pass_mode,
+            NativeFinalPassMode::StreamingOnly
+        );
         assert_eq!(audio3.native_timeout_ms, 20_000);
     }
 
@@ -1476,6 +1578,130 @@ native_timeout_ms = 20000
         assert!(!audio3.language_hints_enabled);
         assert!(!audio3.heartbeat_enabled);
         assert!(audio3.vocabulary.is_empty());
+    }
+
+    #[test]
+    fn audio3_native_final_pass_direct_serde_migrates_and_rejects_ambiguity() {
+        for (value, expected) in [
+            (serde_json::json!({}), NativeFinalPassMode::StreamingOnly),
+            (
+                serde_json::json!({"native_final_pass_enabled": false}),
+                NativeFinalPassMode::StreamingOnly,
+            ),
+            (
+                serde_json::json!({"native_final_pass_enabled": true}),
+                NativeFinalPassMode::Always,
+            ),
+            (
+                serde_json::json!({"native_final_pass_mode": "adaptive"}),
+                NativeFinalPassMode::Adaptive,
+            ),
+            (
+                serde_json::json!({
+                    "native_final_pass_mode": "streaming-only",
+                    "native_final_pass_enabled": false
+                }),
+                NativeFinalPassMode::StreamingOnly,
+            ),
+            (
+                serde_json::json!({
+                    "native_final_pass_mode": "always",
+                    "native_final_pass_enabled": true
+                }),
+                NativeFinalPassMode::Always,
+            ),
+        ] {
+            let config: super::AlibabaAudio3Config = serde_json::from_value(value).unwrap();
+            assert_eq!(config.native_final_pass_mode, expected);
+            let serialized = serde_json::to_value(config).unwrap();
+            assert_eq!(
+                serialized["native_final_pass_mode"],
+                serde_json::to_value(expected).unwrap()
+            );
+            assert!(serialized.get("native_final_pass_enabled").is_none());
+        }
+
+        for value in [
+            serde_json::json!({
+                "native_final_pass_mode": "always",
+                "native_final_pass_enabled": false
+            }),
+            serde_json::json!({
+                "native_final_pass_mode": "adaptive",
+                "native_final_pass_enabled": true
+            }),
+        ] {
+            let error = serde_json::from_value::<super::AlibabaAudio3Config>(value)
+                .expect_err("conflicting settings must fail")
+                .to_string();
+            assert!(error.contains("ambiguous Audio3 native final-pass configuration"));
+            assert!(!error.contains("true"));
+            assert!(!error.contains("false"));
+            assert!(!error.contains("adaptive"));
+            assert!(!error.contains("always"));
+        }
+    }
+
+    #[test]
+    fn config_store_migrates_legacy_audio3_native_final_pass_boolean() {
+        for (legacy, expected) in [
+            (false, NativeFinalPassMode::StreamingOnly),
+            (true, NativeFinalPassMode::Always),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("config.toml");
+            let source = toml::to_string_pretty(&Config::default()).unwrap().replace(
+                "native_final_pass_mode = \"streaming-only\"",
+                &format!("native_final_pass_enabled = {legacy}"),
+            );
+            fs::write(&path, source).unwrap();
+            let loaded = ConfigStore::new(&path).load().unwrap().config;
+            assert_eq!(loaded.asr.alibaba_audio3.native_final_pass_mode, expected);
+
+            ConfigStore::new(&path).save(&loaded, None).unwrap();
+            let saved = fs::read_to_string(path).unwrap();
+            assert!(saved.contains(&format!(
+                "native_final_pass_mode = \"{}\"",
+                match expected {
+                    NativeFinalPassMode::StreamingOnly => "streaming-only",
+                    NativeFinalPassMode::Adaptive => "adaptive",
+                    NativeFinalPassMode::Always => "always",
+                }
+            )));
+            assert!(!saved.contains("native_final_pass_enabled"));
+        }
+    }
+
+    #[test]
+    fn config_store_accepts_consistent_dual_audio3_fields_and_rejects_conflicts() {
+        for (mode, legacy, accepted) in [
+            ("streaming-only", false, true),
+            ("always", true, true),
+            ("adaptive", false, false),
+            ("always", false, false),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("config.toml");
+            let source = toml::to_string_pretty(&Config::default()).unwrap().replace(
+                "native_final_pass_mode = \"streaming-only\"",
+                &format!(
+                    "native_final_pass_mode = \"{mode}\"\nnative_final_pass_enabled = {legacy}"
+                ),
+            );
+            fs::write(&path, source).unwrap();
+            let result = ConfigStore::new(path).load();
+            if accepted {
+                assert!(result.is_ok(), "consistent dual fields must load");
+            } else {
+                let message = format!(
+                    "{:#}",
+                    result.expect_err("conflicting dual fields must fail")
+                );
+                assert!(message.contains("ambiguous Audio3 native final-pass configuration"));
+                assert!(!message.contains(mode));
+                assert!(!message.contains(&legacy.to_string()));
+            }
+        }
     }
 
     #[test]

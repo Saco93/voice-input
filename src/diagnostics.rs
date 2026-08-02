@@ -3,11 +3,11 @@ use std::fmt::Write as _;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    config::{AsrProvider, Config},
+    config::{AsrProvider, Config, NativeFinalPassMode},
     state::{Phase, Snapshot},
 };
 
-pub const DIAGNOSTICS_SCHEMA_VERSION: u32 = 1;
+pub const DIAGNOSTICS_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
@@ -39,6 +39,30 @@ impl Diagnostics {
 
     /// Applies a session-local update only when it still belongs to the active
     /// diagnostics record. This is the boundary used by asynchronous workers.
+    pub(crate) fn configure_audio3_native_final_pass(
+        &mut self,
+        session_id: u64,
+        mode: NativeFinalPassMode,
+    ) -> bool {
+        self.update_session(session_id, |session| {
+            session.final_pass.configured_mode = Some(mode);
+            match mode {
+                NativeFinalPassMode::StreamingOnly => {
+                    session.final_pass.kind = FinalPassKind::None;
+                    session.final_pass.status = StageStatus::Inactive;
+                    session.final_pass.decision = FinalPassDecision::Skipped;
+                    session.final_pass.reason = Some(FinalPassReason::StreamingOnly);
+                }
+                NativeFinalPassMode::Adaptive | NativeFinalPassMode::Always => {
+                    session.final_pass.kind = FinalPassKind::QwenAudio3Native;
+                    session.final_pass.status = StageStatus::Pending;
+                    session.final_pass.decision = FinalPassDecision::Pending;
+                    session.final_pass.reason = None;
+                }
+            }
+        })
+    }
+
     pub(crate) fn update_session(
         &mut self,
         session_id: u64,
@@ -67,6 +91,12 @@ impl Diagnostics {
             session.asr_outcome = outcome;
             session.selected_result = selected_result;
             session.total_asr_latency_ms = Some(total_asr_latency_ms);
+            if session.final_pass.decision == FinalPassDecision::Pending {
+                session.final_pass.decision = FinalPassDecision::Skipped;
+                if session.final_pass.reason.is_none() {
+                    session.final_pass.reason = Some(FinalPassReason::NotReached);
+                }
+            }
             for status in [
                 &mut session.streaming.status,
                 &mut session.final_pass.status,
@@ -121,6 +151,20 @@ impl SessionDiagnostics {
         } else {
             StageStatus::Pending
         };
+        let (configured_mode, final_pass_decision, final_pass_reason) =
+            match (provider, final_pass_kind) {
+                (Provider::AlibabaQwenAudio3, FinalPassKind::None) => (
+                    Some(NativeFinalPassMode::StreamingOnly),
+                    FinalPassDecision::Skipped,
+                    Some(FinalPassReason::StreamingOnly),
+                ),
+                (Provider::AlibabaQwenAudio3, FinalPassKind::QwenAudio3Native) => (
+                    Some(NativeFinalPassMode::Always),
+                    FinalPassDecision::Pending,
+                    None,
+                ),
+                _ => (None, FinalPassDecision::NotApplicable, None),
+            };
         let local_primary_status = if provider == Provider::LocalCli {
             StageStatus::Pending
         } else {
@@ -143,6 +187,9 @@ impl SessionDiagnostics {
             final_pass: FinalPassStage {
                 kind: final_pass_kind,
                 status: final_pass_status,
+                configured_mode,
+                decision: final_pass_decision,
+                reason: final_pass_reason,
                 ..FinalPassStage::default()
             },
             local_primary: LocalPrimaryStage {
@@ -179,10 +226,17 @@ impl SessionDiagnostics {
 
         let _ = write!(
             output,
-            "Final pass: {} ({})",
+            "Final pass: {} ({}, decision={})",
             self.final_pass.kind.as_str(),
-            self.final_pass.status.as_str()
+            self.final_pass.status.as_str(),
+            self.final_pass.decision.as_str()
         );
+        if let Some(mode) = self.final_pass.configured_mode {
+            let _ = write!(output, ", configured-mode={}", mode.as_str());
+        }
+        if let Some(reason) = self.final_pass.reason {
+            let _ = write!(output, ", reason={}", reason.as_str());
+        }
         append_latency(output, "latency-ms", self.final_pass.latency_ms);
         append_failure(output, self.final_pass.failure_kind);
         output.push('\n');
@@ -235,6 +289,9 @@ pub struct StreamingStage {
 pub struct FinalPassStage {
     pub kind: FinalPassKind,
     pub status: StageStatus,
+    pub configured_mode: Option<NativeFinalPassMode>,
+    pub decision: FinalPassDecision,
+    pub reason: Option<FinalPassReason>,
     pub latency_ms: Option<u64>,
     pub failure_kind: Option<FailureKind>,
 }
@@ -334,6 +391,63 @@ impl StageStatus {
             Self::Cancelled => "cancelled",
             Self::Failed => "failed",
             Self::Skipped => "skipped",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum FinalPassDecision {
+    Pending,
+    Invoked,
+    Skipped,
+    #[default]
+    NotApplicable,
+}
+
+impl FinalPassDecision {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Invoked => "invoked",
+            Self::Skipped => "skipped",
+            Self::NotApplicable => "not-applicable",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum FinalPassReason {
+    StreamingOnly,
+    Always,
+    Empty,
+    Degraded,
+    Interrupted,
+    Overloaded,
+    MissingCompletion,
+    Duration,
+    HealthyStream,
+    Cancelled,
+    NoAudio,
+    NotReached,
+}
+
+impl FinalPassReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::StreamingOnly => "streaming-only",
+            Self::Always => "always",
+            Self::Empty => "empty",
+            Self::Degraded => "degraded",
+            Self::Interrupted => "interrupted",
+            Self::Overloaded => "overloaded",
+            Self::MissingCompletion => "missing-completion",
+            Self::Duration => "duration",
+            Self::HealthyStream => "healthy-stream",
+            Self::Cancelled => "cancelled",
+            Self::NoAudio => "no-audio",
+            Self::NotReached => "not-reached",
         }
     }
 }
@@ -466,10 +580,14 @@ impl SupportPayload {
         }
         let _ = writeln!(
             output,
-            "Configuration: provider={}, final-pass={}, fallback={}",
+            "Configuration: provider={}, final-pass={}, fallback={}, audio3-native-mode={}, audio3-language-hints={}, audio3-heartbeat={}, audio3-vocabulary-count={}",
             self.config.provider.as_str(),
             enabled_name(self.config.final_pass_enabled),
-            enabled_name(self.config.fallback_enabled)
+            enabled_name(self.config.fallback_enabled),
+            self.config.audio3_native_final_pass_mode.as_str(),
+            enabled_name(self.config.audio3_language_hints_enabled),
+            enabled_name(self.config.audio3_heartbeat_enabled),
+            self.config.audio3_vocabulary_count
         );
         match &self.session {
             Some(session) => session.format_safe_text(&mut output),
@@ -510,6 +628,10 @@ pub struct SafeConfigSummary {
     pub provider: Provider,
     pub final_pass_enabled: bool,
     pub fallback_enabled: bool,
+    pub audio3_native_final_pass_mode: NativeFinalPassMode,
+    pub audio3_language_hints_enabled: bool,
+    pub audio3_heartbeat_enabled: bool,
+    pub audio3_vocabulary_count: usize,
 }
 
 impl SafeConfigSummary {
@@ -517,12 +639,19 @@ impl SafeConfigSummary {
         let final_pass_enabled = match config.asr.provider {
             AsrProvider::LocalCli => false,
             AsrProvider::AlibabaQwenRealtime => config.asr.alibaba.final_pass_enabled,
-            AsrProvider::AlibabaQwenAudio3 => config.asr.alibaba_audio3.native_final_pass_enabled,
+            AsrProvider::AlibabaQwenAudio3 => {
+                config.asr.alibaba_audio3.native_final_pass_mode
+                    != NativeFinalPassMode::StreamingOnly
+            }
         };
         Self {
             provider: config.asr.provider.into(),
             final_pass_enabled,
             fallback_enabled: config.asr.fallback_to_local,
+            audio3_native_final_pass_mode: config.asr.alibaba_audio3.native_final_pass_mode,
+            audio3_language_hints_enabled: config.asr.alibaba_audio3.language_hints_enabled,
+            audio3_heartbeat_enabled: config.asr.alibaba_audio3.heartbeat_enabled,
+            audio3_vocabulary_count: config.asr.alibaba_audio3.vocabulary.len(),
         }
     }
 }
@@ -588,6 +717,14 @@ mod tests {
             json!("overloaded")
         );
         assert_eq!(
+            serde_json::to_value(FinalPassDecision::NotApplicable).unwrap(),
+            json!("not-applicable")
+        );
+        assert_eq!(
+            serde_json::to_value(FinalPassReason::MissingCompletion).unwrap(),
+            json!("missing-completion")
+        );
+        assert_eq!(
             serde_json::from_value::<FailureKind>(json!("future-private-error")).unwrap(),
             FailureKind::Unknown
         );
@@ -603,6 +740,12 @@ mod tests {
         assert_eq!(session.asr_outcome, OverallOutcome::InProgress);
         assert_eq!(session.streaming.status, StageStatus::Inactive);
         assert_eq!(session.final_pass.kind, FinalPassKind::None);
+        assert_eq!(session.final_pass.configured_mode, None);
+        assert_eq!(
+            session.final_pass.decision,
+            FinalPassDecision::NotApplicable
+        );
+        assert_eq!(session.final_pass.reason, None);
         assert_eq!(session.local_primary.status, StageStatus::Pending);
         assert_eq!(session.local_fallback.status, StageStatus::Inactive);
         assert_eq!(session.selected_result, SelectedResult::Pending);
@@ -691,7 +834,115 @@ mod tests {
         assert_eq!(session.asr_outcome, OverallOutcome::Completed);
         assert_eq!(session.streaming.status, StageStatus::Skipped);
         assert_eq!(session.streaming.failure_kind, None);
+        assert_eq!(session.final_pass.decision, FinalPassDecision::Skipped);
+        assert_eq!(
+            session.final_pass.reason,
+            Some(FinalPassReason::StreamingOnly)
+        );
         assert_eq!(session.total_asr_latency_ms, Some(17));
+    }
+
+    #[test]
+    fn terminal_session_normalizes_pending_final_pass_without_losing_specific_reason() {
+        for (session_id, outcome, reason, expected_reason) in [
+            (
+                10,
+                OverallOutcome::Failed,
+                None,
+                FinalPassReason::NotReached,
+            ),
+            (
+                11,
+                OverallOutcome::Cancelled,
+                Some(FinalPassReason::Cancelled),
+                FinalPassReason::Cancelled,
+            ),
+            (
+                12,
+                OverallOutcome::Empty,
+                Some(FinalPassReason::NoAudio),
+                FinalPassReason::NoAudio,
+            ),
+        ] {
+            let mut diagnostics = Diagnostics::inactive();
+            diagnostics.start_session(
+                session_id,
+                Provider::AlibabaQwenAudio3,
+                FinalPassKind::QwenAudio3Native,
+                false,
+            );
+            diagnostics.update_session(session_id, |session| {
+                session.final_pass.reason = reason;
+            });
+
+            assert!(diagnostics.finish_session(session_id, outcome, SelectedResult::None, 5,));
+            assert!(!diagnostics.update_session(session_id, |session| {
+                session.final_pass.decision = FinalPassDecision::Invoked;
+                session.final_pass.reason = Some(FinalPassReason::Always);
+            }));
+            assert!(!diagnostics.finish_session(
+                session_id,
+                OverallOutcome::Completed,
+                SelectedResult::QwenAudio3Native,
+                99,
+            ));
+            let session = diagnostics.session.unwrap();
+            assert_eq!(session.asr_outcome, outcome);
+            assert_eq!(session.total_asr_latency_ms, Some(5));
+            assert_eq!(session.final_pass.status, StageStatus::Skipped);
+            assert_eq!(session.final_pass.decision, FinalPassDecision::Skipped);
+            assert_eq!(session.final_pass.reason, Some(expected_reason));
+        }
+    }
+
+    #[test]
+    fn invoked_final_pass_remains_invoked_when_session_finishes() {
+        let mut diagnostics = Diagnostics::inactive();
+        diagnostics.start_session(
+            14,
+            Provider::AlibabaQwenAudio3,
+            FinalPassKind::QwenAudio3Native,
+            false,
+        );
+        diagnostics.update_session(14, |session| {
+            session.final_pass.status = StageStatus::Completed;
+            session.final_pass.decision = FinalPassDecision::Invoked;
+            session.final_pass.reason = Some(FinalPassReason::Duration);
+        });
+
+        assert!(diagnostics.finish_session(
+            14,
+            OverallOutcome::Completed,
+            SelectedResult::QwenAudio3Native,
+            8,
+        ));
+        let session = diagnostics.session.unwrap();
+        assert_eq!(session.final_pass.status, StageStatus::Completed);
+        assert_eq!(session.final_pass.decision, FinalPassDecision::Invoked);
+        assert_eq!(session.final_pass.reason, Some(FinalPassReason::Duration));
+    }
+
+    #[test]
+    fn normalized_terminal_final_pass_has_safe_text_and_json() {
+        let mut diagnostics = Diagnostics::inactive();
+        diagnostics.start_session(
+            13,
+            Provider::AlibabaQwenAudio3,
+            FinalPassKind::QwenAudio3Native,
+            false,
+        );
+        diagnostics.finish_session(13, OverallOutcome::Failed, SelectedResult::None, 9);
+        let session = diagnostics.session.unwrap();
+
+        let mut text = String::new();
+        session.format_safe_text(&mut text);
+        let json = serde_json::to_value(&session).unwrap();
+        assert!(text.contains("decision=skipped"));
+        assert!(text.contains("reason=not-reached"));
+        assert!(!text.contains("decision=pending"));
+        assert_eq!(json["final_pass"]["decision"], "skipped");
+        assert_eq!(json["final_pass"]["reason"], "not-reached");
+        assert!(!json.to_string().contains("transcript"));
     }
 
     #[test]
@@ -735,6 +986,52 @@ mod tests {
             assert_eq!(session.local_primary.latency_ms, Some(12));
             assert_eq!(session.local_primary.failure_kind, failure_kind);
         }
+    }
+
+    #[test]
+    fn audio3_mode_and_safe_controls_are_serialized_without_private_values() {
+        const TERM: &str = "private-diagnostics-vocabulary-sentinel";
+        let mut config = Config::default();
+        config.asr.provider = AsrProvider::AlibabaQwenAudio3;
+        config.asr.alibaba_audio3.native_final_pass_mode = NativeFinalPassMode::Adaptive;
+        config.asr.alibaba_audio3.language_hints_enabled = true;
+        config.asr.alibaba_audio3.heartbeat_enabled = true;
+        config.asr.alibaba_audio3.vocabulary = vec![crate::config::Audio3VocabularyTerm {
+            term: TERM.into(),
+            weight: 50,
+        }];
+
+        let payload = SupportPayload::new(&config, None);
+        let json = serde_json::to_value(&payload).unwrap();
+        assert_eq!(json["schema_version"], 2);
+        assert_eq!(json["config"]["audio3_native_final_pass_mode"], "adaptive");
+        assert_eq!(json["config"]["audio3_language_hints_enabled"], true);
+        assert_eq!(json["config"]["audio3_heartbeat_enabled"], true);
+        assert_eq!(json["config"]["audio3_vocabulary_count"], 1);
+        assert!(!json.to_string().contains(TERM));
+
+        let mut diagnostics = Diagnostics::inactive();
+        diagnostics.start_session(
+            23,
+            Provider::AlibabaQwenAudio3,
+            FinalPassKind::QwenAudio3Native,
+            true,
+        );
+        assert!(diagnostics.configure_audio3_native_final_pass(23, NativeFinalPassMode::Adaptive));
+        diagnostics.update_session(23, |session| {
+            session.final_pass.decision = FinalPassDecision::Invoked;
+            session.final_pass.reason = Some(FinalPassReason::MissingCompletion);
+        });
+        let session = diagnostics.session.unwrap();
+        assert_eq!(
+            session.final_pass.configured_mode,
+            Some(NativeFinalPassMode::Adaptive)
+        );
+        assert_eq!(session.final_pass.decision, FinalPassDecision::Invoked);
+        assert_eq!(
+            session.final_pass.reason,
+            Some(FinalPassReason::MissingCompletion)
+        );
     }
 
     #[test]
