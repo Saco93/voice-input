@@ -79,11 +79,17 @@ voice-input status
 systemctl --user status voice-input.service voice-input-hud.service
 ```
 
+## Safe support diagnostics
+
+Use `voice-input diagnostics [--format text|json]` as the canonical output for support reports. It contains bounded stage status, failure categories, timings, and a safe configuration summary for one session only: the active or most recently completed session. That session summary remains available after completion and is reset when the next recording starts. It contains no audio, recognized or refined text, credentials, tooltips, or session history.
+
+Do not paste `voice-input status --extended` into reports. Extended status is intended for local UI integration and can include the current transcript and tooltip text.
+
 ## Experimental Qwen-Audio-3
 
-Qwen-Audio-3 is available as an explicit experimental provider. It is disabled by default and is not offered by the stable setup wizard. To try it, open Settings, choose **Qwen-Audio-3 (experimental)**, acknowledge the experimental-provider warning, and save. The existing encrypted Alibaba credential is shared with this provider.
+Qwen-Audio-3 is available as an explicit experimental provider. It is disabled by default and is not offered by the stable setup wizard. The explicit experimental gate and setup-wizard omission remain intentional while the beta is prepared. To try it, open Settings, choose **Qwen-Audio-3 (experimental)**, acknowledge the experimental-provider warning, and save. The existing encrypted Alibaba credential is shared with this provider.
 
-The streaming model supplies realtime text. **Native final pass** can optionally send the complete recording to `qwen-audio-3.0-asr-flash` after recording stops, replacing the streaming result when successful. Existing realtime text and the configured local fallback remain available if the native request fails.
+The streaming model supplies realtime text. **Native final pass** sends the complete recording to `qwen-audio-3.0-asr-flash` after streaming ends. A successful native transcript takes precedence. A native no-words result is authoritative when no usable streaming transcript exists; otherwise the usable streaming transcript is retained. If the native request fails, usable streaming text remains available, followed by the configured local fallback when needed. Native requests accept at most 10 MiB of raw WAV audio.
 
 Developers can test either API against a prerecorded 16 kHz mono PCM16 WAV without starting the daemon or delivering text to another application:
 

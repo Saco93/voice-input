@@ -19,7 +19,7 @@ pub(crate) fn transcribe_full_audio(config: &Config, wav_path: &Path) -> Result<
 
     let wav_bytes = read_bounded_wav(wav_path)?;
     let body = request_body(&audio3.native_model, &wav_bytes)?;
-    let response = http_client::post_json(
+    let response = http_client::post_json_sanitized(
         audio3.native_endpoint.as_str(),
         audio3.api_key.trim(),
         config.asr.connect_timeout_ms,
@@ -117,6 +117,7 @@ mod tests {
         net::TcpListener,
         sync::mpsc,
         thread,
+        time::Duration,
     };
 
     use reqwest::StatusCode;
@@ -185,6 +186,22 @@ mod tests {
     }
 
     #[test]
+    fn malformed_success_response_is_sanitized() {
+        const SENTINEL: &str = "private-native-transcript-sentinel";
+        let config = Config::default();
+        let body = format!(r#"{{"output":{{"text":"{SENTINEL}"}} trailing"#);
+        let error = parse_response(StatusCode::OK, body.as_bytes(), &config)
+            .expect_err("malformed JSON must fail");
+
+        assert!(
+            error
+                .to_string()
+                .contains("failed to parse Qwen-Audio-3 native ASR response JSON")
+        );
+        assert!(!format!("{error:#}").contains(SENTINEL));
+    }
+
+    #[test]
     fn native_no_words_response_is_empty_audio() {
         let config = Config::default();
         assert_eq!(
@@ -200,16 +217,53 @@ mod tests {
 
     #[test]
     fn native_error_response_is_sanitized() {
+        const SENTINEL: &str = "private-native-error-body-sentinel";
         let config = Config::default();
         for body in [
-            b"credential-or-transcript-must-not-escape".as_slice(),
-            br#"{"message":"some other provider error"}"#,
+            SENTINEL.as_bytes().to_vec(),
+            format!(r#"{{"message":"{SENTINEL}"}}"#).into_bytes(),
         ] {
-            let error = parse_response(StatusCode::BAD_REQUEST, body, &config).unwrap_err();
+            let error = parse_response(StatusCode::BAD_REQUEST, &body, &config).unwrap_err();
             assert_eq!(
                 error.to_string(),
                 "Qwen-Audio-3 native ASR returned HTTP 400"
             );
+            assert!(!format!("{error:#}").contains(SENTINEL));
+        }
+    }
+
+    #[test]
+    fn loopback_timeout_is_bounded_and_does_not_expose_request_details() {
+        const QUERY_SENTINEL: &str = "private-endpoint-query-sentinel";
+        const CREDENTIAL_SENTINEL: &str = "private-credential-sentinel";
+        const AUDIO_SENTINEL: &str = "private-audio-sentinel";
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let endpoint = format!(
+            "http://{}/native?private={QUERY_SENTINEL}",
+            listener.local_addr().unwrap()
+        );
+        let server = thread::spawn(move || {
+            let (_stream, _) = listener.accept().unwrap();
+            thread::sleep(Duration::from_secs(1));
+        });
+
+        let temp = tempfile::tempdir().unwrap();
+        let wav_path = temp.path().join("input.wav");
+        std::fs::write(&wav_path, AUDIO_SENTINEL).unwrap();
+        let mut config = Config::default();
+        config.asr.alibaba_audio3.api_key = CREDENTIAL_SENTINEL.into();
+        config.asr.alibaba_audio3.native_endpoint = endpoint.clone();
+        config.asr.alibaba_audio3.native_timeout_ms = 300;
+
+        let error = transcribe_full_audio(&config, &wav_path)
+            .expect_err("server that never responds must time out");
+        server.join().unwrap();
+        let formatted = format!("{error:#}");
+        assert!(formatted.contains("timed out"));
+        assert!(!formatted.contains(&endpoint));
+        for sentinel in [QUERY_SENTINEL, CREDENTIAL_SENTINEL, AUDIO_SENTINEL] {
+            assert!(!formatted.contains(sentinel));
         }
     }
 

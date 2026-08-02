@@ -18,6 +18,41 @@ pub fn post_json(
     request_timeout_ms: u64,
     body: &Value,
 ) -> Result<JsonResponse> {
+    post_json_inner(
+        endpoint,
+        bearer_token,
+        connect_timeout_ms,
+        request_timeout_ms,
+        body,
+        false,
+    )
+}
+
+pub fn post_json_sanitized(
+    endpoint: &str,
+    bearer_token: &str,
+    connect_timeout_ms: u64,
+    request_timeout_ms: u64,
+    body: &Value,
+) -> Result<JsonResponse> {
+    post_json_inner(
+        endpoint,
+        bearer_token,
+        connect_timeout_ms,
+        request_timeout_ms,
+        body,
+        true,
+    )
+}
+
+fn post_json_inner(
+    endpoint: &str,
+    bearer_token: &str,
+    connect_timeout_ms: u64,
+    request_timeout_ms: u64,
+    body: &Value,
+    sanitize_errors: bool,
+) -> Result<JsonResponse> {
     if bearer_token.is_empty() {
         bail!("HTTP bearer credential is empty");
     }
@@ -29,12 +64,24 @@ pub fn post_json(
         .build()
         .context("failed to build native HTTP client")?;
 
-    let response = client
+    let request = client
         .post(endpoint)
         .bearer_auth(bearer_token)
         .json(body)
-        .send()
-        .with_context(|| format!("native HTTP request to {endpoint} failed"))?;
+        .send();
+    let response = if sanitize_errors {
+        request.map_err(|error| {
+            if error.is_timeout() {
+                anyhow::anyhow!("native HTTP request timed out")
+            } else if error.is_connect() {
+                anyhow::anyhow!("native HTTP connection failed")
+            } else {
+                anyhow::anyhow!("native HTTP request failed")
+            }
+        })?
+    } else {
+        request.with_context(|| format!("native HTTP request to {endpoint} failed"))?
+    };
     let status = response.status();
     let mut bytes = Vec::new();
     response

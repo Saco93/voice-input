@@ -16,7 +16,10 @@ use std::{
 
 use anyhow::Result;
 
-use crate::config::{AsrProvider, Config};
+use crate::{
+    config::{AsrProvider, Config},
+    diagnostics::FailureKind,
+};
 
 pub(crate) use qwen_audio3::transcribe_full_audio as transcribe_qwen_audio3_full_audio;
 pub use qwen_batch::transcribe_full_audio as transcribe_alibaba_full_audio;
@@ -49,7 +52,7 @@ pub enum AsrEvent {
     SegmentFinal { text: String },
     Final { text: String },
     Finished,
-    Error { message: String },
+    Error { kind: FailureKind },
 }
 
 pub struct AsrSessionHandle {

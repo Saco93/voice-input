@@ -113,7 +113,7 @@ QtObject {
         "I understand and enable experimental Qwen-Audio-3": "我了解相关风险并启用实验性 Qwen-Audio-3",
         "Selecting the provider does not enable this acknowledgement.": "仅选择此提供商不会自动确认并启用实验功能。",
         "Enable native final pass": "启用原生最终处理",
-        "Run the native Audio3 model after streaming recognition.": "流式识别完成后，再运行原生 Audio3 模型。",
+        "After streaming, send the complete recording remotely. No words is authoritative unless streaming text is usable; failures keep streaming text or use local fallback.": "流式识别结束后，将完整录音发送给远程服务。流式文本不可用时，无词结果具有最终效力；请求失败时保留可用的流式文本，或使用本地备用识别。",
         "Technical settings for this page.": "此页面的技术设置。",
         "Capture cadence, timeouts, and Alibaba tuning.": "设置采集频率、超时和 Alibaba 调优参数。",
         "Capture cadence, timeouts, and provider tuning.": "设置采集频率、超时和提供商调优参数。",

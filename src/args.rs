@@ -8,6 +8,7 @@ pub enum Command {
     Record(RecordAction),
     Hud(HudCommand),
     Status(StatusOptions),
+    Diagnostics(DiagnosticsOptions),
     Config(ConfigOptions),
     Settings,
     SettingsBackend,
@@ -71,6 +72,11 @@ pub struct ConfigOptions {
     pub format: OutputFormat,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DiagnosticsOptions {
+    pub format: OutputFormat,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SetupCommand {
     Model,
@@ -114,6 +120,7 @@ pub fn parse() -> Result<Command> {
         "record" => parse_record(args.collect()),
         "hud" => parse_hud(args.collect()),
         "status" => parse_status(args.collect()),
+        "diagnostics" => parse_diagnostics(args.collect()),
         "config" => parse_config(args.collect()),
         "settings" => require_no_args(args, "settings").map(|()| Command::Settings),
         "settings-backend" => parse_settings_backend(args.collect()),
@@ -240,6 +247,19 @@ fn parse_status(args: Vec<String>) -> Result<Command> {
     }))
 }
 
+fn parse_diagnostics(args: Vec<String>) -> Result<Command> {
+    match args.as_slice() {
+        [] => Ok(Command::Diagnostics(DiagnosticsOptions {
+            format: OutputFormat::Text,
+        })),
+        [option, value] if option == "--format" => Ok(Command::Diagnostics(DiagnosticsOptions {
+            format: parse_format(value)?,
+        })),
+        [option] if option == "--format" => bail!("--format requires `text` or `json`"),
+        [unknown, ..] => bail!("unknown diagnostics option `{unknown}`"),
+    }
+}
+
 fn parse_config(args: Vec<String>) -> Result<Command> {
     let mut format = OutputFormat::Text;
     let mut iter = args.into_iter();
@@ -358,6 +378,7 @@ USAGE:
   voice-input hud position <bottom-center|bottom-left|bottom-right>
   voice-input hud <center|reset>
   voice-input status [--follow] [--extended] [--format text|json]
+  voice-input diagnostics [--format text|json]
   voice-input config [--format text|json]
   voice-input settings
   voice-input setup <model|waybar|hyprland|systemd|gpu|onnx>
@@ -432,6 +453,31 @@ mod tests {
     #[test]
     fn help_lists_asr_stream_test_usage() {
         assert!(help_text().contains("voice-input asr stream-test --file <wav-path>"));
+    }
+
+    #[test]
+    fn diagnostics_parser_is_typed_and_strict() {
+        assert_eq!(
+            parse_diagnostics(strings(&[])).unwrap(),
+            Command::Diagnostics(DiagnosticsOptions {
+                format: OutputFormat::Text
+            })
+        );
+        assert_eq!(
+            parse_diagnostics(strings(&["--format", "json"])).unwrap(),
+            Command::Diagnostics(DiagnosticsOptions {
+                format: OutputFormat::Json
+            })
+        );
+        assert!(parse_diagnostics(strings(&["--format"])).is_err());
+        assert!(parse_diagnostics(strings(&["--format", "yaml"])).is_err());
+        assert!(parse_diagnostics(strings(&["--format", "json", "extra"])).is_err());
+        assert!(parse_diagnostics(strings(&["--extended"])).is_err());
+    }
+
+    #[test]
+    fn help_lists_diagnostics_usage() {
+        assert!(help_text().contains("voice-input diagnostics [--format text|json]"));
     }
 
     #[test]

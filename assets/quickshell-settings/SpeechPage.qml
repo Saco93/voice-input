@@ -220,7 +220,7 @@ SettingsPage {
                 theme: root.theme
                 label: "Enable native final pass"
                 checked: root.controller.value("asr.alibaba_audio3.native_final_pass_enabled", false)
-                help: "Run the native Audio3 model after streaming recognition."
+                help: "After streaming, send the complete recording remotely. No words is authoritative unless streaming text is usable; failures keep streaming text or use local fallback."
                 error: root.controller.errorFor("asr.alibaba_audio3.native_final_pass_enabled")
                 enabled: !root.controller.busy
                 onToggled: (checked) => {

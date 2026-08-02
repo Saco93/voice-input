@@ -15,11 +15,14 @@ use anyhow::{Context, Result, anyhow, bail};
 use crate::{
     args::{
         AsrCommand, AsrStreamTestOptions, AsrTestOptions, Command as ParsedCommand, ConfigOptions,
-        HudCommand, HudMoveDirection, HudPositionCommand, LlmCommand, OutputFormat, SetupCommand,
+        DiagnosticsOptions, HudCommand, HudMoveDirection, HudPositionCommand, LlmCommand,
+        OutputFormat, SetupCommand,
     },
     backend::{self, AsrBackend, AsrControl, AsrEvent, AsrSessionHandle, AudioSpec},
     config::{AsrProvider, Config},
-    daemon, focused_window, llm, output, paths, setup,
+    daemon,
+    diagnostics::SupportPayload,
+    focused_window, llm, output, paths, setup,
     state::Snapshot,
     wav,
 };
@@ -43,6 +46,7 @@ pub fn run() -> Result<()> {
             Ok(())
         }
         ParsedCommand::Status(options) => run_status(options),
+        ParsedCommand::Diagnostics(options) => print_diagnostics(options),
         ParsedCommand::Config(options) => print_config(options),
         ParsedCommand::Settings => open_settings(),
         ParsedCommand::SettingsBackend => crate::settings_backend::run_stdio(),
@@ -114,9 +118,7 @@ fn record_control_command(action: crate::args::RecordAction) -> String {
 
 fn run_status(options: crate::args::StatusOptions) -> Result<()> {
     let config = Config::load()?;
-    let state_path = config
-        .state_path()?
-        .unwrap_or(paths::runtime_dir()?.join("state.json"));
+    let state_path = configured_state_path(&config)?;
     let mut last_payload = String::new();
 
     loop {
@@ -137,6 +139,26 @@ fn run_status(options: crate::args::StatusOptions) -> Result<()> {
         }
         thread::sleep(Duration::from_millis(250));
     }
+}
+
+fn print_diagnostics(options: DiagnosticsOptions) -> Result<()> {
+    let config = Config::load()?;
+    let state_path = configured_state_path(&config)?;
+    let snapshot = load_available_snapshot(&state_path)?;
+    let payload = SupportPayload::new(&config, snapshot.as_ref());
+    print!("{}", format_diagnostics(&payload, options.format)?);
+    Ok(())
+}
+
+fn format_diagnostics(payload: &SupportPayload, format: OutputFormat) -> Result<String> {
+    let mut output = match format {
+        OutputFormat::Text => payload.format_text(),
+        OutputFormat::Json => serde_json::to_string_pretty(payload)?,
+    };
+    if !output.ends_with('\n') {
+        output.push('\n');
+    }
+    Ok(output)
 }
 
 fn print_config(options: ConfigOptions) -> Result<()> {
@@ -351,15 +373,25 @@ fn run_setup(command: SetupCommand) -> Result<()> {
     }
 }
 
+fn configured_state_path(config: &Config) -> Result<std::path::PathBuf> {
+    Ok(config
+        .state_path()?
+        .unwrap_or(paths::runtime_dir()?.join("state.json")))
+}
+
 fn load_snapshot(config: &Config, state_path: &std::path::Path) -> Result<Snapshot> {
+    Ok(load_available_snapshot(state_path)?.unwrap_or_else(|| Snapshot::idle(config)))
+}
+
+fn load_available_snapshot(state_path: &std::path::Path) -> Result<Option<Snapshot>> {
     if !state_path.exists() {
-        return Ok(Snapshot::idle(config));
+        return Ok(None);
     }
     let source = fs::read_to_string(state_path)
         .with_context(|| format!("failed to read {}", state_path.display()))?;
     let snapshot: Snapshot = serde_json::from_str(&source)
         .with_context(|| format!("failed to parse {}", state_path.display()))?;
-    Ok(snapshot)
+    Ok(Some(snapshot))
 }
 
 fn hud_control_command(command: HudCommand) -> String {
@@ -395,17 +427,26 @@ mod tests {
         path::Path,
         sync::{Arc, Mutex, atomic::AtomicBool, mpsc},
         thread,
+        time::Duration,
     };
 
     use anyhow::Result;
 
-    use super::stream_pcm_with_backend;
+    use super::{
+        StreamOutcome, collect_stream_events, format_diagnostics, stream_pcm_with_backend,
+    };
     use crate::{
+        args::OutputFormat,
         backend::{
             ASR_CONTROL_QUEUE_CAPACITY, AsrBackend, AsrControl, AsrEvent, AsrSessionHandle,
             AudioSpec,
         },
-        config::Config,
+        config::{AsrProvider, Config},
+        diagnostics::{
+            DIAGNOSTICS_SCHEMA_VERSION, Diagnostics, FailureKind, FinalPassKind, OverallOutcome,
+            Provider, SelectedResult, SessionDiagnostics, StageStatus, SupportPayload,
+        },
+        state::Snapshot,
     };
 
     struct FakeStreamingBackend {
@@ -449,6 +490,114 @@ mod tests {
         fn transcribe_file(&self, _config: &Config, _wav_path: &Path) -> Result<String> {
             unreachable!("stream test must not use native file transcription")
         }
+    }
+
+    #[test]
+    fn diagnostics_json_contains_only_allowlisted_support_data() {
+        let mut config = Config {
+            state_file: "/private/SENTINEL_STATE_PATH.json".into(),
+            ..Config::default()
+        };
+        config.asr.provider = AsrProvider::AlibabaQwenAudio3;
+        config.asr.alibaba_audio3.native_final_pass_enabled = true;
+        config.asr.alibaba_audio3.model = "SENTINEL_MODEL".into();
+        config.asr.alibaba_audio3.native_model = "SENTINEL_NATIVE_MODEL".into();
+        config.asr.alibaba_audio3.endpoint = "https://SENTINEL_ENDPOINT.example".into();
+        config.asr.alibaba_audio3.api_key = "SENTINEL_CREDENTIAL".into();
+
+        let mut snapshot = Snapshot::idle(&config);
+        snapshot.tooltip = "SENTINEL_TOOLTIP".into();
+        snapshot.transcript = "SENTINEL_TRANSCRIPT".into();
+        snapshot.raw_transcript = Some("SENTINEL_RAW_TRANSCRIPT".into());
+        snapshot.refined_transcript = Some("SENTINEL_REFINED_TRANSCRIPT".into());
+        snapshot.model = "SENTINEL_SNAPSHOT_MODEL".into();
+        snapshot.error = Some("SENTINEL_RUNTIME_ERROR".into());
+
+        let output = format_diagnostics(
+            &SupportPayload::new(&config, Some(&snapshot)),
+            OutputFormat::Json,
+        )
+        .unwrap();
+        for private_value in [
+            "SENTINEL_STATE_PATH",
+            "SENTINEL_MODEL",
+            "SENTINEL_NATIVE_MODEL",
+            "SENTINEL_ENDPOINT",
+            "SENTINEL_CREDENTIAL",
+            "SENTINEL_TOOLTIP",
+            "SENTINEL_TRANSCRIPT",
+            "SENTINEL_RAW_TRANSCRIPT",
+            "SENTINEL_REFINED_TRANSCRIPT",
+            "SENTINEL_SNAPSHOT_MODEL",
+            "SENTINEL_RUNTIME_ERROR",
+        ] {
+            assert!(!output.contains(private_value), "leaked {private_value}");
+        }
+        let payload: serde_json::Value = serde_json::from_str(&output).unwrap();
+        assert_eq!(
+            payload.as_object().unwrap().keys().collect::<Vec<_>>(),
+            ["config", "runtime", "schema_version", "session"]
+        );
+    }
+
+    #[test]
+    fn diagnostics_text_and_json_have_canonical_no_session_and_session_forms() {
+        let config = Config::default();
+        let unavailable = SupportPayload::new(&config, None);
+        let text = format_diagnostics(&unavailable, OutputFormat::Text).unwrap();
+        assert!(text.starts_with("Voice Input diagnostics (schema 1)\n"));
+        assert!(text.contains("Runtime: unavailable\n"));
+        assert!(text.contains("Session: none\n"));
+
+        let mut snapshot = Snapshot::idle(&config);
+        snapshot.updated_at_ms = 1234;
+        snapshot.diagnostics = Diagnostics {
+            schema_version: DIAGNOSTICS_SCHEMA_VERSION,
+            session: Some(SessionDiagnostics::new(
+                7,
+                Provider::AlibabaQwenRealtime,
+                FinalPassKind::AlibabaCompatible,
+                true,
+            )),
+        };
+        let session = snapshot.diagnostics.session.as_mut().unwrap();
+        session.asr_outcome = OverallOutcome::Completed;
+        session.streaming.status = StageStatus::Completed;
+        session.streaming.ready_latency_ms = Some(12);
+        session.selected_result = SelectedResult::Streaming;
+        session.total_asr_latency_ms = Some(345);
+
+        let payload = SupportPayload::new(&config, Some(&snapshot));
+        let text = format_diagnostics(&payload, OutputFormat::Text).unwrap();
+        assert!(text.contains("Runtime: available (phase=idle, updated-at-ms=1234)"));
+        assert!(
+            text.contains("Session: 7 (asr-outcome=completed, provider=alibaba-qwen-realtime)")
+        );
+        assert!(text.contains("Streaming: completed, ready-latency-ms=12"));
+        assert!(text.contains("Total ASR latency: 345 ms"));
+
+        let json = format_diagnostics(&payload, OutputFormat::Json).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["schema_version"], 1);
+        assert_eq!(parsed["session"]["session_id"], 7);
+        assert_eq!(parsed["session"]["asr_outcome"], "completed");
+        assert!(parsed["session"].get("outcome").is_none());
+        assert_eq!(parsed["session"]["selected_result"], "streaming");
+    }
+
+    #[test]
+    fn stream_event_collector_accepts_only_categorized_errors() {
+        let (event_tx, event_rx) = mpsc::channel();
+        event_tx
+            .send(AsrEvent::Error {
+                kind: FailureKind::Service,
+            })
+            .unwrap();
+
+        assert_eq!(
+            collect_stream_events(&event_rx, Duration::from_secs(1)),
+            StreamOutcome::Error
+        );
     }
 
     #[test]

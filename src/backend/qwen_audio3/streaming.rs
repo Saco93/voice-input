@@ -23,6 +23,7 @@ use tungstenite::{
 use crate::{
     backend::{ASR_CONTROL_QUEUE_CAPACITY, AsrControl, AsrEvent, AsrSessionHandle, AudioSpec},
     config::Config,
+    diagnostics::FailureKind,
 };
 
 type Audio3Socket = WebSocket<MaybeTlsStream<TcpStream>>;
@@ -32,7 +33,6 @@ type Connection = (Audio3Socket, HandshakeResponse);
 const MAX_CONTROLS_PER_TICK: usize = 8;
 const MAX_SERVER_MESSAGE_BYTES: usize = 64 * 1024;
 const MAX_TRANSCRIPT_BYTES: usize = 16 * 1024;
-const MAX_ERROR_BYTES: usize = 1_024;
 static TASK_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 pub(super) fn spawn_session(config: &Config, spec: AudioSpec) -> Result<AsrSessionHandle> {
@@ -161,11 +161,8 @@ fn run_session(
                             let _ = socket.close(None);
                             return Ok(());
                         }
-                        ServerEvent::TaskFailed { message } => {
-                            let _ = event_tx.send(AsrEvent::Error {
-                                message: message.clone(),
-                            });
-                            bail!("Qwen-Audio-3 task failed: {message}");
+                        ServerEvent::TaskFailed { kind } => {
+                            return report_task_failure(&event_tx, kind);
                         }
                     }
                 }
@@ -209,11 +206,8 @@ fn await_task_started(
             }
             Ok(message) => match parse_server_event(message, task_id)? {
                 Some(ServerEvent::TaskStarted) => return Ok(()),
-                Some(ServerEvent::TaskFailed { message }) => {
-                    let _ = event_tx.send(AsrEvent::Error {
-                        message: message.clone(),
-                    });
-                    bail!("Qwen-Audio-3 task failed: {message}");
+                Some(ServerEvent::TaskFailed { kind }) => {
+                    return report_task_failure(event_tx, kind);
                 }
                 Some(_) => bail!("Qwen-Audio-3 server event arrived before task-started"),
                 None => {}
@@ -227,6 +221,11 @@ fn await_task_started(
             Err(error) => return Err(error).context("failed to read Qwen-Audio-3 websocket"),
         }
     }
+}
+
+fn report_task_failure(event_tx: &mpsc::Sender<AsrEvent>, kind: FailureKind) -> Result<()> {
+    let _ = event_tx.send(AsrEvent::Error { kind });
+    bail!("Qwen-Audio-3 streaming ASR failed ({})", kind.as_str())
 }
 
 fn open_socket(endpoint: &str, api_key: &str, timeout: Duration) -> Result<Audio3Socket> {
@@ -383,7 +382,7 @@ enum ServerEvent {
     TaskStarted,
     ResultGenerated { text: String, sentence_final: bool },
     TaskFinished { text: Option<String> },
-    TaskFailed { message: String },
+    TaskFailed { kind: FailureKind },
 }
 
 fn parse_server_event(message: Message, expected_task_id: &str) -> Result<Option<ServerEvent>> {
@@ -431,7 +430,7 @@ fn parse_server_event(message: Message, expected_task_id: &str) -> Result<Option
             text: extract_optional_text(&payload),
         })),
         "task-failed" => Ok(Some(ServerEvent::TaskFailed {
-            message: extract_failure_message(&payload),
+            kind: provider_failure_kind(&payload),
         })),
         _ => Ok(None),
     }
@@ -471,13 +470,26 @@ fn extract_optional_text(payload: &Value) -> Option<String> {
     Some(bounded(text, MAX_TRANSCRIPT_BYTES).to_string())
 }
 
-fn extract_failure_message(payload: &Value) -> String {
-    let message = payload
-        .pointer("/payload/message")
-        .or_else(|| payload.pointer("/header/error_message"))
+fn provider_failure_kind(payload: &Value) -> FailureKind {
+    let code = payload
+        .pointer("/header/error_code")
+        .or_else(|| payload.pointer("/payload/code"))
+        .or_else(|| payload.pointer("/payload/error/code"))
         .and_then(Value::as_str)
-        .unwrap_or("task failed");
-    bounded(message, MAX_ERROR_BYTES).to_string()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+
+    if code.contains("timeout") {
+        FailureKind::Timeout
+    } else if code.contains("throttl") || code.contains("rate") || code.contains("quota") {
+        FailureKind::RateLimited
+    } else if code.contains("auth") || code.contains("api_key") || code.contains("unauthorized") {
+        FailureKind::Authentication
+    } else if code.contains("permission") || code.contains("forbidden") {
+        FailureKind::PermissionDenied
+    } else {
+        FailureKind::Service
+    }
 }
 
 fn bounded(value: &str, maximum_bytes: usize) -> &str {
@@ -543,9 +555,14 @@ mod tests {
     use serde_json::json;
     use tungstenite::Message;
 
+    use std::sync::mpsc;
+
+    use crate::{backend::AsrEvent, diagnostics::FailureKind};
+
     use super::{
-        AudioSpec, MAX_ERROR_BYTES, ServerEvent, TranscriptAssembler, finish_task_envelope,
-        new_task_id, parse_server_event, pcm16_le_bytes, run_task_envelope, websocket_request,
+        AudioSpec, ServerEvent, TranscriptAssembler, finish_task_envelope, new_task_id,
+        parse_server_event, pcm16_le_bytes, report_task_failure, run_task_envelope,
+        websocket_request,
     };
 
     const TASK_ID: &str = "0123456789abcdef0123456789abcdef";
@@ -692,20 +709,34 @@ mod tests {
     }
 
     #[test]
-    fn parses_and_bounds_task_failure() {
-        let server_message = "x".repeat(MAX_ERROR_BYTES + 50);
+    fn task_failure_message_is_discarded_and_only_category_is_emitted() {
+        const SENTINEL: &str = "private-transcript-sentinel";
         let event = Message::Text(
             json!({
                 "header": {"event": "task-failed", "task_id": TASK_ID},
-                "payload": {"message": server_message}
+                "payload": {"message": SENTINEL}
             })
             .to_string(),
         );
-        let Some(ServerEvent::TaskFailed { message }) = parse_server_event(event, TASK_ID).unwrap()
+        let Some(ServerEvent::TaskFailed { kind }) = parse_server_event(event, TASK_ID).unwrap()
         else {
             panic!("expected task failure");
         };
-        assert_eq!(message.len(), MAX_ERROR_BYTES);
+        assert_eq!(kind, FailureKind::Service);
+
+        let (event_tx, event_rx) = mpsc::channel();
+        let error = report_task_failure(&event_tx, kind).unwrap_err();
+        assert!(matches!(
+            event_rx.recv().unwrap(),
+            AsrEvent::Error {
+                kind: FailureKind::Service
+            }
+        ));
+        assert_eq!(
+            error.to_string(),
+            "Qwen-Audio-3 streaming ASR failed (service)"
+        );
+        assert!(!format!("{error:#}").contains(SENTINEL));
     }
 
     #[test]

@@ -27,6 +27,7 @@ use crate::{
         ASR_CONTROL_QUEUE_CAPACITY, AsrBackend, AsrControl, AsrEvent, AsrSessionHandle, AudioSpec,
     },
     config::{AlibabaTurnMode, Config},
+    diagnostics::FailureKind,
     waveform::pcm_has_voiced_speech,
 };
 
@@ -395,17 +396,8 @@ fn run_session(
                             let text = assembler.apply_completed(item_id, transcript);
                             let _ = event_tx.send(AsrEvent::SegmentFinal { text });
                         }
-                        ServerEvent::TranscriptionFailed { message } => {
-                            let _ = event_tx.send(AsrEvent::Error {
-                                message: message.clone(),
-                            });
-                            bail!("Alibaba realtime transcription failed: {message}");
-                        }
-                        ServerEvent::Error { message } => {
-                            let _ = event_tx.send(AsrEvent::Error {
-                                message: message.clone(),
-                            });
-                            bail!("Alibaba realtime ASR error: {message}");
+                        ServerEvent::Failed { kind } => {
+                            return report_provider_failure(&event_tx, kind);
                         }
                         ServerEvent::SessionFinished => {
                             eprintln!(
@@ -489,6 +481,11 @@ fn run_session(
             thread::sleep(Duration::from_millis(10));
         }
     }
+}
+
+fn report_provider_failure(event_tx: &mpsc::Sender<AsrEvent>, kind: FailureKind) -> Result<()> {
+    let _ = event_tx.send(AsrEvent::Error { kind });
+    bail!("Alibaba realtime ASR failed ({})", kind.as_str())
 }
 
 struct OpenedStream {
@@ -814,8 +811,7 @@ fn send_json(socket: &mut QwenSocket, payload: Value) -> Result<()> {
 }
 
 fn build_url(endpoint: &str, model: &str) -> Result<Url> {
-    let mut url =
-        Url::parse(endpoint).with_context(|| format!("invalid ASR endpoint `{endpoint}`"))?;
+    let mut url = Url::parse(endpoint).context("invalid ASR endpoint configuration")?;
     let has_model = url.query_pairs().any(|(key, _)| key == "model");
     if !has_model {
         url.query_pairs_mut().append_pair("model", model);
@@ -934,13 +930,10 @@ enum ServerEvent {
         item_id: String,
         transcript: String,
     },
-    TranscriptionFailed {
-        message: String,
+    Failed {
+        kind: FailureKind,
     },
     SessionFinished,
-    Error {
-        message: String,
-    },
 }
 
 fn parse_server_event(message: Message) -> Result<Option<ServerEvent>> {
@@ -970,23 +963,37 @@ fn parse_server_event(message: Message) -> Result<Option<ServerEvent>> {
                 .unwrap_or_default()
                 .to_string(),
         },
-        "conversation.item.input_audio_transcription.failed" => ServerEvent::TranscriptionFailed {
-            message: payload["error"]["message"]
-                .as_str()
-                .unwrap_or("transcription failed")
-                .to_string(),
-        },
+        "conversation.item.input_audio_transcription.failed" | "session.failed" | "error" => {
+            ServerEvent::Failed {
+                kind: provider_failure_kind(&payload),
+            }
+        }
         "session.finished" => ServerEvent::SessionFinished,
-        "error" => ServerEvent::Error {
-            message: payload["error"]["message"]
-                .as_str()
-                .unwrap_or("unknown websocket error")
-                .to_string(),
-        },
         _ => return Ok(None),
     };
 
     Ok(Some(event))
+}
+
+fn provider_failure_kind(payload: &Value) -> FailureKind {
+    let code = payload
+        .pointer("/error/code")
+        .or_else(|| payload.get("code"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+
+    if code.contains("timeout") {
+        FailureKind::Timeout
+    } else if code.contains("throttl") || code.contains("rate") || code.contains("quota") {
+        FailureKind::RateLimited
+    } else if code.contains("auth") || code.contains("api_key") || code.contains("unauthorized") {
+        FailureKind::Authentication
+    } else if code.contains("permission") || code.contains("forbidden") {
+        FailureKind::PermissionDenied
+    } else {
+        FailureKind::Service
+    }
 }
 
 fn required_string(payload: &Value, path: &[&str]) -> Result<String> {
@@ -1074,13 +1081,15 @@ fn push_transcript_piece(target: &mut String, piece: &str) {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::{sync::mpsc, time::Duration};
+
+    use crate::{backend::AsrEvent, diagnostics::FailureKind};
 
     use super::{
         ACTIVE_TRANSCRIPTION_STALL_TIMEOUT, AsrControl, InterruptionReason, Message,
         POST_TRANSCRIPT_SPEECH_STALL_TIMEOUT, PcmNoiseGate, RetainedAudio, RetryBudget,
         TranscriptAssembler, parse_server_event, push_transcript_piece, realtime_stall_reason,
-        update_local_voiced_evidence,
+        report_provider_failure, update_local_voiced_evidence,
     };
 
     #[test]
@@ -1259,6 +1268,36 @@ mod tests {
                 assert_eq!(stash, " wor");
             }
             other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn provider_failure_messages_are_discarded_and_only_category_is_emitted() {
+        const SENTINEL: &str = "private-provider-error-sentinel";
+        for event_type in ["session.failed", "error"] {
+            let message = Message::Text(
+                serde_json::json!({
+                    "type": event_type,
+                    "error": {"message": SENTINEL}
+                })
+                .to_string(),
+            );
+            let event = parse_server_event(message).unwrap().unwrap();
+            let super::ServerEvent::Failed { kind } = event else {
+                panic!("expected categorized failure");
+            };
+            assert_eq!(kind, FailureKind::Service);
+
+            let (event_tx, event_rx) = mpsc::channel();
+            let error = report_provider_failure(&event_tx, kind).unwrap_err();
+            assert!(matches!(
+                event_rx.recv().unwrap(),
+                AsrEvent::Error {
+                    kind: FailureKind::Service
+                }
+            ));
+            assert_eq!(error.to_string(), "Alibaba realtime ASR failed (service)");
+            assert!(!format!("{error:#}").contains(SENTINEL));
         }
     }
 
