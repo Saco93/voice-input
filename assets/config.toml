@@ -34,6 +34,15 @@ final_pass_model = "qwen3-asr-flash-2026-02-10"
 final_pass_timeout_ms = 20000
 final_pass_enable_itn = false
 
+[asr.alibaba_audio3]
+experimental_enabled = false
+endpoint = "wss://dashscope.aliyuncs.com/api-ws/v1/inference"
+model = "qwen-audio-3.0-asr-flash-streaming"
+native_endpoint = "https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation"
+native_model = "qwen-audio-3.0-asr-flash"
+native_final_pass_enabled = false
+native_timeout_ms = 20000
+
 [output]
 mode = "paste"
 fallback_to_clipboard = true

@@ -18,6 +18,7 @@ use anyhow::Result;
 
 use crate::config::{AsrProvider, Config};
 
+pub(crate) use qwen_audio3::transcribe_full_audio as transcribe_qwen_audio3_full_audio;
 pub use qwen_batch::transcribe_full_audio as transcribe_alibaba_full_audio;
 pub use text::apply_script_conversion;
 
@@ -47,6 +48,7 @@ pub enum AsrEvent {
     Partial { committed: String, unstable: String },
     SegmentFinal { text: String },
     Final { text: String },
+    Finished,
     Error { message: String },
 }
 

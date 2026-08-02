@@ -14,7 +14,16 @@ SettingsPage {
     signal navigateRequested(string page)
 
     function providerLabel(value) {
-        return root.theme.tr(value === "alibaba-qwen-realtime" ? "Alibaba Qwen realtime" : "Local CLI");
+        switch (value) {
+        case "local-cli":
+            return root.theme.tr("Local CLI");
+        case "alibaba-qwen-realtime":
+            return root.theme.tr("Alibaba Qwen realtime");
+        case "alibaba-qwen-audio3":
+            return root.theme.tr("Qwen-Audio-3 (experimental)");
+        default:
+            return root.theme.tr("Unknown provider");
+        }
     }
 
     title: "Overview"

@@ -1,8 +1,9 @@
+mod native;
 mod streaming;
 
 use std::path::Path;
 
-use anyhow::{Result, bail};
+use anyhow::Result;
 
 use crate::{
     backend::{AsrBackend, AsrSessionHandle, AudioSpec},
@@ -22,7 +23,9 @@ impl AsrBackend for QwenAudio3Backend {
         streaming::spawn_session(config, spec)
     }
 
-    fn transcribe_file(&self, _config: &Config, _wav_path: &Path) -> Result<String> {
-        bail!("experimental Qwen-Audio-3 backend does not support file transcription")
+    fn transcribe_file(&self, config: &Config, wav_path: &Path) -> Result<String> {
+        Ok(native::transcribe_full_audio(config, wav_path)?.unwrap_or_default())
     }
 }
+
+pub(crate) use native::transcribe_full_audio;

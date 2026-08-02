@@ -79,6 +79,21 @@ voice-input status
 systemctl --user status voice-input.service voice-input-hud.service
 ```
 
+## Experimental Qwen-Audio-3
+
+Qwen-Audio-3 is available as an explicit experimental provider. It is disabled by default and is not offered by the stable setup wizard. To try it, open Settings, choose **Qwen-Audio-3 (experimental)**, acknowledge the experimental-provider warning, and save. The existing encrypted Alibaba credential is shared with this provider.
+
+The streaming model supplies realtime text. **Native final pass** can optionally send the complete recording to `qwen-audio-3.0-asr-flash` after recording stops, replacing the streaming result when successful. Existing realtime text and the configured local fallback remain available if the native request fails.
+
+Developers can test either API against a prerecorded 16 kHz mono PCM16 WAV without starting the daemon or delivering text to another application:
+
+```bash
+voice-input asr stream-test --file sample.wav  # WebSocket streaming
+voice-input asr test --file sample.wav         # native full-audio request
+```
+
+Both commands require Qwen-Audio-3 to be selected and explicitly enabled in the active configuration. Remote tests send the supplied audio to the configured Alibaba endpoint and may incur API charges. Treat the provider, model names, endpoint compatibility, and transcript behavior as subject to change while this option remains experimental.
+
 ## Highlights
 
 - Realtime Chinese/English mixed dictation with Server VAD

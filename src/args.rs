@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use anyhow::{Result, anyhow, bail};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -10,6 +12,7 @@ pub enum Command {
     Settings,
     SettingsBackend,
     Setup(SetupCommand),
+    Asr(AsrCommand),
     Llm(LlmCommand),
     Help,
     Version,
@@ -77,6 +80,22 @@ pub enum SetupCommand {
     Backend(Vec<String>),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AsrCommand {
+    Test(AsrTestOptions),
+    StreamTest(AsrStreamTestOptions),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AsrTestOptions {
+    pub file: PathBuf,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AsrStreamTestOptions {
+    pub file: PathBuf,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LlmCommand {
     Test,
@@ -99,6 +118,7 @@ pub fn parse() -> Result<Command> {
         "settings" => require_no_args(args, "settings").map(|()| Command::Settings),
         "settings-backend" => parse_settings_backend(args.collect()),
         "setup" => parse_setup(args.collect()),
+        "asr" => parse_asr(args.collect()),
         "llm" => parse_llm(args.collect()),
         other => bail!("unknown command `{other}`"),
     }
@@ -270,6 +290,43 @@ fn parse_setup(args: Vec<String>) -> Result<Command> {
     Ok(Command::Setup(command))
 }
 
+fn parse_asr(args: Vec<String>) -> Result<Command> {
+    let Some(subcommand) = args.first() else {
+        bail!("asr requires the `test` or `stream-test` subcommand");
+    };
+    match subcommand.as_str() {
+        "test" => {
+            let file = parse_asr_file_option(&args[1..], subcommand)?;
+            Ok(Command::Asr(AsrCommand::Test(AsrTestOptions { file })))
+        }
+        "stream-test" => {
+            let file = parse_asr_file_option(&args[1..], subcommand)?;
+            Ok(Command::Asr(AsrCommand::StreamTest(AsrStreamTestOptions {
+                file,
+            })))
+        }
+        _ => bail!("unknown asr command `{subcommand}`"),
+    }
+}
+
+fn parse_asr_file_option(args: &[String], subcommand: &str) -> Result<PathBuf> {
+    match args.first().map(String::as_str) {
+        Some("--file") => {}
+        Some(other) => {
+            bail!("unknown asr {subcommand} argument `{other}`; expected `--file <wav-path>`")
+        }
+        None => bail!("asr {subcommand} requires `--file <wav-path>`"),
+    }
+    let file = args
+        .get(1)
+        .ok_or_else(|| anyhow!("--file requires a WAV path"))?;
+    if let Some(extra) = args.get(2) {
+        bail!("asr {subcommand} does not accept extra argument `{extra}`");
+    }
+
+    Ok(PathBuf::from(file))
+}
+
 fn parse_llm(args: Vec<String>) -> Result<Command> {
     require_arg_count(&args, 1, "llm test")?;
     let Some(subcommand) = args.first() else {
@@ -304,6 +361,8 @@ USAGE:
   voice-input config [--format text|json]
   voice-input settings
   voice-input setup <model|waybar|hyprland|systemd|gpu|onnx>
+  voice-input asr test --file <wav-path>
+  voice-input asr stream-test --file <wav-path>
   voice-input llm test
 
 COMPATIBILITY:
@@ -328,6 +387,8 @@ mod tests {
         assert!(parse_hud(strings(&["position", "left", "extra"])).is_err());
         assert!(parse_llm(strings(&["test", "extra"])).is_err());
         assert!(parse_setup(strings(&["systemd", "extra"])).is_err());
+        assert!(parse_asr(strings(&["test", "--file", "sample.wav", "extra"])).is_err());
+        assert!(parse_asr(strings(&["stream-test", "--file", "sample.wav", "extra"])).is_err());
     }
 
     #[test]
@@ -336,6 +397,41 @@ mod tests {
             parse_record(strings(&["restart"])).unwrap(),
             Command::Record(RecordAction::Restart)
         );
+    }
+
+    #[test]
+    fn asr_test_requires_exact_file_option() {
+        assert_eq!(
+            parse_asr(strings(&["test", "--file", "/tmp/sample.wav"])).unwrap(),
+            Command::Asr(AsrCommand::Test(AsrTestOptions {
+                file: PathBuf::from("/tmp/sample.wav")
+            }))
+        );
+        assert!(parse_asr(strings(&[])).is_err());
+        assert!(parse_asr(strings(&["unknown"])).is_err());
+        assert!(parse_asr(strings(&["test"])).is_err());
+        assert!(parse_asr(strings(&["test", "sample.wav"])).is_err());
+        assert!(parse_asr(strings(&["test", "--file"])).is_err());
+        assert!(parse_asr(strings(&["test", "--other", "sample.wav"])).is_err());
+    }
+
+    #[test]
+    fn asr_stream_test_requires_exact_file_option() {
+        assert_eq!(
+            parse_asr(strings(&["stream-test", "--file", "/tmp/sample.wav"])).unwrap(),
+            Command::Asr(AsrCommand::StreamTest(AsrStreamTestOptions {
+                file: PathBuf::from("/tmp/sample.wav")
+            }))
+        );
+        assert!(parse_asr(strings(&["stream-test"])).is_err());
+        assert!(parse_asr(strings(&["stream-test", "sample.wav"])).is_err());
+        assert!(parse_asr(strings(&["stream-test", "--file"])).is_err());
+        assert!(parse_asr(strings(&["stream-test", "--other", "sample.wav"])).is_err());
+    }
+
+    #[test]
+    fn help_lists_asr_stream_test_usage() {
+        assert!(help_text().contains("voice-input asr stream-test --file <wav-path>"));
     }
 
     #[test]

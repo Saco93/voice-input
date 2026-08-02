@@ -79,6 +79,21 @@ voice-input status
 systemctl --user status voice-input.service voice-input-hud.service
 ```
 
+## 实验性 Qwen-Audio-3
+
+Qwen-Audio-3 目前作为需要明确启用的实验性提供商使用。该选项默认关闭，稳定安装向导也不会提供它。如需试用，请打开 Settings，选择 **Qwen-Audio-3（实验性）**，确认实验功能警告后保存。该提供商与现有 Alibaba 实时识别共用同一份加密凭据。
+
+流式模型负责提供实时文本。用户还可以启用**原生最终处理**：录音停止后，程序会把完整录音发送给 `qwen-audio-3.0-asr-flash`，成功时使用它的结果替换流式结果。如果原生请求失败，程序仍可使用已有的实时文本或配置的本地备用识别。
+
+开发者可以使用预先录制的 16 kHz、单声道、PCM16 WAV 分别测试两个 API。以下命令不会启动守护进程，也不会把识别文本输入其他应用：
+
+```bash
+voice-input asr stream-test --file sample.wav  # WebSocket 流式识别
+voice-input asr test --file sample.wav         # 原生完整音频识别
+```
+
+两个命令都要求当前配置已经选择并明确启用 Qwen-Audio-3。远程测试会把指定音频发送到配置的 Alibaba endpoint，并且可能产生 API 费用。在该选项仍处于实验阶段时，提供商行为、模型名称、端点兼容性和识别结果都可能发生变化。
+
 ## 主要能力
 
 - 支持中英文混合输入的 Qwen Realtime + Server VAD

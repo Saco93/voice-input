@@ -107,6 +107,8 @@ pub struct AlibabaAudio3Config {
     pub model: String,
     pub native_endpoint: String,
     pub native_model: String,
+    pub native_final_pass_enabled: bool,
+    pub native_timeout_ms: u64,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -308,6 +310,8 @@ impl Default for Config {
                     model: "qwen-audio-3.0-asr-flash-streaming".into(),
                     native_endpoint: "https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation".into(),
                     native_model: "qwen-audio-3.0-asr-flash".into(),
+                    native_final_pass_enabled: false,
+                    native_timeout_ms: 20_000,
                 },
             },
             output: OutputConfig {
@@ -546,6 +550,15 @@ impl Config {
                 512,
                 false,
             );
+            if self.asr.alibaba_audio3.native_final_pass_enabled {
+                range(
+                    &mut fields,
+                    "asr.alibaba_audio3.native_timeout_ms",
+                    self.asr.alibaba_audio3.native_timeout_ms,
+                    100,
+                    120_000,
+                );
+            }
         }
 
         range(
@@ -1001,7 +1014,16 @@ impl AsrConfig {
                     self.alibaba.model.clone()
                 }
             }
-            AsrProvider::AlibabaQwenAudio3 => self.alibaba_audio3.model.clone(),
+            AsrProvider::AlibabaQwenAudio3 => {
+                if self.alibaba_audio3.native_final_pass_enabled {
+                    format!(
+                        "{} -> {}",
+                        self.alibaba_audio3.model, self.alibaba_audio3.native_model
+                    )
+                } else {
+                    self.alibaba_audio3.model.clone()
+                }
+            }
         }
     }
 }
@@ -1191,6 +1213,8 @@ mod tests {
             config.asr.alibaba_audio3.native_model,
             "qwen-audio-3.0-asr-flash"
         );
+        assert!(!config.asr.alibaba_audio3.native_final_pass_enabled);
+        assert_eq!(config.asr.alibaba_audio3.native_timeout_ms, 20_000);
     }
 
     #[test]
@@ -1227,6 +1251,47 @@ mod tests {
     }
 
     #[test]
+    fn audio3_active_model_label_includes_enabled_native_final_pass() {
+        let mut config = Config::default();
+        config.asr.provider = AsrProvider::AlibabaQwenAudio3;
+        assert_eq!(
+            config.asr.active_model_label(),
+            "qwen-audio-3.0-asr-flash-streaming"
+        );
+
+        config.asr.alibaba_audio3.native_final_pass_enabled = true;
+        assert_eq!(
+            config.asr.active_model_label(),
+            "qwen-audio-3.0-asr-flash-streaming -> qwen-audio-3.0-asr-flash"
+        );
+    }
+
+    #[test]
+    fn audio3_native_timeout_is_validated_only_for_selected_enabled_final_pass() {
+        let mut config = Config::default();
+        config.asr.alibaba_audio3.native_timeout_ms = 0;
+        config
+            .validate()
+            .expect("inactive Audio3 native timeout is ignored");
+
+        config.asr.provider = AsrProvider::AlibabaQwenAudio3;
+        config.asr.alibaba_audio3.experimental_enabled = true;
+        config
+            .validate()
+            .expect("disabled Audio3 final pass ignores its timeout");
+
+        config.asr.alibaba_audio3.native_final_pass_enabled = true;
+        let error = config
+            .validate()
+            .expect_err("enabled Audio3 final pass validates its timeout");
+        assert!(
+            error
+                .fields
+                .contains_key("asr.alibaba_audio3.native_timeout_ms")
+        );
+    }
+
+    #[test]
     fn old_asr_config_deserializes_with_unchanged_defaults() {
         let old = r#"
 provider = "alibaba-qwen-realtime"
@@ -1250,6 +1315,24 @@ model = "legacy-model"
             asr.alibaba_audio3.model,
             "qwen-audio-3.0-asr-flash-streaming"
         );
+        assert!(!asr.alibaba_audio3.native_final_pass_enabled);
+        assert_eq!(asr.alibaba_audio3.native_timeout_ms, 20_000);
+    }
+
+    #[test]
+    fn audio3_config_without_native_gate_or_timeout_uses_new_defaults() {
+        let audio3: super::AlibabaAudio3Config = toml::from_str(
+            r#"
+experimental_enabled = true
+endpoint = "wss://dashscope.aliyuncs.com/api-ws/v1/inference"
+model = "streaming-model"
+native_endpoint = "https://dashscope.aliyuncs.com/native"
+native_model = "native-model"
+"#,
+        )
+        .expect("pre-milestone Audio3 config");
+        assert!(!audio3.native_final_pass_enabled);
+        assert_eq!(audio3.native_timeout_ms, 20_000);
     }
 
     #[test]

@@ -36,6 +36,26 @@ const CAPTURE_STOP_DRAIN: Duration = Duration::from_millis(120);
 const CONTROL_COMMAND_MAX_BYTES: u64 = 4 * 1024;
 const CONTROL_READ_TIMEOUT: Duration = Duration::from_secs(2);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FullAudioPass {
+    AlibabaCompatible,
+    QwenAudio3Native,
+}
+
+fn selected_full_audio_pass(config: &Config) -> Option<FullAudioPass> {
+    match config.asr.provider {
+        AsrProvider::AlibabaQwenRealtime if config.asr.alibaba.final_pass_enabled => {
+            Some(FullAudioPass::AlibabaCompatible)
+        }
+        AsrProvider::AlibabaQwenAudio3 if config.asr.alibaba_audio3.native_final_pass_enabled => {
+            Some(FullAudioPass::QwenAudio3Native)
+        }
+        AsrProvider::LocalCli
+        | AsrProvider::AlibabaQwenRealtime
+        | AsrProvider::AlibabaQwenAudio3 => None,
+    }
+}
+
 pub fn run(config: Config) -> Result<()> {
     let runtime_dir = paths::runtime_dir()?;
     fs::create_dir_all(&runtime_dir)?;
@@ -1029,11 +1049,9 @@ impl Daemon {
                         return Ok(());
                     }
 
-                    let final_pass_enabled = self.config.asr.provider
-                        == AsrProvider::AlibabaQwenRealtime
-                        && self.config.asr.alibaba.final_pass_enabled;
+                    let full_audio_pass = selected_full_audio_pass(&self.config);
                     if realtime_overloaded
-                        && !final_pass_enabled
+                        && full_audio_pass.is_none()
                         && !self.config.asr.fallback_to_local
                     {
                         bail!(
@@ -1082,7 +1100,7 @@ impl Daemon {
                         }
                     };
 
-                    if final_pass_enabled {
+                    if let Some(full_audio_pass) = full_audio_pass {
                         self.state.update(|snapshot| {
                             snapshot.phase = Phase::Transcribing;
                             snapshot.class = "transcribing".into();
@@ -1091,7 +1109,7 @@ impl Daemon {
                             snapshot.bars = PROCESSING_WAVEFORM;
                         })?;
 
-                        match self.transcribe_alibaba_full_audio(&audio) {
+                        match self.transcribe_full_audio(&audio, full_audio_pass) {
                             Ok(Some(text)) => text,
                             Ok(None) => {
                                 if let Some(text) = remote_transcript {
@@ -1903,6 +1921,7 @@ fn spawn_realtime_event_thread(
                         }
                     })?;
                 }
+                backend::AsrEvent::Finished => break,
                 backend::AsrEvent::Error { message } => {
                     speech_detected.store(true, Ordering::SeqCst);
                     realtime_overloaded.store(true, Ordering::SeqCst);
@@ -1990,11 +2009,18 @@ fn truncate_for_tooltip(text: &str) -> String {
 }
 
 impl Daemon {
-    fn transcribe_alibaba_full_audio(&self, audio: &[i16]) -> Result<Option<String>> {
+    fn transcribe_full_audio(&self, audio: &[i16], pass: FullAudioPass) -> Result<Option<String>> {
         let temp_file = tempfile::NamedTempFile::new()
-            .context("failed to create WAV temp file for Alibaba full-audio retranscription")?;
+            .context("failed to create WAV temp file for full-audio retranscription")?;
         wav::write_pcm16_wav(temp_file.path(), self.config.audio.sample_rate, audio)?;
-        backend::transcribe_alibaba_full_audio(&self.config, temp_file.path())
+        match pass {
+            FullAudioPass::AlibabaCompatible => {
+                backend::transcribe_alibaba_full_audio(&self.config, temp_file.path())
+            }
+            FullAudioPass::QwenAudio3Native => {
+                backend::transcribe_qwen_audio3_full_audio(&self.config, temp_file.path())
+            }
+        }
     }
 
     fn transcribe_local_audio(&self, audio: &[i16]) -> Result<String> {
@@ -2015,6 +2041,31 @@ mod tests {
     use std::io::Cursor;
 
     use super::*;
+
+    #[test]
+    fn full_audio_pass_selection_keeps_providers_independent() {
+        let mut config = Config::default();
+        assert_eq!(selected_full_audio_pass(&config), None);
+
+        config.asr.provider = AsrProvider::AlibabaQwenRealtime;
+        config.asr.alibaba.final_pass_enabled = true;
+        assert_eq!(
+            selected_full_audio_pass(&config),
+            Some(FullAudioPass::AlibabaCompatible)
+        );
+
+        config.asr.provider = AsrProvider::AlibabaQwenAudio3;
+        assert_eq!(selected_full_audio_pass(&config), None);
+        config.asr.alibaba_audio3.native_final_pass_enabled = true;
+        assert_eq!(
+            selected_full_audio_pass(&config),
+            Some(FullAudioPass::QwenAudio3Native)
+        );
+
+        config.asr.provider = AsrProvider::AlibabaQwenRealtime;
+        config.asr.alibaba.final_pass_enabled = false;
+        assert_eq!(selected_full_audio_pass(&config), None);
+    }
 
     #[test]
     fn control_commands_are_bounded_and_require_utf8() {

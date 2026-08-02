@@ -157,6 +157,7 @@ fn run_session(
                             if !final_text.is_empty() {
                                 let _ = event_tx.send(AsrEvent::Final { text: final_text });
                             }
+                            let _ = event_tx.send(AsrEvent::Finished);
                             let _ = socket.close(None);
                             return Ok(());
                         }

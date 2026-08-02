@@ -2,20 +2,26 @@ use std::{
     fs,
     io::Write,
     process::{Command, Stdio},
+    sync::{
+        atomic::Ordering,
+        mpsc::{self, Receiver},
+    },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow, bail};
 
 use crate::{
     args::{
-        Command as ParsedCommand, ConfigOptions, HudCommand, HudMoveDirection, HudPositionCommand,
-        LlmCommand, OutputFormat, SetupCommand,
+        AsrCommand, AsrStreamTestOptions, AsrTestOptions, Command as ParsedCommand, ConfigOptions,
+        HudCommand, HudMoveDirection, HudPositionCommand, LlmCommand, OutputFormat, SetupCommand,
     },
-    config::Config,
+    backend::{self, AsrBackend, AsrControl, AsrEvent, AsrSessionHandle, AudioSpec},
+    config::{AsrProvider, Config},
     daemon, focused_window, llm, output, paths, setup,
     state::Snapshot,
+    wav,
 };
 
 pub fn run() -> Result<()> {
@@ -41,6 +47,8 @@ pub fn run() -> Result<()> {
         ParsedCommand::Settings => open_settings(),
         ParsedCommand::SettingsBackend => crate::settings_backend::run_stdio(),
         ParsedCommand::Setup(command) => run_setup(command),
+        ParsedCommand::Asr(AsrCommand::Test(options)) => run_asr_test(options),
+        ParsedCommand::Asr(AsrCommand::StreamTest(options)) => run_asr_stream_test(options),
         ParsedCommand::Llm(LlmCommand::Test) => {
             let mut config = Config::load()?;
             crate::credentials::apply_runtime_credentials(&mut config)?;
@@ -173,6 +181,163 @@ fn open_settings() -> Result<()> {
     Ok(())
 }
 
+fn run_asr_test(options: AsrTestOptions) -> Result<()> {
+    let mut config = load_audio3_test_config("asr test")?;
+    let metadata = match fs::metadata(&options.file) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            anyhow::bail!("ASR test file does not exist: {}", options.file.display())
+        }
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "failed to inspect ASR test file `{}`",
+                    options.file.display()
+                )
+            });
+        }
+    };
+    if !metadata.is_file() {
+        anyhow::bail!("ASR test path is not a file: {}", options.file.display());
+    }
+
+    apply_audio3_test_credentials(&mut config)?;
+
+    match backend::transcribe_qwen_audio3_full_audio(&config, &options.file)? {
+        Some(transcript) => println!("{transcript}"),
+        None => println!("No transcript (empty audio)."),
+    }
+    Ok(())
+}
+
+fn run_asr_stream_test(options: AsrStreamTestOptions) -> Result<()> {
+    let mut config = load_audio3_test_config("asr stream-test")?;
+    let samples = wav::read_pcm16_wav(
+        &options.file,
+        config.audio.sample_rate,
+        config.audio.max_duration_secs,
+    )?;
+    apply_audio3_test_credentials(&mut config)?;
+
+    let asr = backend::build(&config);
+    match stream_pcm_with_backend(asr.as_ref(), &config, &samples)? {
+        Some(transcript) => println!("{transcript}"),
+        None => println!("No transcript (empty audio)."),
+    }
+    Ok(())
+}
+
+fn load_audio3_test_config(command: &str) -> Result<Config> {
+    let config = Config::load()?;
+    if config.asr.provider != AsrProvider::AlibabaQwenAudio3 {
+        bail!("{command} requires selected provider `alibaba-qwen-audio3`");
+    }
+    if !config.asr.alibaba_audio3.experimental_enabled {
+        bail!("{command} requires `asr.alibaba_audio3.experimental_enabled = true`");
+    }
+    Ok(config)
+}
+
+fn apply_audio3_test_credentials(config: &mut Config) -> Result<()> {
+    crate::credentials::apply_runtime_credentials(config)?;
+    if config.asr.alibaba_audio3.api_key.trim().is_empty() {
+        let api_key = crate::credentials::decrypt(crate::credentials::ALIBABA_CREDENTIAL_ID)
+            .context("failed to load encrypted Alibaba credential")?;
+        config.asr.alibaba.api_key = api_key.clone();
+        config.asr.alibaba_audio3.api_key = api_key;
+    }
+    Ok(())
+}
+
+fn stream_pcm_with_backend(
+    asr: &dyn AsrBackend,
+    config: &Config,
+    samples: &[i16],
+) -> Result<Option<String>> {
+    let session = asr.spawn_session(
+        config,
+        AudioSpec {
+            sample_rate_hz: config.audio.sample_rate,
+        },
+    )?;
+    let AsrSessionHandle {
+        control_tx,
+        abort_flag,
+        event_rx,
+        join,
+    } = session;
+    let chunk_samples = usize::try_from(config.audio.sample_rate)
+        .context("audio sample rate does not fit this platform")?
+        .div_ceil(10);
+
+    // The adapter and its bounded control queue provide backpressure, so the
+    // prerecorded input can be submitted without sleeping for its duration.
+    let send_result = samples
+        .chunks(chunk_samples)
+        .try_for_each(|chunk| control_tx.send(AsrControl::AppendPcm16(chunk.to_vec())))
+        .and_then(|()| control_tx.send(AsrControl::Finish));
+    drop(control_tx);
+    if send_result.is_err() {
+        abort_flag.store(true, Ordering::SeqCst);
+        let _ = join_asr_worker(join);
+        bail!("Qwen-Audio-3 streaming ASR stopped while accepting audio");
+    }
+
+    let outcome = collect_stream_events(
+        &event_rx,
+        Duration::from_millis(config.asr.finalize_timeout_ms),
+    );
+    if !matches!(outcome, StreamOutcome::Finished(_)) {
+        abort_flag.store(true, Ordering::SeqCst);
+    }
+    drop(event_rx);
+    let worker_result = join_asr_worker(join);
+
+    match outcome {
+        StreamOutcome::Finished(transcript) => {
+            worker_result?;
+            Ok(transcript)
+        }
+        StreamOutcome::Error => bail!("Qwen-Audio-3 streaming ASR failed"),
+        StreamOutcome::TimedOut => bail!("Qwen-Audio-3 streaming ASR finalization timed out"),
+        StreamOutcome::Disconnected => {
+            if worker_result.is_err() {
+                bail!("Qwen-Audio-3 streaming ASR worker failed");
+            }
+            bail!("Qwen-Audio-3 streaming ASR ended without a completion event")
+        }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum StreamOutcome {
+    Finished(Option<String>),
+    Error,
+    TimedOut,
+    Disconnected,
+}
+
+fn collect_stream_events(event_rx: &Receiver<AsrEvent>, timeout: Duration) -> StreamOutcome {
+    let deadline = Instant::now() + timeout;
+    let mut transcript = None;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match event_rx.recv_timeout(remaining) {
+            Ok(AsrEvent::Final { text }) if !text.trim().is_empty() => transcript = Some(text),
+            Ok(AsrEvent::Finished) => return StreamOutcome::Finished(transcript),
+            Ok(AsrEvent::Error { .. }) => return StreamOutcome::Error,
+            Ok(_) => {}
+            Err(mpsc::RecvTimeoutError::Timeout) => return StreamOutcome::TimedOut,
+            Err(mpsc::RecvTimeoutError::Disconnected) => return StreamOutcome::Disconnected,
+        }
+    }
+}
+
+fn join_asr_worker(join: thread::JoinHandle<Result<()>>) -> Result<()> {
+    join.join()
+        .map_err(|_| anyhow!("Qwen-Audio-3 streaming ASR worker panicked"))?
+}
+
 fn run_setup(command: SetupCommand) -> Result<()> {
     match command {
         SetupCommand::Model => {
@@ -221,5 +386,84 @@ fn hud_control_command(command: HudCommand) -> String {
         ),
         HudCommand::Center => "hud center".into(),
         HudCommand::Reset => "hud reset".into(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        path::Path,
+        sync::{Arc, Mutex, atomic::AtomicBool, mpsc},
+        thread,
+    };
+
+    use anyhow::Result;
+
+    use super::stream_pcm_with_backend;
+    use crate::{
+        backend::{
+            ASR_CONTROL_QUEUE_CAPACITY, AsrBackend, AsrControl, AsrEvent, AsrSessionHandle,
+            AudioSpec,
+        },
+        config::Config,
+    };
+
+    struct FakeStreamingBackend {
+        controls: Arc<Mutex<Vec<usize>>>,
+    }
+
+    impl AsrBackend for FakeStreamingBackend {
+        fn spawn_session(&self, _config: &Config, _spec: AudioSpec) -> Result<AsrSessionHandle> {
+            let (control_tx, control_rx) = mpsc::sync_channel(ASR_CONTROL_QUEUE_CAPACITY);
+            let (event_tx, event_rx) = mpsc::channel();
+            let controls = self.controls.clone();
+            let join = thread::spawn(move || {
+                event_tx.send(AsrEvent::Ready).unwrap();
+                while let Ok(control) = control_rx.recv() {
+                    match control {
+                        AsrControl::AppendPcm16(samples) => {
+                            controls.lock().unwrap().push(samples.len());
+                        }
+                        AsrControl::Finish => {
+                            controls.lock().unwrap().push(0);
+                            event_tx
+                                .send(AsrEvent::Final {
+                                    text: "stream transcript".into(),
+                                })
+                                .unwrap();
+                            event_tx.send(AsrEvent::Finished).unwrap();
+                            return Ok(());
+                        }
+                    }
+                }
+                anyhow::bail!("missing finish control")
+            });
+            Ok(AsrSessionHandle {
+                control_tx,
+                abort_flag: Arc::new(AtomicBool::new(false)),
+                event_rx,
+                join,
+            })
+        }
+
+        fn transcribe_file(&self, _config: &Config, _wav_path: &Path) -> Result<String> {
+            unreachable!("stream test must not use native file transcription")
+        }
+    }
+
+    #[test]
+    fn stream_test_chunks_pcm_and_collects_final_transcript() {
+        let controls = Arc::new(Mutex::new(Vec::new()));
+        let backend = FakeStreamingBackend {
+            controls: controls.clone(),
+        };
+        let config = Config::default();
+        let samples = vec![7; 3_201];
+
+        assert_eq!(
+            stream_pcm_with_backend(&backend, &config, &samples).unwrap(),
+            Some("stream transcript".into())
+        );
+        assert_eq!(*controls.lock().unwrap(), vec![1_600, 1_600, 1, 0]);
     }
 }
