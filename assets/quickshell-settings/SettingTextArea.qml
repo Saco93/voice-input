@@ -72,10 +72,13 @@ GridLayout {
                 placeholderTextColor: root.theme.subtle
                 font.family: root.theme.fontFamily
                 font.weight: Font.ExtraBold
-                maximumLength: root.maximumLength
                 Accessible.name: root.theme.tr(root.label)
                 Accessible.description: root.theme.tr(root.help)
                 onTextChanged: {
+                    if (text.length > root.maximumLength) {
+                        remove(root.maximumLength, text.length);
+                        return;
+                    }
                     if (activeFocus)
                         root.edited(text);
                 }
