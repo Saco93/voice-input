@@ -153,7 +153,7 @@ SettingsPage {
                 theme: root.theme
                 label: "Replace Alibaba API key"
                 value: root.controller.alibabaCredential
-                help: root.controller.credentialLabel("alibaba-api-key") + ". Blank keeps it unchanged."
+                help: root.controller.credentialLabel("alibaba-api-key") + ". Blank keeps it unchanged. API keys are region- and workspace-scoped; Voice Input never probes another route or migrates a key automatically."
                 password: true
                 placeholderText: "Enter a new credential"
                 error: root.controller.errorFor("credentials.alibaba-api-key")
@@ -217,6 +217,49 @@ SettingsPage {
                 }
             }
 
+            SettingCombo {
+                theme: root.theme
+                label: "Endpoint mode"
+                value: root.controller.value("asr.alibaba_audio3.endpoint_mode", "regional")
+                labels: ["Regional", "Custom"]
+                values: ["regional", "custom"]
+                help: "Regional routing uses reviewed Alibaba hosts. Custom keeps the raw streaming and native endpoints in Advanced settings."
+                error: root.controller.errorFor("asr.alibaba_audio3.endpoint_mode")
+                enabled: !root.controller.busy
+                onSelected: (value) => {
+                    return root.controller.setValue("asr.alibaba_audio3.endpoint_mode", value);
+                }
+            }
+
+            SettingCombo {
+                visible: root.controller.value("asr.alibaba_audio3.endpoint_mode", "regional") === "regional" || root.controller.errorFor("asr.alibaba_audio3.region").length > 0
+                theme: root.theme
+                label: "Region"
+                value: root.controller.value("asr.alibaba_audio3.region", "beijing")
+                labels: ["Beijing", "Singapore"]
+                values: ["beijing", "singapore"]
+                help: "Select the region that owns the configured Alibaba API key. Singapore controls still require scenario-specific live validation."
+                error: root.controller.errorFor("asr.alibaba_audio3.region")
+                enabled: !root.controller.busy
+                onSelected: (value) => {
+                    return root.controller.setValue("asr.alibaba_audio3.region", value);
+                }
+            }
+
+            SettingTextField {
+                visible: root.controller.value("asr.alibaba_audio3.endpoint_mode", "regional") === "regional" || root.controller.errorFor("asr.alibaba_audio3.workspace_id").length > 0
+                theme: root.theme
+                label: "Workspace ID"
+                value: root.controller.value("asr.alibaba_audio3.workspace_id", "")
+                placeholderText: "Optional"
+                help: "Optional. Empty uses the regional legacy route. A nonempty value must satisfy the DNS-label transport constraint (1–63 ASCII letters, digits, or hyphens; no leading or trailing hyphen). This is not provider business-ID validation. API keys are region- and workspace-scoped; Voice Input never probes or migrates them."
+                error: root.controller.errorFor("asr.alibaba_audio3.workspace_id")
+                enabled: !root.controller.busy
+                onEdited: (value) => {
+                    return root.controller.setValue("asr.alibaba_audio3.workspace_id", value);
+                }
+            }
+
             SettingSwitch {
                 theme: root.theme
                 label: "Enable language hints"
@@ -238,6 +281,20 @@ SettingsPage {
                 enabled: !root.controller.busy
                 onToggled: (checked) => {
                     return root.controller.setValue("asr.alibaba_audio3.heartbeat_enabled", checked);
+                }
+            }
+
+            SettingCombo {
+                theme: root.theme
+                label: "Recognition preset"
+                value: root.controller.value("asr.alibaba_audio3.recognition_preset", "standard")
+                labels: ["Standard", "Low-latency dictation", "Long-form", "Custom"]
+                values: ["standard", "low-latency-dictation", "long-form", "custom"]
+                help: "Standard preserves existing behavior. Low-latency dictation and long-form are evaluation candidates pending live pause and noise validation. Custom exposes every raw recognition control."
+                error: root.controller.errorFor("asr.alibaba_audio3.recognition_preset")
+                enabled: !root.controller.busy
+                onSelected: (value) => {
+                    return root.controller.setValue("asr.alibaba_audio3.recognition_preset", value);
                 }
             }
 
@@ -464,12 +521,13 @@ SettingsPage {
             SectionCard {
                 id: audio3StreamingCard
 
-                visible: root.controller.value("asr.provider", "local-cli") === "alibaba-qwen-audio3" || root.controller.hasErrorPrefix("asr.alibaba_audio3.endpoint") || root.controller.hasErrorPrefix("asr.alibaba_audio3.model")
+                visible: root.controller.value("asr.provider", "local-cli") === "alibaba-qwen-audio3" || root.controller.hasErrorPrefix("asr.alibaba_audio3.endpoint") || root.controller.hasErrorPrefix("asr.alibaba_audio3.model") || root.controller.hasErrorPrefix("asr.alibaba_audio3.max_sentence_silence_ms") || root.controller.hasErrorPrefix("asr.alibaba_audio3.semantic_punctuation_enabled") || root.controller.hasErrorPrefix("asr.alibaba_audio3.multi_threshold_mode_enabled") || root.controller.hasErrorPrefix("asr.alibaba_audio3.speech_noise_threshold")
                 theme: root.theme
                 title: "Qwen-Audio-3 streaming"
                 showDivider: audio3NativeCard.visible
 
                 SettingTextField {
+                    visible: root.controller.value("asr.alibaba_audio3.endpoint_mode", "regional") === "custom" || root.controller.errorFor("asr.alibaba_audio3.endpoint").length > 0
                     theme: root.theme
                     label: "Streaming endpoint"
                     value: root.controller.value("asr.alibaba_audio3.endpoint", "")
@@ -492,6 +550,7 @@ SettingsPage {
                 }
 
                 SettingTextField {
+                    visible: root.controller.value("asr.alibaba_audio3.recognition_preset", "standard") === "custom" || root.controller.errorFor("asr.alibaba_audio3.max_sentence_silence_ms").length > 0
                     theme: root.theme
                     label: "Maximum sentence silence"
                     value: root.controller.value("asr.alibaba_audio3.max_sentence_silence_ms", 800)
@@ -504,6 +563,7 @@ SettingsPage {
                 }
 
                 SettingSwitch {
+                    visible: root.controller.value("asr.alibaba_audio3.recognition_preset", "standard") === "custom" || root.controller.errorFor("asr.alibaba_audio3.semantic_punctuation_enabled").length > 0 || root.controller.errorFor("asr.alibaba_audio3.multi_threshold_mode_enabled").length > 0
                     theme: root.theme
                     label: "Enable semantic punctuation"
                     checked: root.controller.value("asr.alibaba_audio3.semantic_punctuation_enabled", false)
@@ -512,6 +572,51 @@ SettingsPage {
                     enabled: !root.controller.busy
                     onToggled: (checked) => {
                         return root.controller.setValue("asr.alibaba_audio3.semantic_punctuation_enabled", checked);
+                    }
+                }
+
+                SettingSwitch {
+                    visible: root.controller.value("asr.alibaba_audio3.recognition_preset", "standard") === "custom" || root.controller.errorFor("asr.alibaba_audio3.multi_threshold_mode_enabled").length > 0
+                    theme: root.theme
+                    label: "Enable multi-threshold mode"
+                    checked: root.controller.value("asr.alibaba_audio3.multi_threshold_mode_enabled", false)
+                    help: "Use the documented adaptive VAD threshold mode. It cannot be combined with semantic punctuation."
+                    error: root.controller.errorFor("asr.alibaba_audio3.multi_threshold_mode_enabled")
+                    enabled: !root.controller.busy
+                    onToggled: (checked) => {
+                        return root.controller.setValue("asr.alibaba_audio3.multi_threshold_mode_enabled", checked);
+                    }
+                }
+
+                SettingSwitch {
+                    visible: root.controller.value("asr.alibaba_audio3.recognition_preset", "standard") === "custom" || root.controller.errorFor("asr.alibaba_audio3.speech_noise_threshold").length > 0
+                    theme: root.theme
+                    label: "Override speech/noise threshold"
+                    checked: root.controller.value("asr.alibaba_audio3.speech_noise_threshold", null) !== null
+                    help: "Send an optional threshold from -1 to 1. Lower values classify more noise as speech; Alibaba publishes no default."
+                    error: root.controller.errorFor("asr.alibaba_audio3.speech_noise_threshold")
+                    enabled: !root.controller.busy
+                    onToggled: (checked) => {
+                        if (checked && root.controller.value("asr.alibaba_audio3.speech_noise_threshold", null) === null)
+                            return root.controller.setValue("asr.alibaba_audio3.speech_noise_threshold", 0);
+
+                        if (!checked)
+                            return root.controller.setValue("asr.alibaba_audio3.speech_noise_threshold", null);
+
+                        return true;
+                    }
+                }
+
+                SettingTextField {
+                    visible: (root.controller.value("asr.alibaba_audio3.recognition_preset", "standard") === "custom" && root.controller.value("asr.alibaba_audio3.speech_noise_threshold", null) !== null) || root.controller.errorFor("asr.alibaba_audio3.speech_noise_threshold").length > 0
+                    theme: root.theme
+                    label: "Speech/noise threshold"
+                    value: root.controller.value("asr.alibaba_audio3.speech_noise_threshold", "")
+                    help: "Finite value from -1 to 1. This value is sent remotely only while the override is enabled."
+                    error: root.controller.errorFor("asr.alibaba_audio3.speech_noise_threshold")
+                    enabled: !root.controller.busy && root.controller.value("asr.alibaba_audio3.speech_noise_threshold", null) !== null
+                    onEdited: (value) => {
+                        return root.controller.setValue("asr.alibaba_audio3.speech_noise_threshold", value);
                     }
                 }
 
@@ -526,6 +631,7 @@ SettingsPage {
                 showDivider: false
 
                 SettingTextField {
+                    visible: root.controller.value("asr.alibaba_audio3.endpoint_mode", "regional") === "custom" || root.controller.errorFor("asr.alibaba_audio3.native_endpoint").length > 0
                     theme: root.theme
                     label: "Native endpoint"
                     value: root.controller.value("asr.alibaba_audio3.native_endpoint", "")

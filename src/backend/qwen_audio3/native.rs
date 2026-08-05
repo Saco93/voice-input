@@ -20,6 +20,9 @@ pub(crate) fn transcribe_full_audio(config: &Config, wav_path: &Path) -> Result<
         bail!("Qwen-Audio-3 native ASR requires a configured credential");
     }
 
+    let endpoints = audio3
+        .resolve_endpoints()
+        .context("failed to resolve Qwen-Audio-3 routing")?;
     let wav_bytes = read_bounded_wav(wav_path)?;
     let body = request_body(
         &audio3.native_model,
@@ -29,7 +32,7 @@ pub(crate) fn transcribe_full_audio(config: &Config, wav_path: &Path) -> Result<
         &audio3.vocabulary,
     )?;
     let response = http_client::post_json_sanitized(
-        audio3.native_endpoint.as_str(),
+        endpoints.native(),
         audio3.api_key.trim(),
         config.asr.connect_timeout_ms,
         audio3.native_timeout_ms,
@@ -149,7 +152,7 @@ mod tests {
         MAX_RAW_AUDIO_BYTES, enforce_raw_audio_limit, parse_response, request_body,
         transcribe_full_audio,
     };
-    use crate::config::{Audio3VocabularyTerm, Config, Language};
+    use crate::config::{Audio3EndpointMode, Audio3VocabularyTerm, Config, Language};
 
     #[test]
     fn request_body_matches_official_native_shape_and_data_uri() {
@@ -296,6 +299,23 @@ mod tests {
     }
 
     #[test]
+    fn native_custom_endpoint_construction_errors_are_value_free() {
+        const ENDPOINT_SENTINEL: &str = "private native endpoint construction sentinel";
+        let temp = tempfile::tempdir().unwrap();
+        let wav_path = temp.path().join("input.wav");
+        std::fs::write(&wav_path, b"wav").unwrap();
+        let mut config = Config::default();
+        config.asr.alibaba_audio3.api_key = "test-key".into();
+        config.asr.alibaba_audio3.endpoint_mode = Audio3EndpointMode::Custom;
+        config.asr.alibaba_audio3.native_endpoint = ENDPOINT_SENTINEL.into();
+
+        let error = transcribe_full_audio(&config, &wav_path)
+            .expect_err("malformed custom native target must fail generically");
+        assert_eq!(error.to_string(), "native HTTP request failed");
+        assert!(!format!("{error:#}").contains(ENDPOINT_SENTINEL));
+    }
+
+    #[test]
     fn loopback_timeout_is_bounded_and_does_not_expose_request_details() {
         const QUERY_SENTINEL: &str = "private-endpoint-query-sentinel";
         const CREDENTIAL_SENTINEL: &str = "private-credential-sentinel";
@@ -316,6 +336,7 @@ mod tests {
         std::fs::write(&wav_path, AUDIO_SENTINEL).unwrap();
         let mut config = Config::default();
         config.asr.alibaba_audio3.api_key = CREDENTIAL_SENTINEL.into();
+        config.asr.alibaba_audio3.endpoint_mode = Audio3EndpointMode::Custom;
         config.asr.alibaba_audio3.native_endpoint = endpoint.clone();
         config.asr.alibaba_audio3.native_timeout_ms = 300;
 
@@ -333,7 +354,10 @@ mod tests {
     #[test]
     fn loopback_request_uses_bearer_auth_and_exact_body() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let endpoint = format!("http://{}/native", listener.local_addr().unwrap());
+        let endpoint = format!(
+            "http://{}/native?route=exact%2Fvalue",
+            listener.local_addr().unwrap()
+        );
         let (request_tx, request_rx) = mpsc::channel();
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
@@ -361,6 +385,8 @@ mod tests {
             term: "Voice Input".into(),
             weight: 5,
         }];
+        config.asr.alibaba_audio3.endpoint_mode = Audio3EndpointMode::Custom;
+        config.asr.alibaba_audio3.workspace_id = "dormant-workspace".into();
         config.asr.alibaba_audio3.native_endpoint = endpoint;
         config.asr.alibaba_audio3.native_model = "test-native-model".into();
 
@@ -372,12 +398,18 @@ mod tests {
         server.join().unwrap();
 
         let (headers, body) = request.split_once("\r\n\r\n").unwrap();
-        assert!(headers.starts_with("POST /native HTTP/1.1\r\n"));
+        assert!(headers.starts_with("POST /native?route=exact%2Fvalue HTTP/1.1\r\n"));
         assert!(
             headers
                 .lines()
                 .any(|line| line.eq_ignore_ascii_case("authorization: Bearer test-bearer-token"))
         );
+        assert!(
+            !headers
+                .to_ascii_lowercase()
+                .contains("x-dashscope-workspace")
+        );
+        assert!(!headers.contains("dormant-workspace"));
         let body: Value = serde_json::from_str(body).unwrap();
         assert_eq!(body["parameters"]["language_hints"], json!(["ko", "en"]));
         assert_eq!(body["parameters"]["vocabulary"], json!({"Voice Input": 5}));

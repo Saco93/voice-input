@@ -2464,6 +2464,31 @@ impl StreamingTelemetryUpdate {
     }
 }
 
+fn apply_timestamp_diagnostics(
+    stage: &mut crate::diagnostics::StreamingStage,
+    delta: backend::TimestampDiagnosticsDelta,
+) {
+    stage.timestamp_bearing_result_count = stage
+        .timestamp_bearing_result_count
+        .saturating_add(delta.timestamp_bearing_result_count);
+    stage.accepted_timed_unit_count = stage
+        .accepted_timed_unit_count
+        .saturating_add(delta.accepted_timed_unit_count);
+    stage.result_with_rejected_timestamp_metadata_count = stage
+        .result_with_rejected_timestamp_metadata_count
+        .saturating_add(delta.result_with_rejected_timestamp_metadata_count);
+    stage.truncated_timed_unit_count = stage
+        .truncated_timed_unit_count
+        .saturating_add(delta.truncated_timed_unit_count);
+    if delta.latest_valid_audio_end_ms.is_some() {
+        stage.latest_valid_audio_end_ms = delta.latest_valid_audio_end_ms;
+    }
+}
+
+fn record_timestamp_diagnostics(update_diagnostics: impl FnOnce() -> Result<()>) {
+    let _ = update_diagnostics();
+}
+
 fn record_finished_telemetry(update_diagnostics: impl FnOnce() -> Result<()>) -> bool {
     let _ = update_diagnostics();
     true
@@ -2637,6 +2662,17 @@ fn spawn_realtime_event_thread(
                                 session.streaming.finish_sent_latency_ms = Some(latency_ms);
                             });
                         }
+                    });
+                }
+                backend::AsrEvent::TimestampDiagnostics { delta } => {
+                    record_timestamp_diagnostics(|| {
+                        state.update(|snapshot| {
+                            if snapshot_matches_session(snapshot, session_id) {
+                                snapshot.diagnostics.update_session(session_id, |session| {
+                                    apply_timestamp_diagnostics(&mut session.streaming, delta);
+                                });
+                            }
+                        })
                     });
                 }
                 backend::AsrEvent::Partial {
@@ -3264,6 +3300,45 @@ mod tests {
         assert_eq!(stage.first_nonempty_partial_latency_ms, None);
         assert_eq!(stage.partial_event_count, 0);
         assert_eq!(stage.nonempty_partial_event_count, 0);
+    }
+
+    #[test]
+    fn timestamp_diagnostics_saturate_and_overwrite_latest_numeric_end() {
+        let mut stage = crate::diagnostics::StreamingStage {
+            timestamp_bearing_result_count: u64::MAX,
+            accepted_timed_unit_count: u64::MAX - 1,
+            result_with_rejected_timestamp_metadata_count: 4,
+            truncated_timed_unit_count: 5,
+            latest_valid_audio_end_ms: Some(900),
+            ..crate::diagnostics::StreamingStage::default()
+        };
+        apply_timestamp_diagnostics(
+            &mut stage,
+            backend::TimestampDiagnosticsDelta {
+                timestamp_bearing_result_count: 1,
+                accepted_timed_unit_count: 3,
+                result_with_rejected_timestamp_metadata_count: 1,
+                truncated_timed_unit_count: 7,
+                latest_valid_audio_end_ms: Some(800),
+            },
+        );
+
+        assert_eq!(stage.timestamp_bearing_result_count, u64::MAX);
+        assert_eq!(stage.accepted_timed_unit_count, u64::MAX);
+        assert_eq!(stage.result_with_rejected_timestamp_metadata_count, 5);
+        assert_eq!(stage.truncated_timed_unit_count, 12);
+        assert_eq!(stage.latest_valid_audio_end_ms, Some(800));
+    }
+
+    #[test]
+    fn timestamp_diagnostics_persistence_failure_is_best_effort() {
+        let transcript_outcome = "unchanged transcript";
+        record_timestamp_diagnostics(|| {
+            Err(anyhow!(
+                "injected timestamp diagnostics persistence failure"
+            ))
+        });
+        assert_eq!(transcript_outcome, "unchanged transcript");
     }
 
     #[test]

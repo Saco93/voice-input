@@ -106,6 +106,7 @@ QtObject {
         "Realtime recognition behavior.": "设置实时识别行为。",
         "Replace Alibaba API key": "替换 Alibaba API key",
         "Enter a new credential": "输入新凭据",
+        "API keys are region- and workspace-scoped; Voice Input never probes another route or migrates a key automatically.": "API key 受区域和工作空间范围约束；语音输入绝不会探测其他路由，也不会自动迁移 key。",
         "Realtime model": "实时模型",
         "Turn mode": "分段模式",
         "Server VAD": "服务端 VAD",
@@ -113,10 +114,26 @@ QtObject {
         "Experimental provider; behavior and API compatibility may change.": "此提供商仍处于实验阶段，其行为和 API 兼容性可能发生变化。",
         "I understand and enable experimental Qwen-Audio-3": "我了解相关风险并启用实验性 Qwen-Audio-3",
         "Selecting the provider does not enable this acknowledgement.": "仅选择此提供商不会自动确认并启用实验功能。",
+        "Endpoint mode": "端点模式",
+        "Regional": "区域路由",
+        "Regional routing uses reviewed Alibaba hosts. Custom keeps the raw streaming and native endpoints in Advanced settings.": "区域路由使用经过审核的 Alibaba 主机。自定义模式会在高级设置中保留原始流式端点和原生端点。",
+        "Region": "区域",
+        "Beijing": "北京",
+        "Singapore": "新加坡",
+        "Select the region that owns the configured Alibaba API key. Singapore controls still require scenario-specific live validation.": "请选择当前 Alibaba API key 所属的区域。新加坡区域的各项控制仍需按具体场景完成在线验证。",
+        "Workspace ID": "工作空间 ID",
+        "Optional": "可选",
+        "Optional. Empty uses the regional legacy route. A nonempty value must satisfy the DNS-label transport constraint (1–63 ASCII letters, digits, or hyphens; no leading or trailing hyphen). This is not provider business-ID validation. API keys are region- and workspace-scoped; Voice Input never probes or migrates them.": "可选。留空时使用对应区域的旧版路由。非空值必须满足 DNS label 传输约束：包含 1–63 个 ASCII 字母、数字或连字符，且首尾不能是连字符。这不是对提供商业务 ID 规则的验证。API key 受区域和工作空间范围约束；语音输入绝不会探测或迁移 key。",
         "Enable language hints": "启用语言提示",
         "Opt in to sending the selected language as an Audio3 recognition hint.": "选择将所选语言作为 Audio3 识别提示发送。",
         "Enable streaming heartbeat": "启用流式 heartbeat",
         "Opt in to keeping long silent push-to-talk sessions alive while audio frames continue.": "选择在音频帧持续发送时，使长时间静音的按键说话 session 保持连接。",
+        "Recognition preset": "识别预设",
+        "Standard": "标准",
+        "Low-latency dictation": "低延迟听写",
+        "Long-form": "长篇语音",
+        "Custom": "自定义",
+        "Standard preserves existing behavior. Low-latency dictation and long-form are evaluation candidates pending live pause and noise validation. Custom exposes every raw recognition control.": "标准预设会保留现有行为。低延迟听写和长篇语音是评估候选值，仍需完成暂停和噪声的在线验证。自定义预设会显示所有原始识别控制项。",
         "Dynamic vocabulary": "动态词汇表",
         "Optional global Audio3 terms. Enter one JSON object per line with term and weight; weights are 1–5 or 50. Every listed term is sent remotely.": "可选的全局 Audio3 词条。每行输入一个包含 term 和 weight 的 JSON 对象；权重可以是 1–5 或 50。列出的每个词条都会发送给远程服务。",
         "{\"term\":\"Voice Input\",\"weight\":5}": "{\"term\":\"语音输入\",\"weight\":5}",
@@ -161,6 +178,13 @@ QtObject {
         "Milliseconds from 200 to 6000. Lower values finalize speech segments sooner.": "范围为 200 到 6000 毫秒。较小的值会更快完成语音分段。",
         "Enable semantic punctuation": "启用语义标点",
         "Allow the streaming model to use semantic punctuation when finalizing speech segments.": "允许流式模型在完成语音分段时使用语义标点。",
+        "Enable multi-threshold mode": "启用多阈值模式",
+        "Use the documented adaptive VAD threshold mode. It cannot be combined with semantic punctuation.": "使用文档说明的自适应 VAD 阈值模式。此模式不能与语义标点同时启用。",
+        "Override speech/noise threshold": "覆盖语音/噪声阈值",
+        "Send an optional threshold from -1 to 1. Lower values classify more noise as speech; Alibaba publishes no default.": "发送一个 -1 到 1 的可选阈值。数值越低，越多噪声会被归类为语音；Alibaba 未公布默认值。",
+        "Speech/noise threshold": "语音/噪声阈值",
+        "Finite value from -1 to 1. This value is sent remotely only while the override is enabled.": "请输入 -1 到 1 的有限数值。仅在启用覆盖时，程序才会将该值发送给远程服务。",
+        "Enter a finite number.": "请输入有限数值。",
         "Qwen-Audio-3 native final pass": "Qwen-Audio-3 原生最终处理",
         "Native endpoint": "原生端点",
         "Native model": "原生模型",
@@ -297,6 +321,7 @@ QtObject {
         "must not contain embedded credentials": "不得包含嵌入式凭据",
         "must include a host": "必须包含主机名",
         "must use transport encryption unless the host is loopback": "除回环主机外，必须使用加密传输",
+        "must be a valid DNS label for hostname transport": "必须是可用于主机名传输的有效 DNS label",
         "must be true when the experimental provider is selected": "选择实验性提供商时必须明确启用此选项",
         "must not exceed maximum recording duration": "不得超过最长录音时长",
         "must be finite and between 0 and 1": "必须是 0 到 1 之间的有限数值",
@@ -349,6 +374,10 @@ QtObject {
         match = source.match(/^Configured via (.+)$/);
         if (match)
             return "已通过 " + match[1] + " 配置";
+
+        match = source.match(/^(.*)\. Blank keeps it unchanged\. API keys are region- and workspace-scoped; Voice Input never probes another route or migrates a key automatically\.$/);
+        if (match)
+            return root.tr(match[1]) + "。留空将保持不变。API key 受区域和工作空间范围约束；语音输入绝不会探测其他路由，也不会自动迁移 key。";
 
         match = source.match(/^(.*)\. Blank keeps it unchanged\.$/);
         if (match)

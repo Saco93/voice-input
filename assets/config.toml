@@ -36,12 +36,17 @@ final_pass_enable_itn = false
 
 [asr.alibaba_audio3]
 experimental_enabled = false
+endpoint_mode = "regional"
+region = "beijing"
+workspace_id = ""
 endpoint = "wss://dashscope.aliyuncs.com/api-ws/v1/inference"
 model = "qwen-audio-3.0-asr-flash-streaming"
 language_hints_enabled = false
 heartbeat_enabled = false
+recognition_preset = "standard"
 max_sentence_silence_ms = 800
 semantic_punctuation_enabled = false
+multi_threshold_mode_enabled = false
 vocabulary = []
 native_endpoint = "https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation"
 native_model = "qwen-audio-3.0-asr-flash"

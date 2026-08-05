@@ -505,6 +505,9 @@ mod tests {
         config.asr.alibaba_audio3.model = "SENTINEL_MODEL".into();
         config.asr.alibaba_audio3.native_model = "SENTINEL_NATIVE_MODEL".into();
         config.asr.alibaba_audio3.endpoint = "https://SENTINEL_ENDPOINT.example".into();
+        config.asr.alibaba_audio3.native_endpoint =
+            "https://SENTINEL_NATIVE_ENDPOINT.example".into();
+        config.asr.alibaba_audio3.workspace_id = "SENTINEL_WORKSPACE".into();
         config.asr.alibaba_audio3.api_key = "SENTINEL_CREDENTIAL".into();
 
         let mut snapshot = Snapshot::idle(&config);
@@ -525,6 +528,8 @@ mod tests {
             "SENTINEL_MODEL",
             "SENTINEL_NATIVE_MODEL",
             "SENTINEL_ENDPOINT",
+            "SENTINEL_NATIVE_ENDPOINT",
+            "SENTINEL_WORKSPACE",
             "SENTINEL_CREDENTIAL",
             "SENTINEL_TOOLTIP",
             "SENTINEL_TRANSCRIPT",
@@ -547,7 +552,7 @@ mod tests {
         let config = Config::default();
         let unavailable = SupportPayload::new(&config, None);
         let text = format_diagnostics(&unavailable, OutputFormat::Text).unwrap();
-        assert!(text.starts_with("Voice Input diagnostics (schema 3)\n"));
+        assert!(text.starts_with("Voice Input diagnostics (schema 4)\n"));
         assert!(text.contains("Runtime: unavailable\n"));
         assert!(text.contains("Session: none\n"));
 
@@ -580,7 +585,7 @@ mod tests {
 
         let json = format_diagnostics(&payload, OutputFormat::Json).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed["schema_version"], 3);
+        assert_eq!(parsed["schema_version"], 4);
         assert_eq!(parsed["session"]["session_id"], 7);
         assert_eq!(parsed["session"]["asr_outcome"], "completed");
         assert!(parsed["session"].get("outcome").is_none());

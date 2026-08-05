@@ -3,11 +3,11 @@ use std::fmt::Write as _;
 use serde::{Deserialize, Deserializer, Serialize, de};
 
 use crate::{
-    config::{AsrProvider, Config, NativeFinalPassMode},
+    config::{AsrProvider, Audio3EndpointMode, Audio3Region, Config, NativeFinalPassMode},
     state::{Phase, Snapshot},
 };
 
-pub const DIAGNOSTICS_SCHEMA_VERSION: u32 = 3;
+pub const DIAGNOSTICS_SCHEMA_VERSION: u32 = 4;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
@@ -252,6 +252,39 @@ impl SessionDiagnostics {
                 self.streaming.segment_final_event_count
             );
         }
+        if self.streaming.timestamp_bearing_result_count > 0 {
+            let _ = write!(
+                output,
+                ", timestamp-bearing-results={}",
+                self.streaming.timestamp_bearing_result_count
+            );
+        }
+        if self.streaming.accepted_timed_unit_count > 0 {
+            let _ = write!(
+                output,
+                ", accepted-timed-units={}",
+                self.streaming.accepted_timed_unit_count
+            );
+        }
+        if self.streaming.result_with_rejected_timestamp_metadata_count > 0 {
+            let _ = write!(
+                output,
+                ", results-with-rejected-timestamp-metadata={}",
+                self.streaming.result_with_rejected_timestamp_metadata_count
+            );
+        }
+        if self.streaming.truncated_timed_unit_count > 0 {
+            let _ = write!(
+                output,
+                ", truncated-timed-units={}",
+                self.streaming.truncated_timed_unit_count
+            );
+        }
+        append_latency(
+            output,
+            "latest-valid-audio-end-ms",
+            self.streaming.latest_valid_audio_end_ms,
+        );
         if self.streaming.audio_packet_count > 0 {
             let _ = write!(
                 output,
@@ -362,6 +395,14 @@ pub struct StreamingStage {
     pub partial_event_count: u64,
     pub nonempty_partial_event_count: u64,
     pub segment_final_event_count: u64,
+    pub timestamp_bearing_result_count: u64,
+    pub accepted_timed_unit_count: u64,
+    /// Number of normal results whose timestamp metadata block contained at
+    /// least one invalid scalar, relationship, words shape, or processed unit.
+    /// Each malformed result contributes exactly one; truncation alone does not.
+    pub result_with_rejected_timestamp_metadata_count: u64,
+    pub truncated_timed_unit_count: u64,
+    pub latest_valid_audio_end_ms: Option<u64>,
     pub audio_packet_count: u64,
     pub audio_sent_duration_ms: Option<u64>,
     pub max_audio_queue_delay_ms: Option<u64>,
@@ -726,10 +767,13 @@ impl SupportPayload {
         }
         let _ = writeln!(
             output,
-            "Configuration: provider={}, final-pass={}, fallback={}, audio3-native-mode={}, audio3-language-hints={}, audio3-heartbeat={}, audio3-max-sentence-silence-ms={}, audio3-semantic-punctuation={}, audio3-vocabulary-count={}",
+            "Configuration: provider={}, final-pass={}, fallback={}, audio3-endpoint-mode={}, audio3-region={}, audio3-workspace-configured={}, audio3-native-mode={}, audio3-language-hints={}, audio3-heartbeat={}, audio3-max-sentence-silence-ms={}, audio3-semantic-punctuation={}, audio3-vocabulary-count={}",
             self.config.provider.as_str(),
             enabled_name(self.config.final_pass_enabled),
             enabled_name(self.config.fallback_enabled),
+            self.config.endpoint_mode.as_str(),
+            self.config.region.as_str(),
+            enabled_name(self.config.workspace_configured),
             self.config.audio3_native_final_pass_mode.as_str(),
             enabled_name(self.config.audio3_language_hints_enabled),
             enabled_name(self.config.audio3_heartbeat_enabled),
@@ -771,11 +815,15 @@ impl RuntimeSummary {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
 pub struct SafeConfigSummary {
     pub provider: Provider,
     pub final_pass_enabled: bool,
     pub fallback_enabled: bool,
+    pub endpoint_mode: Audio3EndpointMode,
+    pub region: Audio3Region,
+    pub workspace_configured: bool,
     pub audio3_native_final_pass_mode: NativeFinalPassMode,
     pub audio3_language_hints_enabled: bool,
     pub audio3_heartbeat_enabled: bool,
@@ -794,20 +842,28 @@ impl SafeConfigSummary {
                     != NativeFinalPassMode::StreamingOnly
             }
         };
+        let recognition = config.asr.alibaba_audio3.effective_recognition_controls();
         Self {
             provider: config.asr.provider.into(),
             final_pass_enabled,
             fallback_enabled: config.asr.fallback_to_local,
+            endpoint_mode: config.asr.alibaba_audio3.endpoint_mode,
+            region: config.asr.alibaba_audio3.region,
+            workspace_configured: !config.asr.alibaba_audio3.workspace_id.is_empty(),
             audio3_native_final_pass_mode: config.asr.alibaba_audio3.native_final_pass_mode,
             audio3_language_hints_enabled: config.asr.alibaba_audio3.language_hints_enabled,
             audio3_heartbeat_enabled: config.asr.alibaba_audio3.heartbeat_enabled,
-            audio3_max_sentence_silence_ms: config.asr.alibaba_audio3.max_sentence_silence_ms,
-            audio3_semantic_punctuation_enabled: config
-                .asr
-                .alibaba_audio3
-                .semantic_punctuation_enabled,
+            audio3_max_sentence_silence_ms: recognition.max_sentence_silence_ms,
+            audio3_semantic_punctuation_enabled: recognition.semantic_punctuation_enabled,
             audio3_vocabulary_count: config.asr.alibaba_audio3.vocabulary.len(),
         }
+    }
+}
+
+impl Default for SafeConfigSummary {
+    fn default() -> Self {
+        let config = Config::default();
+        Self::from_config(&config)
     }
 }
 
@@ -946,6 +1002,7 @@ mod tests {
 
     #[test]
     fn streaming_event_diagnostics_are_aggregate_and_safe() {
+        const PRIVATE_TIMED_UNIT_SENTINEL: &str = "private-timed-unit-diagnostics-sentinel";
         let mut session =
             SessionDiagnostics::new(24, Provider::AlibabaQwenAudio3, FinalPassKind::None, false);
         session.streaming.ready_latency_ms = Some(150);
@@ -955,6 +1012,13 @@ mod tests {
         session.streaming.partial_event_count = 3;
         session.streaming.nonempty_partial_event_count = 2;
         session.streaming.segment_final_event_count = 1;
+        session.streaming.timestamp_bearing_result_count = 4;
+        session.streaming.accepted_timed_unit_count = 12;
+        session
+            .streaming
+            .result_with_rejected_timestamp_metadata_count = 2;
+        session.streaming.truncated_timed_unit_count = 3;
+        session.streaming.latest_valid_audio_end_ms = Some(2_420);
         session.streaming.audio_packet_count = 20;
         session.streaming.audio_sent_duration_ms = Some(2_560);
         session.streaming.max_audio_queue_delay_ms = Some(151);
@@ -970,17 +1034,32 @@ mod tests {
         let json = serde_json::to_value(&session).unwrap();
         assert!(text.contains("first-partial-latency-ms=900"));
         assert!(text.contains("nonempty-partial-events=2"));
+        assert!(text.contains("timestamp-bearing-results=4"));
+        assert!(text.contains("accepted-timed-units=12"));
+        assert!(text.contains("results-with-rejected-timestamp-metadata=2"));
+        assert!(text.contains("truncated-timed-units=3"));
+        assert!(text.contains("latest-valid-audio-end-ms=2420"));
         assert!(text.contains("provider-error-code=ServiceUnavailable"));
         assert_eq!(
             json["streaming"]["first_nonempty_partial_latency_ms"],
             1_200
         );
+        assert_eq!(json["streaming"]["timestamp_bearing_result_count"], 4);
+        assert_eq!(json["streaming"]["accepted_timed_unit_count"], 12);
+        assert_eq!(
+            json["streaming"]["result_with_rejected_timestamp_metadata_count"],
+            2
+        );
+        assert_eq!(json["streaming"]["truncated_timed_unit_count"], 3);
+        assert_eq!(json["streaming"]["latest_valid_audio_end_ms"], 2_420);
         assert_eq!(
             json["streaming"]["provider_error_code"],
             "ServiceUnavailable"
         );
         assert!(!text.contains("transcript"));
         assert!(!json.to_string().contains("transcript"));
+        assert!(!text.contains(PRIVATE_TIMED_UNIT_SENTINEL));
+        assert!(!json.to_string().contains(PRIVATE_TIMED_UNIT_SENTINEL));
     }
 
     #[test]
@@ -1002,6 +1081,40 @@ mod tests {
         assert_eq!(session.local_primary.status, StageStatus::Pending);
         assert_eq!(session.local_fallback.status, StageStatus::Inactive);
         assert_eq!(session.selected_result, SelectedResult::Pending);
+    }
+
+    #[test]
+    fn schema_three_snapshot_defaults_new_timestamp_aggregates() {
+        let mut diagnostics = Diagnostics::inactive();
+        diagnostics.start_session(31, Provider::AlibabaQwenAudio3, FinalPassKind::None, false);
+        let mut persisted = serde_json::to_value(&diagnostics).unwrap();
+        persisted["schema_version"] = json!(3);
+        let streaming = persisted["session"]["streaming"].as_object_mut().unwrap();
+        for field in [
+            "timestamp_bearing_result_count",
+            "accepted_timed_unit_count",
+            "result_with_rejected_timestamp_metadata_count",
+            "truncated_timed_unit_count",
+            "latest_valid_audio_end_ms",
+        ] {
+            streaming.remove(field);
+        }
+
+        let restored: Diagnostics =
+            serde_json::from_value(persisted).expect("schema 3 diagnostics remain readable");
+        assert_eq!(restored.schema_version, 3);
+        let streaming = &restored.session.as_ref().unwrap().streaming;
+        assert_eq!(streaming.timestamp_bearing_result_count, 0);
+        assert_eq!(streaming.accepted_timed_unit_count, 0);
+        assert_eq!(streaming.result_with_rejected_timestamp_metadata_count, 0);
+        assert_eq!(streaming.truncated_timed_unit_count, 0);
+        assert_eq!(streaming.latest_valid_audio_end_ms, None);
+
+        let config = Config::default();
+        let mut snapshot = crate::state::Snapshot::idle(&config);
+        snapshot.diagnostics = restored;
+        let support = SupportPayload::new(&config, Some(&snapshot));
+        assert_eq!(support.schema_version, 4);
     }
 
     #[test]
@@ -1047,6 +1160,16 @@ mod tests {
         assert_eq!(session.provider, Provider::AlibabaQwenAudio3);
         assert_eq!(session.asr_outcome, OverallOutcome::InProgress);
         assert_eq!(session.selected_result, SelectedResult::Pending);
+        assert_eq!(session.streaming.timestamp_bearing_result_count, 0);
+        assert_eq!(session.streaming.accepted_timed_unit_count, 0);
+        assert_eq!(
+            session
+                .streaming
+                .result_with_rejected_timestamp_metadata_count,
+            0
+        );
+        assert_eq!(session.streaming.truncated_timed_unit_count, 0);
+        assert_eq!(session.streaming.latest_valid_audio_end_ms, None);
     }
 
     #[test]
@@ -1244,11 +1367,25 @@ mod tests {
     #[test]
     fn audio3_mode_and_safe_controls_are_serialized_without_private_values() {
         const TERM: &str = "private-diagnostics-vocabulary-sentinel";
+        const WORKSPACE: &str = "private-workspace-diagnostics-sentinel";
+        const STREAMING_ENDPOINT: &str = "wss://private-streaming-host.invalid/private-path";
+        const NATIVE_ENDPOINT: &str = "https://private-native-host.invalid/private-path";
         let mut config = Config::default();
         config.asr.provider = AsrProvider::AlibabaQwenAudio3;
+        config.asr.alibaba_audio3.endpoint_mode = Audio3EndpointMode::Custom;
+        config.asr.alibaba_audio3.region = Audio3Region::Singapore;
+        config.asr.alibaba_audio3.workspace_id = WORKSPACE.into();
+        config.asr.alibaba_audio3.endpoint = STREAMING_ENDPOINT.into();
+        config.asr.alibaba_audio3.native_endpoint = NATIVE_ENDPOINT.into();
         config.asr.alibaba_audio3.native_final_pass_mode = NativeFinalPassMode::Adaptive;
         config.asr.alibaba_audio3.language_hints_enabled = true;
         config.asr.alibaba_audio3.heartbeat_enabled = true;
+        config.asr.alibaba_audio3.recognition_preset =
+            crate::config::Audio3RecognitionPreset::LongForm;
+        config.asr.alibaba_audio3.max_sentence_silence_ms = 333;
+        config.asr.alibaba_audio3.semantic_punctuation_enabled = false;
+        config.asr.alibaba_audio3.multi_threshold_mode_enabled = true;
+        config.asr.alibaba_audio3.speech_noise_threshold = Some(0.75);
         config.asr.alibaba_audio3.vocabulary = vec![crate::config::Audio3VocabularyTerm {
             term: TERM.into(),
             weight: 50,
@@ -1256,14 +1393,32 @@ mod tests {
 
         let payload = SupportPayload::new(&config, None);
         let json = serde_json::to_value(&payload).unwrap();
-        assert_eq!(json["schema_version"], 3);
+        assert_eq!(json["schema_version"], 4);
+        assert_eq!(json["config"]["endpoint_mode"], "custom");
+        assert_eq!(json["config"]["region"], "singapore");
+        assert_eq!(json["config"]["workspace_configured"], true);
         assert_eq!(json["config"]["audio3_native_final_pass_mode"], "adaptive");
         assert_eq!(json["config"]["audio3_language_hints_enabled"], true);
         assert_eq!(json["config"]["audio3_heartbeat_enabled"], true);
-        assert_eq!(json["config"]["audio3_max_sentence_silence_ms"], 800);
-        assert_eq!(json["config"]["audio3_semantic_punctuation_enabled"], false);
+        assert_eq!(json["config"]["audio3_max_sentence_silence_ms"], 1_300);
+        assert_eq!(json["config"]["audio3_semantic_punctuation_enabled"], true);
         assert_eq!(json["config"]["audio3_vocabulary_count"], 1);
-        assert!(!json.to_string().contains(TERM));
+        let encoded = json.to_string();
+        for forbidden in [
+            TERM,
+            WORKSPACE,
+            STREAMING_ENDPOINT,
+            NATIVE_ENDPOINT,
+            "private-streaming-host",
+            "private-native-host",
+        ] {
+            assert!(!encoded.contains(forbidden));
+            assert!(!payload.format_text().contains(forbidden));
+        }
+        assert!(!encoded.contains("speech_noise_threshold"));
+        assert!(!encoded.contains("workspace_id"));
+        assert!(!encoded.contains("endpoint\""));
+        assert_eq!(json["config"].as_object().unwrap().len(), 12);
 
         let mut diagnostics = Diagnostics::inactive();
         diagnostics.start_session(
@@ -1287,6 +1442,25 @@ mod tests {
             session.final_pass.reason,
             Some(FinalPassReason::MissingCompletion)
         );
+    }
+
+    #[test]
+    fn older_safe_config_summaries_default_new_routing_fields() {
+        let summary: SafeConfigSummary = serde_json::from_value(json!({
+            "provider": "alibaba-qwen-audio3",
+            "final_pass_enabled": false,
+            "fallback_enabled": true,
+            "audio3_native_final_pass_mode": "streaming-only",
+            "audio3_language_hints_enabled": false,
+            "audio3_heartbeat_enabled": false,
+            "audio3_max_sentence_silence_ms": 800,
+            "audio3_semantic_punctuation_enabled": false,
+            "audio3_vocabulary_count": 0
+        }))
+        .expect("older schema 4/3 safe summaries remain readable");
+        assert_eq!(summary.endpoint_mode, Audio3EndpointMode::Regional);
+        assert_eq!(summary.region, Audio3Region::Beijing);
+        assert!(!summary.workspace_configured);
     }
 
     #[test]

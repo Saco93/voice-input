@@ -88,12 +88,18 @@ QtObject {
                 },
                 "alibaba_audio3": {
                     "experimental_enabled": false,
+                    "endpoint_mode": "regional",
+                    "region": "beijing",
+                    "workspace_id": "",
                     "endpoint": "wss://dashscope.aliyuncs.com/api-ws/v1/inference",
                     "model": "qwen-audio-3.0-asr-flash-streaming",
                     "language_hints_enabled": false,
                     "heartbeat_enabled": false,
+                    "recognition_preset": "standard",
                     "max_sentence_silence_ms": 800,
                     "semantic_punctuation_enabled": false,
+                    "multi_threshold_mode_enabled": false,
+                    "speech_noise_threshold": null,
                     "vocabulary": [],
                     "native_endpoint": "https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation",
                     "native_model": "qwen-audio-3.0-asr-flash",
@@ -299,7 +305,7 @@ QtObject {
     }
 
     function fieldNeedsAdvanced(path) {
-        const audio3Advanced = path.indexOf("asr.alibaba_audio3.") === 0 && path !== "asr.alibaba_audio3.experimental_enabled" && path !== "asr.alibaba_audio3.language_hints_enabled" && path !== "asr.alibaba_audio3.heartbeat_enabled" && path !== "asr.alibaba_audio3.vocabulary" && path !== "asr.alibaba_audio3.native_final_pass_mode";
+        const audio3Advanced = path.indexOf("asr.alibaba_audio3.") === 0 && path !== "asr.alibaba_audio3.experimental_enabled" && path !== "asr.alibaba_audio3.endpoint_mode" && path !== "asr.alibaba_audio3.region" && path !== "asr.alibaba_audio3.workspace_id" && path !== "asr.alibaba_audio3.language_hints_enabled" && path !== "asr.alibaba_audio3.heartbeat_enabled" && path !== "asr.alibaba_audio3.recognition_preset" && path !== "asr.alibaba_audio3.vocabulary" && path !== "asr.alibaba_audio3.native_final_pass_mode";
         return path === "audio.sample_rate" || path === "audio.partial_interval_ms" || path === "audio.pre_roll_ms" || path === "asr.connect_timeout_ms" || path === "asr.finalize_timeout_ms" || path.indexOf("asr.alibaba.endpoint") === 0 || path.indexOf("asr.alibaba.vad_") === 0 || path.indexOf("asr.alibaba.silence_") === 0 || path.indexOf("asr.alibaba.final_pass_") === 0 || audio3Advanced || path === "llm.api_base_url" || path === "llm.timeout_ms" || path === "llm.provider_sort" || path === "llm.agent_context_max_chars" || path === "output.type_delay_ms" || path === "output.pre_type_delay_ms" || path === "output.paste_keys" || path === "output.prefer_paste_for_xwayland" || path === "output.xwayland_paste_keys" || path === "hud.margin_bottom" || path === "hud.height" || path === "hud.offset_x" || path === "hud.offset_y" || path === "hud.nudge_step";
     }
 
@@ -438,6 +444,17 @@ QtObject {
         for (let i = 0; i < unsignedIntegers.length; ++i) valid = asNumber(config, unsignedIntegers[i][0], true, unsignedIntegers[i][1]) && valid
         for (let i = 0; i < signedIntegers.length; ++i) valid = asNumber(config, signedIntegers[i], true, null) && valid
         valid = asNumber(config, "asr.alibaba.vad_threshold", false, null) && valid;
+        const threshold = config.asr.alibaba_audio3.speech_noise_threshold;
+        if (threshold !== null && threshold !== undefined) {
+            if (String(threshold).trim().length === 0) {
+                const next = clone(fieldErrors);
+                next["asr.alibaba_audio3.speech_noise_threshold"] = "Enter a finite number.";
+                fieldErrors = next;
+                valid = false;
+            } else {
+                valid = asNumber(config, "asr.alibaba_audio3.speech_noise_threshold", false, null) && valid;
+            }
+        }
         const vocabulary = parseAudio3Vocabulary();
         if (vocabulary === null)
             valid = false;
