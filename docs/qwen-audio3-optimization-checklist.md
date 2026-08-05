@@ -48,7 +48,7 @@ Complete items 1–4, then stop and evaluate their combined effect before starti
 - [x] Add Settings UI controls that make all remotely sent terms visible to the user.
 - [x] Send dynamic vocabulary only when explicitly configured.
 - [x] Add serialization, bounds, privacy, request-envelope, and legacy-provider isolation tests.
-- [!] Evaluate proper nouns and technical terms against a fixed opt-in corpus. Live requests with two explicit technical terms succeeded, but no transcript/reference corpus or A/B vocabulary comparison was retained, so accuracy uplift is not claimed.
+- [x] Evaluate proper nouns and technical terms against a fixed opt-in corpus. A private local Git-excluded corpus replayed 30 identical WAV files across no vocabulary, weight 5, and weight 50 in both Streaming and Native, for 180 successful requests. Weight 5 did not improve exact recall; weight 50 improved both tested terms to 10/10 in both modes. Streaming had 0/10 negative-control insertions, while Native converted 1/10 deliberately sound-alike controls into a configured term. The corpus covers one speaker and two terms, so claims remain corpus-bounded; details are in `docs/qwen-audio3-milestone1-evaluation.md`.
 
 ### 4. Adaptive native final pass
 
@@ -66,9 +66,9 @@ Complete items 1–4, then stop and evaluate their combined effect before starti
 - [x] Run controlled live tests for Chinese, English, mixed language, configured technical terms, silence, noise, short speech, longer dictation, and silence beyond 60 seconds.
 - [!] Compare baseline and milestone results using median and p95 streaming-ready, streaming-finalize, native, and total-ASR latency. Milestone medians/p95 are recorded for seven sessions, but the pre-milestone baseline has only one diagnostic sample; no statistically valid p95 baseline comparison is claimed.
 - [x] Compare empty-result, degraded-streaming, native-invocation, and local-fallback rates.
-- [!] Evaluate accuracy only with an explicit local test corpus; do not store transcript/reference pairs in diagnostics or commit them to the repository. No retained corpus was authorized, so the report records behavior and one inconsistent noise outcome without CER/WER claims.
+- [x] Evaluate accuracy only with an explicit local test corpus; do not store transcript/reference pairs in diagnostics or commit them to the repository. The authorized corpus, references, and per-request results remain private and Git-excluded; only aggregate recall, false insertion, normalized CER, latency, and request counts are committed.
 - [x] Record pricing assumptions, region, model families, test date, and sample counts.
-- [x] Decide whether to retain, revise, or revert each of items 1–4 before starting milestone 2. Retain all four as explicit opt-in controls; carry the noise false-positive finding into VAD/timestamp work and keep vocabulary accuracy claims limited until an A/B corpus exists.
+- [x] Decide whether to retain, revise, or revert each of items 1–4 before starting milestone 2. Retain all four as explicit opt-in controls; carry the noise false-positive finding into VAD/timestamp work. Retain weight 50 for the two corpus-tested terms with the documented Native sound-alike tradeoff; do not generalize the result to other terms or speakers.
 
 ## Milestone 2 — Advanced recognition controls
 
@@ -119,6 +119,7 @@ Complete items 1–4, then stop and evaluate their combined effect before starti
 | 2026-08-02 | Milestone 1 item 4 implementation | Completed locally | Replaced the Audio3 native-pass boolean with streaming-only, adaptive, and always modes; migrated legacy `true` to always and `false` to streaming-only. Added a text-free 30-second adaptive policy, explicit completion tracking, privacy-safe diagnostics schema v2, Settings/QML controls, bilingual documentation, and exhaustive migration/policy/result tests through production-used planning and injectable invocation seams. |
 | 2026-08-02 | Milestone 1 live evaluation | Completed with documented limits | Real streaming/native APIs accepted the new controls. Seven controlled, transcript-free diagnostic samples covered short Chinese/English/mixed speech, configured technical terms, silence, repeated noise, long speech, and silence beyond 60 seconds. Healthy short streams skipped native; empty and long cases invoked it; no fallback or ASR failure occurred. One of two noise attempts produced a false positive. Aggregate timings, invocation rate, approximate Beijing pricing, decisions, and limitations are in `docs/qwen-audio3-milestone1-evaluation.md`. |
 | 2026-08-05 | Milestone 1 closeout | Completed locally; no new live evaluation | Added deterministic production-used Audio3 lifecycle coverage for 65 simulated heartbeat-enabled seconds and cancellation, corrected terminal/committed-only streaming telemetry, made malformed persisted provider error codes degrade to unavailable, and advanced diagnostics to schema v3. Included validated `max_sentence_silence` and semantic-punctuation configuration foundations at user direction; Milestone 2 item 5 remains in progress because presets, multi-threshold/noise controls, and full pause/noise evaluation are still outstanding. |
+| 2026-08-05 | Fixed-corpus vocabulary A/B | Completed | Retained a private local Git-excluded corpus with 30 clips and replayed identical audio under no vocabulary, weight 5, and weight 50 in Streaming and Native. All 180 requests succeeded. Weight 50 produced 10/10 recall for each tested term in both modes; weight 5 showed no recall uplift. Streaming had no negative-control insertion, while Native weight 50 inserted a configured term for one deliberately sound-alike control. Only aggregate results are committed. |
 
 ## Official references
 
