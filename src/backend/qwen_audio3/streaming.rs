@@ -22,13 +22,57 @@ use tungstenite::{
 
 use crate::{
     backend::{ASR_CONTROL_QUEUE_CAPACITY, AsrControl, AsrEvent, AsrSessionHandle, AudioSpec},
-    config::Config,
-    diagnostics::FailureKind,
+    config::{Audio3VocabularyTerm, Config, Language},
+    diagnostics::{FailureKind, ProviderErrorCode},
 };
 
 type Audio3Socket = WebSocket<MaybeTlsStream<TcpStream>>;
 type HandshakeResponse = tungstenite::http::Response<Option<Vec<u8>>>;
 type Connection = (Audio3Socket, HandshakeResponse);
+
+type SocketResult<T> = std::result::Result<T, Box<tungstenite::Error>>;
+
+trait SocketIo {
+    fn send_message(&mut self, message: Message) -> SocketResult<()>;
+    fn read_message(&mut self) -> SocketResult<Message>;
+    fn close_socket(&mut self) -> SocketResult<()>;
+}
+
+impl SocketIo for Audio3Socket {
+    fn send_message(&mut self, message: Message) -> SocketResult<()> {
+        self.send(message).map_err(Box::new)
+    }
+
+    fn read_message(&mut self) -> SocketResult<Message> {
+        self.read().map_err(Box::new)
+    }
+
+    fn close_socket(&mut self) -> SocketResult<()> {
+        self.close(None).map_err(Box::new)
+    }
+}
+
+trait DeadlineClock {
+    type Deadline: Copy;
+
+    fn deadline_after(&self, duration: Duration) -> Self::Deadline;
+    fn is_expired(&self, deadline: Self::Deadline) -> bool;
+}
+
+#[derive(Clone, Copy)]
+struct ProductionClock;
+
+impl DeadlineClock for ProductionClock {
+    type Deadline = Instant;
+
+    fn deadline_after(&self, duration: Duration) -> Self::Deadline {
+        Instant::now() + duration
+    }
+
+    fn is_expired(&self, deadline: Self::Deadline) -> bool {
+        Instant::now() > deadline
+    }
+}
 
 const MAX_CONTROLS_PER_TICK: usize = 8;
 const MAX_SERVER_MESSAGE_BYTES: usize = 64 * 1024;
@@ -70,23 +114,79 @@ fn run_session(
 
     let task_id = new_task_id();
     let connect_timeout = Duration::from_millis(config.asr.connect_timeout_ms);
-    let connect_deadline = Instant::now() + connect_timeout;
+    let clock = ProductionClock;
+    // Preserve the existing startup budget: connection establishment consumes
+    // time from the same deadline as the task-started wait.
+    let connect_deadline = clock.deadline_after(connect_timeout);
     let mut socket = open_socket(&audio3.endpoint, &audio3.api_key, connect_timeout)?;
     configure_socket(socket.get_mut())?;
-    send_json(
+    run_established_socket(
         &mut socket,
-        run_task_envelope(&task_id, &audio3.model, spec),
+        &clock,
+        EstablishedSession {
+            config: &config,
+            spec,
+            task_id: &task_id,
+            startup_deadline: connect_deadline,
+            control_rx,
+            abort_flag: &abort_flag,
+            event_tx: &event_tx,
+        },
+    )
+}
+
+struct EstablishedSession<'a, D> {
+    config: &'a Config,
+    spec: AudioSpec,
+    task_id: &'a str,
+    startup_deadline: D,
+    control_rx: mpsc::Receiver<AsrControl>,
+    abort_flag: &'a AtomicBool,
+    event_tx: &'a mpsc::Sender<AsrEvent>,
+}
+
+fn run_established_socket<S: SocketIo, C: DeadlineClock>(
+    socket: &mut S,
+    clock: &C,
+    session: EstablishedSession<'_, C::Deadline>,
+) -> Result<()> {
+    let EstablishedSession {
+        config,
+        spec,
+        task_id,
+        startup_deadline,
+        control_rx,
+        abort_flag,
+        event_tx,
+    } = session;
+    let audio3 = &config.asr.alibaba_audio3;
+    send_json(
+        socket,
+        run_task_envelope(
+            task_id,
+            &audio3.model,
+            spec,
+            Audio3RequestControls {
+                language: config.asr.language,
+                language_hints_enabled: audio3.language_hints_enabled,
+                heartbeat_enabled: audio3.heartbeat_enabled,
+                max_sentence_silence_ms: audio3.max_sentence_silence_ms,
+                semantic_punctuation_enabled: audio3.semantic_punctuation_enabled,
+                vocabulary: &audio3.vocabulary,
+            },
+        ),
     )?;
     await_task_started(
-        &mut socket,
-        &task_id,
-        connect_deadline,
-        &abort_flag,
-        &event_tx,
+        socket,
+        clock,
+        task_id,
+        startup_deadline,
+        abort_flag,
+        event_tx,
     )?;
 
     if abort_flag.load(Ordering::SeqCst) {
-        let _ = socket.close(None);
+        let _ = socket.close_socket();
         return Ok(());
     }
     let _ = event_tx.send(AsrEvent::Ready);
@@ -94,27 +194,47 @@ fn run_session(
     let mut finish_sent = false;
     let mut finalize_deadline = None;
     let mut assembler = TranscriptAssembler::default();
+    let mut audio_packet_count = 0_u64;
+    let mut audio_sample_count = 0_u64;
+    let mut max_audio_queue_delay_ms = 0_u64;
+    let mut last_audio_queue_delay_ms = 0_u64;
 
     loop {
         if abort_flag.load(Ordering::SeqCst) {
-            let _ = socket.close(None);
+            let _ = socket.close_socket();
             return Ok(());
         }
 
         if !finish_sent {
             for _ in 0..MAX_CONTROLS_PER_TICK {
                 match control_rx.try_recv() {
-                    Ok(AsrControl::AppendPcm16(samples)) => {
+                    Ok(AsrControl::AppendPcm16 {
+                        samples,
+                        enqueued_at,
+                    }) => {
+                        let queue_delay_ms = duration_ms(enqueued_at.elapsed());
                         socket
-                            .send(Message::Binary(pcm16_le_bytes(&samples)))
+                            .send_message(Message::Binary(pcm16_le_bytes(&samples)))
                             .context("failed to send Qwen-Audio-3 PCM")?;
+                        audio_packet_count = audio_packet_count.saturating_add(1);
+                        audio_sample_count = audio_sample_count
+                            .saturating_add(u64::try_from(samples.len()).unwrap_or(u64::MAX));
+                        max_audio_queue_delay_ms = max_audio_queue_delay_ms.max(queue_delay_ms);
+                        last_audio_queue_delay_ms = queue_delay_ms;
                     }
                     Ok(AsrControl::Finish) => {
-                        send_json(&mut socket, finish_task_envelope(&task_id))?;
+                        send_json(socket, finish_task_envelope(task_id))?;
+                        let _ = event_tx.send(AsrEvent::AudioDeliveryCompleted {
+                            packet_count: audio_packet_count,
+                            sample_count: audio_sample_count,
+                            max_queue_delay_ms: max_audio_queue_delay_ms,
+                            last_queue_delay_ms: last_audio_queue_delay_ms,
+                        });
                         finish_sent = true;
-                        finalize_deadline = Some(
-                            Instant::now() + Duration::from_millis(config.asr.finalize_timeout_ms),
-                        );
+                        finalize_deadline =
+                            Some(clock.deadline_after(Duration::from_millis(
+                                config.asr.finalize_timeout_ms,
+                            )));
                         break;
                     }
                     Err(mpsc::TryRecvError::Empty) => break,
@@ -125,12 +245,12 @@ fn run_session(
             }
         }
 
-        match socket.read() {
+        match socket.read_message() {
             Ok(Message::Close(_)) => {
                 bail!("Qwen-Audio-3 websocket closed before task completion")
             }
             Ok(message) => {
-                if let Some(event) = parse_server_event(message, &task_id)? {
+                if let Some(event) = parse_server_event(message, task_id)? {
                     match event {
                         ServerEvent::TaskStarted => {
                             bail!("Qwen-Audio-3 server sent duplicate task-started event")
@@ -158,64 +278,77 @@ fn run_session(
                                 let _ = event_tx.send(AsrEvent::Final { text: final_text });
                             }
                             let _ = event_tx.send(AsrEvent::Finished);
-                            let _ = socket.close(None);
+                            let _ = socket.close_socket();
                             return Ok(());
                         }
-                        ServerEvent::TaskFailed { kind } => {
-                            return report_task_failure(&event_tx, kind);
+                        ServerEvent::TaskFailed {
+                            kind,
+                            provider_error_code,
+                        } => {
+                            return report_task_failure(event_tx, kind, provider_error_code);
                         }
                     }
                 }
             }
-            Err(tungstenite::Error::Io(error))
-                if error.kind() == std::io::ErrorKind::WouldBlock
-                    || error.kind() == std::io::ErrorKind::TimedOut => {}
-            Err(tungstenite::Error::ConnectionClosed) | Err(tungstenite::Error::AlreadyClosed) => {
+            Err(error) if socket_error_is_retryable(&error) => {}
+            Err(error)
+                if matches!(
+                    error.as_ref(),
+                    tungstenite::Error::ConnectionClosed | tungstenite::Error::AlreadyClosed
+                ) =>
+            {
                 bail!("Qwen-Audio-3 connection closed before task completion")
             }
             Err(error) => return Err(error).context("failed to read Qwen-Audio-3 websocket"),
         }
 
-        if finalize_deadline.is_some_and(|deadline| Instant::now() > deadline) {
-            let _ = socket.close(None);
+        if finalize_deadline.is_some_and(|deadline| clock.is_expired(deadline)) {
+            let _ = socket.close_socket();
             bail!("Qwen-Audio-3 finalization timed out");
         }
     }
 }
 
-fn await_task_started(
-    socket: &mut Audio3Socket,
+fn await_task_started<S: SocketIo, C: DeadlineClock>(
+    socket: &mut S,
+    clock: &C,
     task_id: &str,
-    deadline: Instant,
+    deadline: C::Deadline,
     abort_flag: &AtomicBool,
     event_tx: &mpsc::Sender<AsrEvent>,
 ) -> Result<()> {
     loop {
         if abort_flag.load(Ordering::SeqCst) {
-            let _ = socket.close(None);
+            let _ = socket.close_socket();
             return Ok(());
         }
-        if Instant::now() > deadline {
-            let _ = socket.close(None);
+        if clock.is_expired(deadline) {
+            let _ = socket.close_socket();
             bail!("Qwen-Audio-3 task-started timed out");
         }
 
-        match socket.read() {
+        match socket.read_message() {
             Ok(Message::Close(_)) => {
                 bail!("Qwen-Audio-3 websocket closed before task-started")
             }
             Ok(message) => match parse_server_event(message, task_id)? {
                 Some(ServerEvent::TaskStarted) => return Ok(()),
-                Some(ServerEvent::TaskFailed { kind }) => {
-                    return report_task_failure(event_tx, kind);
+                Some(ServerEvent::TaskFailed {
+                    kind,
+                    provider_error_code,
+                }) => {
+                    return report_task_failure(event_tx, kind, provider_error_code);
                 }
                 Some(_) => bail!("Qwen-Audio-3 server event arrived before task-started"),
                 None => {}
             },
-            Err(tungstenite::Error::Io(error))
-                if error.kind() == std::io::ErrorKind::WouldBlock
-                    || error.kind() == std::io::ErrorKind::TimedOut => {}
-            Err(tungstenite::Error::ConnectionClosed) | Err(tungstenite::Error::AlreadyClosed) => {
+            Err(error) if socket_error_is_retryable(&error) => {}
+            Err(error)
+                if matches!(
+                    error.as_ref(),
+                    tungstenite::Error::ConnectionClosed | tungstenite::Error::AlreadyClosed
+                ) =>
+            {
                 bail!("Qwen-Audio-3 connection closed before task-started")
             }
             Err(error) => return Err(error).context("failed to read Qwen-Audio-3 websocket"),
@@ -223,8 +356,24 @@ fn await_task_started(
     }
 }
 
-fn report_task_failure(event_tx: &mpsc::Sender<AsrEvent>, kind: FailureKind) -> Result<()> {
-    let _ = event_tx.send(AsrEvent::Error { kind });
+fn socket_error_is_retryable(error: &tungstenite::Error) -> bool {
+    matches!(
+        error,
+        tungstenite::Error::Io(error)
+            if error.kind() == std::io::ErrorKind::WouldBlock
+                || error.kind() == std::io::ErrorKind::TimedOut
+    )
+}
+
+fn report_task_failure(
+    event_tx: &mpsc::Sender<AsrEvent>,
+    kind: FailureKind,
+    provider_error_code: Option<ProviderErrorCode>,
+) -> Result<()> {
+    let _ = event_tx.send(AsrEvent::TaskFailed {
+        kind,
+        provider_error_code,
+    });
     bail!("Qwen-Audio-3 streaming ASR failed ({})", kind.as_str())
 }
 
@@ -310,14 +459,36 @@ fn configure_socket(stream: &mut MaybeTlsStream<TcpStream>) -> Result<()> {
     Ok(())
 }
 
-fn send_json(socket: &mut Audio3Socket, payload: Value) -> Result<()> {
+fn send_json(socket: &mut impl SocketIo, payload: Value) -> Result<()> {
     socket
-        .send(Message::Text(payload.to_string()))
+        .send_message(Message::Text(payload.to_string()))
         .context("failed to send Qwen-Audio-3 websocket event")
 }
 
-fn run_task_envelope(task_id: &str, model: &str, spec: AudioSpec) -> Value {
-    json!({
+struct Audio3RequestControls<'a> {
+    language: Language,
+    language_hints_enabled: bool,
+    heartbeat_enabled: bool,
+    max_sentence_silence_ms: u32,
+    semantic_punctuation_enabled: bool,
+    vocabulary: &'a [Audio3VocabularyTerm],
+}
+
+fn run_task_envelope(
+    task_id: &str,
+    model: &str,
+    spec: AudioSpec,
+    controls: Audio3RequestControls<'_>,
+) -> Value {
+    let Audio3RequestControls {
+        language,
+        language_hints_enabled,
+        heartbeat_enabled,
+        max_sentence_silence_ms,
+        semantic_punctuation_enabled,
+        vocabulary,
+    } = controls;
+    let mut envelope = json!({
         "header": {
             "action": "run-task",
             "task_id": task_id,
@@ -331,10 +502,20 @@ fn run_task_envelope(task_id: &str, model: &str, spec: AudioSpec) -> Value {
             "input": {},
             "parameters": {
                 "format": "pcm",
-                "sample_rate": spec.sample_rate_hz
+                "sample_rate": spec.sample_rate_hz,
+                "heartbeat": heartbeat_enabled,
+                "max_sentence_silence": max_sentence_silence_ms,
+                "semantic_punctuation_enabled": semantic_punctuation_enabled
             }
         }
-    })
+    });
+    if language_hints_enabled {
+        envelope["payload"]["parameters"]["language_hints"] = super::language_hints(language);
+    }
+    if let Some(vocabulary) = super::vocabulary_value(vocabulary) {
+        envelope["payload"]["parameters"]["vocabulary"] = vocabulary;
+    }
+    envelope
 }
 
 fn finish_task_envelope(task_id: &str) -> Value {
@@ -380,9 +561,17 @@ fn new_task_id() -> String {
 #[derive(Debug, PartialEq, Eq)]
 enum ServerEvent {
     TaskStarted,
-    ResultGenerated { text: String, sentence_final: bool },
-    TaskFinished { text: Option<String> },
-    TaskFailed { kind: FailureKind },
+    ResultGenerated {
+        text: String,
+        sentence_final: bool,
+    },
+    TaskFinished {
+        text: Option<String>,
+    },
+    TaskFailed {
+        kind: FailureKind,
+        provider_error_code: Option<ProviderErrorCode>,
+    },
 }
 
 fn parse_server_event(message: Message, expected_task_id: &str) -> Result<Option<ServerEvent>> {
@@ -431,6 +620,7 @@ fn parse_server_event(message: Message, expected_task_id: &str) -> Result<Option
         })),
         "task-failed" => Ok(Some(ServerEvent::TaskFailed {
             kind: provider_failure_kind(&payload),
+            provider_error_code: provider_error_code(&payload),
         })),
         _ => Ok(None),
     }
@@ -470,6 +660,15 @@ fn extract_optional_text(payload: &Value) -> Option<String> {
     Some(bounded(text, MAX_TRANSCRIPT_BYTES).to_string())
 }
 
+fn provider_error_code(payload: &Value) -> Option<ProviderErrorCode> {
+    payload
+        .pointer("/header/error_code")
+        .or_else(|| payload.pointer("/payload/code"))
+        .or_else(|| payload.pointer("/payload/error/code"))
+        .and_then(Value::as_str)
+        .and_then(ProviderErrorCode::try_new)
+}
+
 fn provider_failure_kind(payload: &Value) -> FailureKind {
     let code = payload
         .pointer("/header/error_code")
@@ -490,6 +689,10 @@ fn provider_failure_kind(payload: &Value) -> FailureKind {
     } else {
         FailureKind::Service
     }
+}
+
+fn duration_ms(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
 fn bounded(value: &str, maximum_bytes: usize) -> &str {
@@ -555,17 +758,376 @@ mod tests {
     use serde_json::json;
     use tungstenite::Message;
 
-    use std::sync::mpsc;
+    use std::{
+        io,
+        sync::{
+            Arc,
+            atomic::{AtomicBool, AtomicU64, Ordering},
+            mpsc,
+        },
+        thread,
+        time::Duration,
+    };
 
-    use crate::{backend::AsrEvent, diagnostics::FailureKind};
+    use crate::{
+        backend::AsrEvent,
+        config::{Audio3VocabularyTerm, Language},
+        diagnostics::{FailureKind, ProviderErrorCode},
+    };
 
     use super::{
-        AudioSpec, ServerEvent, TranscriptAssembler, finish_task_envelope, new_task_id,
-        parse_server_event, pcm16_le_bytes, report_task_failure, run_task_envelope,
+        Audio3RequestControls, AudioSpec, DeadlineClock, EstablishedSession, ServerEvent, SocketIo,
+        SocketResult, TranscriptAssembler, finish_task_envelope, new_task_id, parse_server_event,
+        pcm16_le_bytes, report_task_failure, run_established_socket, run_task_envelope,
         websocket_request,
     };
 
     const TASK_ID: &str = "0123456789abcdef0123456789abcdef";
+    const HEARTBEAT_TEXT_SENTINEL: &str = "heartbeat-must-not-become-transcript";
+    const LONG_IDLE_SECONDS: usize = 65;
+    const SAMPLES_PER_PACKET: usize = 16_000;
+    const STARTUP_DEADLINE_MS: u64 = 10_000;
+    const FINALIZE_DEADLINE_MS: u64 = 8_000;
+
+    #[derive(Clone, Default)]
+    struct ManualClock(Arc<AtomicU64>);
+
+    impl ManualClock {
+        fn advance(&self, duration: Duration) {
+            self.0.fetch_add(
+                u64::try_from(duration.as_millis()).unwrap(),
+                Ordering::SeqCst,
+            );
+        }
+    }
+
+    impl DeadlineClock for ManualClock {
+        type Deadline = u64;
+
+        fn deadline_after(&self, duration: Duration) -> Self::Deadline {
+            self.0
+                .load(Ordering::SeqCst)
+                .saturating_add(u64::try_from(duration.as_millis()).unwrap())
+        }
+
+        fn is_expired(&self, deadline: Self::Deadline) -> bool {
+            self.0.load(Ordering::SeqCst) > deadline
+        }
+    }
+
+    enum ScriptRead {
+        Message(Message),
+        WouldBlock,
+    }
+
+    #[derive(Debug)]
+    enum SocketCheckpoint {
+        Sent(Message),
+        ReadWaiting,
+        Closed,
+    }
+
+    struct ScriptedSocket {
+        read_rx: mpsc::Receiver<ScriptRead>,
+        checkpoint_tx: mpsc::Sender<SocketCheckpoint>,
+    }
+
+    impl SocketIo for ScriptedSocket {
+        fn send_message(&mut self, message: Message) -> SocketResult<()> {
+            self.checkpoint_tx
+                .send(SocketCheckpoint::Sent(message))
+                .expect("test checkpoint receiver dropped");
+            Ok(())
+        }
+
+        fn read_message(&mut self) -> SocketResult<Message> {
+            self.checkpoint_tx
+                .send(SocketCheckpoint::ReadWaiting)
+                .expect("test checkpoint receiver dropped");
+            match self.read_rx.recv().expect("test script sender dropped") {
+                ScriptRead::Message(message) => Ok(message),
+                ScriptRead::WouldBlock => Err(Box::new(tungstenite::Error::Io(io::Error::from(
+                    io::ErrorKind::WouldBlock,
+                )))),
+            }
+        }
+
+        fn close_socket(&mut self) -> SocketResult<()> {
+            self.checkpoint_tx
+                .send(SocketCheckpoint::Closed)
+                .expect("test checkpoint receiver dropped");
+            Ok(())
+        }
+    }
+
+    fn provider_event(event: &str, payload: serde_json::Value) -> Message {
+        Message::Text(
+            json!({
+                "header": {"event": event, "task_id": TASK_ID},
+                "payload": payload,
+            })
+            .to_string(),
+        )
+    }
+
+    fn heartbeat_event() -> Message {
+        provider_event(
+            "result-generated",
+            json!({"output": {"sentence": {
+                "text": HEARTBEAT_TEXT_SENTINEL,
+                "heartbeat": true,
+                "sentence_end": false,
+            }}}),
+        )
+    }
+
+    fn expect_sent(checkpoint_rx: &mpsc::Receiver<SocketCheckpoint>) -> Message {
+        match checkpoint_rx.recv().unwrap() {
+            SocketCheckpoint::Sent(message) => message,
+            checkpoint => panic!("expected sent message, got {checkpoint:?}"),
+        }
+    }
+
+    fn expect_read_waiting(checkpoint_rx: &mpsc::Receiver<SocketCheckpoint>) {
+        assert!(matches!(
+            checkpoint_rx.recv().unwrap(),
+            SocketCheckpoint::ReadWaiting
+        ));
+    }
+
+    fn expect_closed(checkpoint_rx: &mpsc::Receiver<SocketCheckpoint>) {
+        assert!(matches!(
+            checkpoint_rx.recv().unwrap(),
+            SocketCheckpoint::Closed
+        ));
+    }
+
+    fn assert_run_task_heartbeat(message: Message) {
+        let Message::Text(text) = message else {
+            panic!("run-task must be text");
+        };
+        let payload: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(payload["header"]["action"], "run-task");
+        assert_eq!(payload["payload"]["parameters"]["heartbeat"], true);
+    }
+
+    type ScriptedLifecycle = (
+        mpsc::SyncSender<crate::backend::AsrControl>,
+        mpsc::Sender<ScriptRead>,
+        mpsc::Receiver<SocketCheckpoint>,
+        mpsc::Receiver<AsrEvent>,
+        thread::JoinHandle<anyhow::Result<()>>,
+    );
+
+    fn spawn_scripted_lifecycle(
+        clock: ManualClock,
+        abort_flag: Arc<AtomicBool>,
+    ) -> ScriptedLifecycle {
+        let mut config = crate::config::Config::default();
+        config.asr.alibaba_audio3.heartbeat_enabled = true;
+        config.asr.finalize_timeout_ms = FINALIZE_DEADLINE_MS;
+        let (control_tx, control_rx) = mpsc::sync_channel(1);
+        let (read_tx, read_rx) = mpsc::channel();
+        let (checkpoint_tx, checkpoint_rx) = mpsc::channel();
+        let (event_tx, event_rx) = mpsc::channel();
+        let deadline = clock.deadline_after(Duration::from_millis(STARTUP_DEADLINE_MS));
+        let join = thread::spawn(move || {
+            let mut socket = ScriptedSocket {
+                read_rx,
+                checkpoint_tx,
+            };
+            run_established_socket(
+                &mut socket,
+                &clock,
+                EstablishedSession {
+                    config: &config,
+                    spec: AudioSpec {
+                        sample_rate_hz: 16_000,
+                    },
+                    task_id: TASK_ID,
+                    startup_deadline: deadline,
+                    control_rx,
+                    abort_flag: &abort_flag,
+                    event_tx: &event_tx,
+                },
+            )
+        });
+        (control_tx, read_tx, checkpoint_rx, event_rx, join)
+    }
+
+    fn start_scripted_lifecycle(
+        read_tx: &mpsc::Sender<ScriptRead>,
+        checkpoint_rx: &mpsc::Receiver<SocketCheckpoint>,
+        event_rx: &mpsc::Receiver<AsrEvent>,
+    ) {
+        assert_run_task_heartbeat(expect_sent(checkpoint_rx));
+        expect_read_waiting(checkpoint_rx);
+        read_tx
+            .send(ScriptRead::Message(provider_event(
+                "task-started",
+                json!({}),
+            )))
+            .unwrap();
+        assert!(matches!(event_rx.recv().unwrap(), AsrEvent::Ready));
+        expect_read_waiting(checkpoint_rx);
+    }
+
+    fn drive_one_silent_second(
+        control_tx: &mpsc::SyncSender<crate::backend::AsrControl>,
+        read_tx: &mpsc::Sender<ScriptRead>,
+        checkpoint_rx: &mpsc::Receiver<SocketCheckpoint>,
+        clock: &ManualClock,
+    ) {
+        control_tx
+            .send(crate::backend::AsrControl::append_pcm16(vec![
+                0;
+                SAMPLES_PER_PACKET
+            ]))
+            .unwrap();
+        read_tx.send(ScriptRead::WouldBlock).unwrap();
+        let Message::Binary(bytes) = expect_sent(checkpoint_rx) else {
+            panic!("PCM packet must be binary");
+        };
+        assert_eq!(bytes.len(), SAMPLES_PER_PACKET * 2);
+        assert!(bytes.iter().all(|byte| *byte == 0));
+        expect_read_waiting(checkpoint_rx);
+        clock.advance(Duration::from_secs(1));
+        read_tx
+            .send(ScriptRead::Message(heartbeat_event()))
+            .unwrap();
+        expect_read_waiting(checkpoint_rx);
+    }
+
+    #[test]
+    fn startup_deadline_expiration_closes_with_stable_timeout_error() {
+        let clock = ManualClock::default();
+        let abort_flag = Arc::new(AtomicBool::new(false));
+        let (control_tx, read_tx, checkpoint_rx, event_rx, join) =
+            spawn_scripted_lifecycle(clock.clone(), abort_flag);
+
+        assert_run_task_heartbeat(expect_sent(&checkpoint_rx));
+        expect_read_waiting(&checkpoint_rx);
+        clock.advance(Duration::from_millis(STARTUP_DEADLINE_MS + 1));
+        read_tx.send(ScriptRead::WouldBlock).unwrap();
+        expect_closed(&checkpoint_rx);
+        drop(control_tx);
+
+        let error = join.join().unwrap().unwrap_err();
+        assert_eq!(error.to_string(), "Qwen-Audio-3 task-started timed out");
+        assert!(event_rx.try_iter().next().is_none());
+    }
+
+    #[test]
+    fn finalization_deadline_expiration_closes_with_stable_timeout_error() {
+        let clock = ManualClock::default();
+        let abort_flag = Arc::new(AtomicBool::new(false));
+        let (control_tx, read_tx, checkpoint_rx, event_rx, join) =
+            spawn_scripted_lifecycle(clock.clone(), abort_flag);
+        start_scripted_lifecycle(&read_tx, &checkpoint_rx, &event_rx);
+
+        control_tx.send(crate::backend::AsrControl::Finish).unwrap();
+        read_tx.send(ScriptRead::WouldBlock).unwrap();
+        let Message::Text(finish_text) = expect_sent(&checkpoint_rx) else {
+            panic!("finish-task must be text");
+        };
+        let finish_payload: serde_json::Value = serde_json::from_str(&finish_text).unwrap();
+        assert_eq!(finish_payload["header"]["action"], "finish-task");
+        assert!(matches!(
+            event_rx.recv().unwrap(),
+            AsrEvent::AudioDeliveryCompleted {
+                packet_count: 0,
+                sample_count: 0,
+                ..
+            }
+        ));
+        expect_read_waiting(&checkpoint_rx);
+        clock.advance(Duration::from_millis(FINALIZE_DEADLINE_MS + 1));
+        read_tx.send(ScriptRead::WouldBlock).unwrap();
+        expect_closed(&checkpoint_rx);
+        drop(control_tx);
+
+        let error = join.join().unwrap().unwrap_err();
+        assert_eq!(error.to_string(), "Qwen-Audio-3 finalization timed out");
+        assert!(event_rx.try_iter().all(|event| !matches!(
+            event,
+            AsrEvent::Partial { .. }
+                | AsrEvent::SegmentFinal { .. }
+                | AsrEvent::Final { .. }
+                | AsrEvent::Finished
+        )));
+    }
+
+    #[test]
+    fn heartbeat_long_idle_finish_lifecycle_is_deterministic() {
+        let clock = ManualClock::default();
+        let abort_flag = Arc::new(AtomicBool::new(false));
+        let (control_tx, read_tx, checkpoint_rx, event_rx, join) =
+            spawn_scripted_lifecycle(clock.clone(), abort_flag);
+        start_scripted_lifecycle(&read_tx, &checkpoint_rx, &event_rx);
+
+        for _ in 0..LONG_IDLE_SECONDS {
+            drive_one_silent_second(&control_tx, &read_tx, &checkpoint_rx, &clock);
+        }
+
+        control_tx.send(crate::backend::AsrControl::Finish).unwrap();
+        read_tx.send(ScriptRead::WouldBlock).unwrap();
+        let Message::Text(finish_text) = expect_sent(&checkpoint_rx) else {
+            panic!("finish-task must be text");
+        };
+        let finish_payload: serde_json::Value = serde_json::from_str(&finish_text).unwrap();
+        assert_eq!(finish_payload["header"]["action"], "finish-task");
+        assert!(matches!(
+            event_rx.recv().unwrap(),
+            AsrEvent::AudioDeliveryCompleted {
+                packet_count: 65,
+                sample_count: 1_040_000,
+                ..
+            }
+        ));
+        expect_read_waiting(&checkpoint_rx);
+        read_tx
+            .send(ScriptRead::Message(provider_event(
+                "task-finished",
+                json!({}),
+            )))
+            .unwrap();
+        assert!(matches!(event_rx.recv().unwrap(), AsrEvent::Finished));
+        expect_closed(&checkpoint_rx);
+        join.join().unwrap().unwrap();
+
+        assert!(event_rx.try_iter().all(|event| !matches!(
+            event,
+            AsrEvent::Partial { .. } | AsrEvent::SegmentFinal { .. } | AsrEvent::Final { .. }
+        )));
+    }
+
+    #[test]
+    fn heartbeat_long_idle_cancellation_is_observed_on_next_retryable_read_and_closes() {
+        let clock = ManualClock::default();
+        let abort_flag = Arc::new(AtomicBool::new(false));
+        let (control_tx, read_tx, checkpoint_rx, event_rx, join) =
+            spawn_scripted_lifecycle(clock.clone(), abort_flag.clone());
+        start_scripted_lifecycle(&read_tx, &checkpoint_rx, &event_rx);
+
+        for _ in 0..LONG_IDLE_SECONDS {
+            drive_one_silent_second(&control_tx, &read_tx, &checkpoint_rx, &clock);
+        }
+
+        abort_flag.store(true, Ordering::SeqCst);
+        read_tx.send(ScriptRead::WouldBlock).unwrap();
+        expect_closed(&checkpoint_rx);
+        drop(control_tx);
+        join.join().unwrap().unwrap();
+
+        assert!(event_rx.try_iter().all(|event| !matches!(
+            event,
+            AsrEvent::Partial { .. }
+                | AsrEvent::SegmentFinal { .. }
+                | AsrEvent::Final { .. }
+                | AsrEvent::AudioDeliveryCompleted { .. }
+                | AsrEvent::Finished
+        )));
+    }
 
     #[test]
     fn websocket_request_uses_bearer_authorization() {
@@ -585,6 +1147,14 @@ mod tests {
                 AudioSpec {
                     sample_rate_hz: 16_000,
                 },
+                Audio3RequestControls {
+                    language: Language::SimplifiedChinese,
+                    language_hints_enabled: true,
+                    heartbeat_enabled: true,
+                    max_sentence_silence_ms: 800,
+                    semantic_punctuation_enabled: false,
+                    vocabulary: &[],
+                },
             ),
             json!({
                 "header": {
@@ -600,10 +1170,90 @@ mod tests {
                     "input": {},
                     "parameters": {
                         "format": "pcm",
-                        "sample_rate": 16_000
+                        "sample_rate": 16_000,
+                        "language_hints": ["zh", "en"],
+                        "heartbeat": true,
+                        "max_sentence_silence": 800,
+                        "semantic_punctuation_enabled": false
                     }
                 }
             })
+        );
+    }
+
+    #[test]
+    fn run_task_envelope_sends_explicit_controls_and_omits_empty_vocabulary() {
+        let disabled = run_task_envelope(
+            TASK_ID,
+            "model",
+            AudioSpec {
+                sample_rate_hz: 16_000,
+            },
+            Audio3RequestControls {
+                language: Language::English,
+                language_hints_enabled: false,
+                heartbeat_enabled: false,
+                max_sentence_silence_ms: 200,
+                semantic_punctuation_enabled: true,
+                vocabulary: &[],
+            },
+        );
+        assert!(
+            disabled["payload"]["parameters"]
+                .get("language_hints")
+                .is_none()
+        );
+        assert_eq!(disabled["payload"]["parameters"]["heartbeat"], false);
+        assert_eq!(
+            disabled["payload"]["parameters"]["max_sentence_silence"],
+            200
+        );
+        assert_eq!(
+            disabled["payload"]["parameters"]["semantic_punctuation_enabled"],
+            true
+        );
+        assert!(
+            disabled["payload"]["parameters"]
+                .get("vocabulary")
+                .is_none()
+        );
+
+        let vocabulary = [
+            Audio3VocabularyTerm {
+                term: " Voice Input ".into(),
+                weight: 5,
+            },
+            Audio3VocabularyTerm {
+                term: "语音输入".into(),
+                weight: 50,
+            },
+        ];
+        let configured = run_task_envelope(
+            TASK_ID,
+            "model",
+            AudioSpec {
+                sample_rate_hz: 16_000,
+            },
+            Audio3RequestControls {
+                language: Language::Japanese,
+                language_hints_enabled: true,
+                heartbeat_enabled: true,
+                max_sentence_silence_ms: 6_000,
+                semantic_punctuation_enabled: false,
+                vocabulary: &vocabulary,
+            },
+        );
+        assert_eq!(
+            configured["payload"]["parameters"]["language_hints"],
+            json!(["ja", "en"])
+        );
+        assert_eq!(
+            configured["payload"]["parameters"]["vocabulary"],
+            json!({"Voice Input": 5, "语音输入": 50})
+        );
+        assert_eq!(
+            configured["payload"]["parameters"]["max_sentence_silence"],
+            6_000
         );
     }
 
@@ -713,30 +1363,72 @@ mod tests {
         const SENTINEL: &str = "private-transcript-sentinel";
         let event = Message::Text(
             json!({
-                "header": {"event": "task-failed", "task_id": TASK_ID},
+                "header": {
+                    "event": "task-failed",
+                    "task_id": TASK_ID,
+                    "error_code": "ServiceUnavailable"
+                },
                 "payload": {"message": SENTINEL}
             })
             .to_string(),
         );
-        let Some(ServerEvent::TaskFailed { kind }) = parse_server_event(event, TASK_ID).unwrap()
+        let Some(ServerEvent::TaskFailed {
+            kind,
+            provider_error_code,
+        }) = parse_server_event(event, TASK_ID).unwrap()
         else {
             panic!("expected task failure");
         };
         assert_eq!(kind, FailureKind::Service);
+        assert_eq!(
+            provider_error_code,
+            ProviderErrorCode::try_new("ServiceUnavailable")
+        );
 
         let (event_tx, event_rx) = mpsc::channel();
-        let error = report_task_failure(&event_tx, kind).unwrap_err();
+        let error = report_task_failure(&event_tx, kind, provider_error_code).unwrap_err();
         assert!(matches!(
             event_rx.recv().unwrap(),
-            AsrEvent::Error {
-                kind: FailureKind::Service
-            }
+            AsrEvent::TaskFailed {
+                kind: FailureKind::Service,
+                provider_error_code: Some(code),
+            } if code.as_str() == "ServiceUnavailable"
         ));
         assert_eq!(
             error.to_string(),
             "Qwen-Audio-3 streaming ASR failed (service)"
         );
         assert!(!format!("{error:#}").contains(SENTINEL));
+    }
+
+    #[test]
+    fn malformed_provider_error_codes_are_discarded_whole() {
+        for code in [
+            "private value",
+            "path/value",
+            "line\nbreak",
+            "私密内容",
+            &"A".repeat(65),
+        ] {
+            let event = Message::Text(
+                json!({
+                    "header": {
+                        "event": "task-failed",
+                        "task_id": TASK_ID,
+                        "error_code": code
+                    },
+                    "payload": {}
+                })
+                .to_string(),
+            );
+            assert!(matches!(
+                parse_server_event(event, TASK_ID).unwrap(),
+                Some(ServerEvent::TaskFailed {
+                    provider_error_code: None,
+                    ..
+                })
+            ));
+        }
     }
 
     #[test]

@@ -38,9 +38,14 @@ final_pass_enable_itn = false
 experimental_enabled = false
 endpoint = "wss://dashscope.aliyuncs.com/api-ws/v1/inference"
 model = "qwen-audio-3.0-asr-flash-streaming"
+language_hints_enabled = false
+heartbeat_enabled = false
+max_sentence_silence_ms = 800
+semantic_punctuation_enabled = false
+vocabulary = []
 native_endpoint = "https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation"
 native_model = "qwen-audio-3.0-asr-flash"
-native_final_pass_enabled = false
+native_final_pass_mode = "streaming-only"
 native_timeout_ms = 20000
 
 [output]

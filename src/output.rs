@@ -118,16 +118,28 @@ fn settle_before_output(delay_ms: u64) {
 fn paste_via_clipboard(config: &Config, text: &str, target: &OutputTarget) -> Result<()> {
     eprintln!("voice-input output: capture clipboard backup");
     let backup = ClipboardBackup::capture(target)?;
-    eprintln!("voice-input output: write clipboard payload");
-    copy_to_clipboards(text, target)?;
-    eprintln!(
-        "voice-input output: send paste chord {}",
-        selected_paste_keys(config, target)
-    );
-    press_key_chord(selected_paste_keys(config, target), target)?;
-    thread::sleep(Duration::from_millis(220));
+    let delivery_result = (|| {
+        eprintln!("voice-input output: write clipboard payload");
+        copy_to_clipboards(text, target)?;
+        eprintln!(
+            "voice-input output: send paste chord {}",
+            selected_paste_keys(config, target)
+        );
+        press_key_chord(selected_paste_keys(config, target), target)?;
+        thread::sleep(Duration::from_millis(220));
+        Ok(())
+    })();
+
     eprintln!("voice-input output: restore clipboard backup");
-    backup.restore()
+    let restore_result = backup.restore();
+    match (delivery_result, restore_result) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(delivery_error), Ok(())) => Err(delivery_error),
+        (Ok(()), Err(restore_error)) => Err(restore_error),
+        (Err(delivery_error), Err(restore_error)) => Err(anyhow!(
+            "{delivery_error:#}; clipboard restoration also failed: {restore_error:#}"
+        )),
+    }
 }
 
 fn selected_paste_keys<'a>(config: &'a Config, target: &OutputTarget) -> &'a str {
@@ -148,15 +160,7 @@ fn copy_to_clipboards(text: &str, target: &OutputTarget) -> Result<()> {
 }
 
 fn copy_to_wayland_clipboard(text: &str) -> Result<()> {
-    let mut command = Command::new("wl-copy");
-    command
-        .arg("--trim-newline")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        // wl-copy forks a clipboard-provider process by default. A piped
-        // stderr remains open in that provider and makes wait_with_output()
-        // wait forever even though the original child has exited.
-        .stderr(Stdio::null());
+    let mut command = wayland_payload_copy_command();
     let output = spawn_with_input_and_wait(
         &mut command,
         text.as_bytes(),
@@ -171,6 +175,38 @@ fn copy_to_wayland_clipboard(text: &str) -> Result<()> {
             String::from_utf8_lossy(&output.stderr).trim()
         )
     }
+}
+
+fn wayland_payload_copy_command() -> Command {
+    let mut command = Command::new("wl-copy");
+    command
+        // Advertise x-kde-passwordManagerHint alongside the text formats so
+        // compatible clipboard managers do not persist dictation history.
+        .arg("--sensitive")
+        .arg("--trim-newline")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        // wl-copy forks a clipboard-provider process by default. A piped
+        // stderr remains open in that provider and makes wait_with_output()
+        // wait forever even though the original child has exited.
+        .stderr(Stdio::null());
+    command
+}
+
+fn wayland_restore_copy_command(mime_type: &str) -> Command {
+    let mut command = Command::new("wl-copy");
+    command
+        // Avoid recording or reordering the restored item in compatible
+        // clipboard managers.
+        .arg("--sensitive")
+        .arg("--type")
+        .arg(mime_type)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        // See wayland_payload_copy_command: wl-copy daemonizes, so captured
+        // output pipes would be held open by the clipboard provider.
+        .stderr(Stdio::null());
+    command
 }
 
 fn press_key_chord(chord: &str, target: &OutputTarget) -> Result<()> {
@@ -562,6 +598,20 @@ fn find_latest_hyprland_socket(hypr_dir: &std::path::Path) -> Option<PathBuf> {
     best.map(|(_, path)| path)
 }
 
+fn select_clipboard_payload_mime(advertised_types: &str) -> Option<&str> {
+    advertised_types
+        .lines()
+        .map(str::trim)
+        .filter(|mime_type| !mime_type.is_empty())
+        .find(|mime_type| !is_sensitive_clipboard_metadata_mime(mime_type))
+}
+
+fn is_sensitive_clipboard_metadata_mime(mime_type: &str) -> bool {
+    ["x-kde-passwordManagerHint"]
+        .iter()
+        .any(|marker| mime_type.eq_ignore_ascii_case(marker))
+}
+
 struct ClipboardBackup {
     mime_type: Option<String>,
     temp_path: Option<PathBuf>,
@@ -608,10 +658,8 @@ impl ClipboardBackup {
             });
         }
 
-        let mime_type = String::from_utf8_lossy(&type_output.stdout)
-            .lines()
-            .find(|line| !line.trim().is_empty())
-            .map(|line| line.trim().to_string());
+        let advertised_types = String::from_utf8_lossy(&type_output.stdout);
+        let mime_type = select_clipboard_payload_mime(&advertised_types).map(str::to_string);
 
         let Some(mime_type) = mime_type else {
             return Ok(Self {
@@ -670,22 +718,15 @@ impl ClipboardBackup {
         };
 
         let data = fs::read(&temp_path).context("failed to read clipboard backup")?;
-        let mut command = Command::new("wl-copy");
-        command
-            .arg("--type")
-            .arg(mime_type)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            // See copy_to_wayland_clipboard: wl-copy daemonizes, so captured
-            // output pipes would be held open by the clipboard provider.
-            .stderr(Stdio::null());
+        let mut command = wayland_restore_copy_command(&mime_type);
         let output = spawn_with_input_and_wait(
             &mut command,
             &data,
             CLIPBOARD_COPY_TIMEOUT_MS,
             "wl-copy clipboard restore",
-        )?;
+        );
         fs::remove_file(&temp_path).ok();
+        let output = output?;
 
         if output.status.success() {
             Ok(())
@@ -808,7 +849,79 @@ fn wait_with_output_timeout(mut child: Child, timeout_ms: u64, label: &str) -> R
 
 #[cfg(test)]
 mod tests {
-    use super::{ActiveWindow, OutputTarget, hyprland_shortcut};
+    use std::process::Command;
+
+    use super::{
+        ActiveWindow, OutputTarget, hyprland_shortcut, select_clipboard_payload_mime,
+        wayland_payload_copy_command, wayland_restore_copy_command,
+    };
+
+    fn command_args(command: &Command) -> Vec<String> {
+        command
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn clipboard_mime_selection_skips_sensitive_marker_before_text() {
+        assert_eq!(
+            select_clipboard_payload_mime(
+                "x-kde-passwordManagerHint\ntext/plain;charset=utf-8\ntext/plain\n"
+            ),
+            Some("text/plain;charset=utf-8")
+        );
+        assert_eq!(
+            select_clipboard_payload_mime("X-KDE-PASSWORDMANAGERHINT\ntext/plain\n"),
+            Some("text/plain")
+        );
+    }
+
+    #[test]
+    fn clipboard_mime_selection_skips_sensitive_marker_before_image() {
+        assert_eq!(
+            select_clipboard_payload_mime("x-kde-passwordManagerHint\nimage/png\n"),
+            Some("image/png")
+        );
+    }
+
+    #[test]
+    fn clipboard_mime_selection_rejects_marker_only_lists() {
+        assert_eq!(
+            select_clipboard_payload_mime("x-kde-passwordManagerHint\nX-KDE-PASSWORDMANAGERHINT\n"),
+            None
+        );
+    }
+
+    #[test]
+    fn clipboard_mime_selection_preserves_ordinary_advertised_order() {
+        assert_eq!(
+            select_clipboard_payload_mime("application/octet-stream\nimage/png\n"),
+            Some("application/octet-stream")
+        );
+        assert_eq!(
+            select_clipboard_payload_mime("  text/plain  \nimage/png\n"),
+            Some("text/plain")
+        );
+    }
+
+    #[test]
+    fn clipboard_mime_selection_rejects_empty_or_whitespace_lists() {
+        assert_eq!(select_clipboard_payload_mime(""), None);
+        assert_eq!(select_clipboard_payload_mime(" \n\t\n"), None);
+    }
+
+    #[test]
+    fn wayland_copy_commands_mark_initial_and_restored_payloads_sensitive() {
+        assert_eq!(
+            command_args(&wayland_payload_copy_command()),
+            ["--sensitive", "--trim-newline"]
+        );
+        assert_eq!(
+            command_args(&wayland_restore_copy_command("text/plain")),
+            ["--sensitive", "--type", "text/plain"]
+        );
+    }
 
     #[test]
     fn wayland_paste_shortcut_uses_hyprland_dispatch_syntax() {

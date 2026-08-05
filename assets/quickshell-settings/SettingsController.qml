@@ -36,8 +36,10 @@ QtObject {
     // draft config, logged, or placed in process arguments.
     property string alibabaCredential: ""
     property string openrouterCredential: ""
+    property string audio3VocabularyText: ""
     readonly property bool busy: loading || saving || testing
-    readonly property bool dirty: JSON.stringify(draft) !== JSON.stringify(loadedConfig) || alibabaCredential.length > 0 || openrouterCredential.length > 0
+    readonly property bool audio3VocabularyDirty: audio3VocabularyText !== formatAudio3Vocabulary(loadedConfig)
+    readonly property bool dirty: JSON.stringify(draft) !== JSON.stringify(loadedConfig) || audio3VocabularyDirty || alibabaCredential.length > 0 || openrouterCredential.length > 0
     property Process backendProcess
     property Timer runtimePollTimer
     property Timer requestTimeoutTimer
@@ -88,9 +90,14 @@ QtObject {
                     "experimental_enabled": false,
                     "endpoint": "wss://dashscope.aliyuncs.com/api-ws/v1/inference",
                     "model": "qwen-audio-3.0-asr-flash-streaming",
+                    "language_hints_enabled": false,
+                    "heartbeat_enabled": false,
+                    "max_sentence_silence_ms": 800,
+                    "semantic_punctuation_enabled": false,
+                    "vocabulary": [],
                     "native_endpoint": "https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation",
                     "native_model": "qwen-audio-3.0-asr-flash",
-                    "native_final_pass_enabled": false,
+                    "native_final_pass_mode": "streaming-only",
                     "native_timeout_ms": 20000
                 }
             },
@@ -130,6 +137,54 @@ QtObject {
 
     function clone(value) {
         return JSON.parse(JSON.stringify(value));
+    }
+
+    function formatAudio3Vocabulary(config) {
+        const audio3 = config && config.asr ? config.asr.alibaba_audio3 : null;
+        const entries = audio3 && Array.isArray(audio3.vocabulary) ? audio3.vocabulary : [];
+        const lines = [];
+        for (let i = 0; i < entries.length; ++i) lines.push(JSON.stringify({
+            "term": entries[i].term,
+            "weight": entries[i].weight
+        }))
+        return lines.join("\n");
+    }
+
+    function setAudio3VocabularyText(value) {
+        audio3VocabularyText = value;
+        clearFieldError("asr.alibaba_audio3.vocabulary");
+        statusMessage = "";
+    }
+
+    function parseAudio3Vocabulary() {
+        const entries = [];
+        const lines = audio3VocabularyText.split(/\r?\n/);
+        for (let i = 0; i < lines.length; ++i) {
+            if (lines[i].trim().length === 0)
+                continue;
+
+            let entry;
+            try {
+                entry = JSON.parse(lines[i]);
+            } catch (error) {
+                const next = clone(fieldErrors);
+                next["asr.alibaba_audio3.vocabulary"] = "Vocabulary line " + (i + 1) + " must be a JSON object with term and weight.";
+                fieldErrors = next;
+                return null;
+            }
+            const keys = entry && typeof entry === "object" && !Array.isArray(entry) ? Object.keys(entry) : [];
+            if (keys.length !== 2 || !Object.prototype.hasOwnProperty.call(entry, "term") || !Object.prototype.hasOwnProperty.call(entry, "weight") || typeof entry.term !== "string" || typeof entry.weight !== "number" || !Number.isInteger(entry.weight)) {
+                const next = clone(fieldErrors);
+                next["asr.alibaba_audio3.vocabulary"] = "Vocabulary line " + (i + 1) + " must be a JSON object with term and weight.";
+                fieldErrors = next;
+                return null;
+            }
+            entries.push({
+                "term": entry.term.trim(),
+                "weight": entry.weight
+            });
+        }
+        return entries;
     }
 
     function withoutPlaintextSecrets(config) {
@@ -218,6 +273,7 @@ QtObject {
             return ;
 
         draft = clone(loadedConfig);
+        audio3VocabularyText = formatAudio3Vocabulary(loadedConfig);
         alibabaCredential = "";
         openrouterCredential = "";
         clearMessages();
@@ -243,7 +299,7 @@ QtObject {
     }
 
     function fieldNeedsAdvanced(path) {
-        const audio3Advanced = path.indexOf("asr.alibaba_audio3.") === 0 && path !== "asr.alibaba_audio3.experimental_enabled" && path !== "asr.alibaba_audio3.native_final_pass_enabled";
+        const audio3Advanced = path.indexOf("asr.alibaba_audio3.") === 0 && path !== "asr.alibaba_audio3.experimental_enabled" && path !== "asr.alibaba_audio3.language_hints_enabled" && path !== "asr.alibaba_audio3.heartbeat_enabled" && path !== "asr.alibaba_audio3.vocabulary" && path !== "asr.alibaba_audio3.native_final_pass_mode";
         return path === "audio.sample_rate" || path === "audio.partial_interval_ms" || path === "audio.pre_roll_ms" || path === "asr.connect_timeout_ms" || path === "asr.finalize_timeout_ms" || path.indexOf("asr.alibaba.endpoint") === 0 || path.indexOf("asr.alibaba.vad_") === 0 || path.indexOf("asr.alibaba.silence_") === 0 || path.indexOf("asr.alibaba.final_pass_") === 0 || audio3Advanced || path === "llm.api_base_url" || path === "llm.timeout_ms" || path === "llm.provider_sort" || path === "llm.agent_context_max_chars" || path === "output.type_delay_ms" || path === "output.pre_type_delay_ms" || path === "output.paste_keys" || path === "output.prefer_paste_for_xwayland" || path === "output.xwayland_paste_keys" || path === "hud.margin_bottom" || path === "hud.height" || path === "hud.offset_x" || path === "hud.offset_y" || path === "hud.nudge_step";
     }
 
@@ -376,14 +432,19 @@ QtObject {
         fieldErrors = ({
         });
         const config = withoutPlaintextSecrets(draft);
-        const unsignedIntegers = [["audio.sample_rate", 1], ["audio.max_duration_secs", 0], ["audio.partial_interval_ms", 0], ["audio.pre_roll_ms", 0], ["asr.connect_timeout_ms", 0], ["asr.finalize_timeout_ms", 0], ["asr.alibaba.silence_duration_ms", 0], ["asr.alibaba.final_pass_timeout_ms", 0], ["asr.alibaba_audio3.native_timeout_ms", 0], ["output.type_delay_ms", 0], ["output.pre_type_delay_ms", 0], ["llm.timeout_ms", 0], ["llm.agent_context_max_chars", 0]];
+        const unsignedIntegers = [["audio.sample_rate", 1], ["audio.max_duration_secs", 0], ["audio.partial_interval_ms", 0], ["audio.pre_roll_ms", 0], ["asr.connect_timeout_ms", 0], ["asr.finalize_timeout_ms", 0], ["asr.alibaba.silence_duration_ms", 0], ["asr.alibaba.final_pass_timeout_ms", 0], ["asr.alibaba_audio3.max_sentence_silence_ms", 0], ["asr.alibaba_audio3.native_timeout_ms", 0], ["output.type_delay_ms", 0], ["output.pre_type_delay_ms", 0], ["llm.timeout_ms", 0], ["llm.agent_context_max_chars", 0]];
         const signedIntegers = ["hud.margin_bottom", "hud.height", "hud.offset_x", "hud.offset_y", "hud.nudge_step"];
         let valid = true;
         for (let i = 0; i < unsignedIntegers.length; ++i) valid = asNumber(config, unsignedIntegers[i][0], true, unsignedIntegers[i][1]) && valid
         for (let i = 0; i < signedIntegers.length; ++i) valid = asNumber(config, signedIntegers[i], true, null) && valid
         valid = asNumber(config, "asr.alibaba.vad_threshold", false, null) && valid;
+        const vocabulary = parseAudio3Vocabulary();
+        if (vocabulary === null)
+            valid = false;
+        else
+            config.asr.alibaba_audio3.vocabulary = vocabulary;
         if (!valid) {
-            globalError = "Fix the highlighted numeric fields before continuing.";
+            globalError = vocabulary === null ? "Fix the highlighted fields before continuing." : "Fix the highlighted numeric fields before continuing.";
             routeFirstError();
             return null;
         }
@@ -584,6 +645,7 @@ QtObject {
             }));
             loadedConfig = clone(config);
             draft = clone(config);
+            audio3VocabularyText = formatAudio3Vocabulary(config);
             revision = result.revision === undefined ? null : result.revision;
             credentials = clone(result.credentials || {
             });
@@ -594,6 +656,7 @@ QtObject {
             const config = withoutPlaintextSecrets(merge(defaults(), result.config || request.configFallback));
             loadedConfig = clone(config);
             draft = clone(config);
+            audio3VocabularyText = formatAudio3Vocabulary(config);
             if (result.revision !== undefined)
                 revision = result.revision;
 
@@ -631,6 +694,7 @@ QtObject {
     Component.onCompleted: {
         loadedConfig = defaults();
         draft = clone(loadedConfig);
+        audio3VocabularyText = formatAudio3Vocabulary(loadedConfig);
         if (!backendConfigured)
             globalError = "Set VOICE_INPUT_BIN to the Voice Input executable path.";
 

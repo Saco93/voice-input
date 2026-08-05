@@ -79,6 +79,7 @@ SettingsPage {
                 value: root.controller.value("asr.language", "simplified-chinese")
                 labels: ["English", "Simplified Chinese", "Traditional Chinese", "Japanese", "Korean"]
                 values: ["english", "simplified-chinese", "traditional-chinese", "japanese", "korean"]
+                help: "When Audio3 language hints are enabled, this selection guides recognition; Chinese, Japanese, and Korean also retain English mixing."
                 error: root.controller.errorFor("asr.language")
                 enabled: !root.controller.busy
                 onSelected: (value) => {
@@ -199,7 +200,7 @@ SettingsPage {
         }
 
         SectionCard {
-            visible: root.controller.value("asr.provider", "local-cli") === "alibaba-qwen-audio3" || root.controller.hasErrorPrefix("asr.alibaba_audio3.")
+            visible: root.controller.value("asr.provider", "local-cli") === "alibaba-qwen-audio3" || root.controller.hasErrorPrefix("asr.alibaba_audio3.") || root.controller.audio3VocabularyDirty
             theme: root.theme
             title: "Qwen-Audio-3 (experimental)"
             description: "Experimental provider; behavior and API compatibility may change."
@@ -218,13 +219,52 @@ SettingsPage {
 
             SettingSwitch {
                 theme: root.theme
-                label: "Enable native final pass"
-                checked: root.controller.value("asr.alibaba_audio3.native_final_pass_enabled", false)
-                help: "After streaming, send the complete recording remotely. No words is authoritative unless streaming text is usable; failures keep streaming text or use local fallback."
-                error: root.controller.errorFor("asr.alibaba_audio3.native_final_pass_enabled")
+                label: "Enable language hints"
+                checked: root.controller.value("asr.alibaba_audio3.language_hints_enabled", false)
+                help: "Opt in to sending the selected language as an Audio3 recognition hint."
+                error: root.controller.errorFor("asr.alibaba_audio3.language_hints_enabled")
                 enabled: !root.controller.busy
                 onToggled: (checked) => {
-                    return root.controller.setValue("asr.alibaba_audio3.native_final_pass_enabled", checked);
+                    return root.controller.setValue("asr.alibaba_audio3.language_hints_enabled", checked);
+                }
+            }
+
+            SettingSwitch {
+                theme: root.theme
+                label: "Enable streaming heartbeat"
+                checked: root.controller.value("asr.alibaba_audio3.heartbeat_enabled", false)
+                help: "Opt in to keeping long silent push-to-talk sessions alive while audio frames continue."
+                error: root.controller.errorFor("asr.alibaba_audio3.heartbeat_enabled")
+                enabled: !root.controller.busy
+                onToggled: (checked) => {
+                    return root.controller.setValue("asr.alibaba_audio3.heartbeat_enabled", checked);
+                }
+            }
+
+            SettingTextArea {
+                theme: root.theme
+                label: "Dynamic vocabulary"
+                value: root.controller.audio3VocabularyText
+                help: "Optional global Audio3 terms. Enter one JSON object per line with term and weight; weights are 1–5 or 50. Every listed term is sent remotely."
+                placeholderText: "{\"term\":\"Voice Input\",\"weight\":5}"
+                error: root.controller.errorFor("asr.alibaba_audio3.vocabulary")
+                enabled: !root.controller.busy
+                onEdited: (value) => {
+                    return root.controller.setAudio3VocabularyText(value);
+                }
+            }
+
+            SettingCombo {
+                theme: root.theme
+                label: "Native final pass"
+                value: root.controller.value("asr.alibaba_audio3.native_final_pass_mode", "streaming-only")
+                labels: ["Streaming only", "Adaptive", "Always"]
+                values: ["streaming-only", "adaptive", "always"]
+                help: "Adaptive runs native recognition for unhealthy, incomplete, overloaded, or 30-second recordings. Always requests maximum accuracy for every nonempty recording."
+                error: root.controller.errorFor("asr.alibaba_audio3.native_final_pass_mode")
+                enabled: !root.controller.busy
+                onSelected: (value) => {
+                    return root.controller.setValue("asr.alibaba_audio3.native_final_pass_mode", value);
                 }
             }
 
@@ -448,6 +488,30 @@ SettingsPage {
                     enabled: !root.controller.busy
                     onEdited: (value) => {
                         return root.controller.setValue("asr.alibaba_audio3.model", value);
+                    }
+                }
+
+                SettingTextField {
+                    theme: root.theme
+                    label: "Maximum sentence silence"
+                    value: root.controller.value("asr.alibaba_audio3.max_sentence_silence_ms", 800)
+                    help: "Milliseconds from 200 to 6000. Lower values finalize speech segments sooner."
+                    error: root.controller.errorFor("asr.alibaba_audio3.max_sentence_silence_ms")
+                    enabled: !root.controller.busy
+                    onEdited: (value) => {
+                        return root.controller.setValue("asr.alibaba_audio3.max_sentence_silence_ms", value);
+                    }
+                }
+
+                SettingSwitch {
+                    theme: root.theme
+                    label: "Enable semantic punctuation"
+                    checked: root.controller.value("asr.alibaba_audio3.semantic_punctuation_enabled", false)
+                    help: "Allow the streaming model to use semantic punctuation when finalizing speech segments."
+                    error: root.controller.errorFor("asr.alibaba_audio3.semantic_punctuation_enabled")
+                    enabled: !root.controller.busy
+                    onToggled: (checked) => {
+                        return root.controller.setValue("asr.alibaba_audio3.semantic_punctuation_enabled", checked);
                     }
                 }
 

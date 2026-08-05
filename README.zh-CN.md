@@ -27,7 +27,7 @@ flowchart LR
 2. Qwen Realtime 持续把 partial transcript 发送到 HUD，Server VAD 控制波形是否可见。实时音频使用容量受限的非阻塞 queue，并公平处理双向 WebSocket 消息。如果结束录音前发生传输错误、Server VAD 确认语音段处于 active 状态但 transcript 停滞八秒，或者已经出现文本后检测到持续且具有音高相关性的本地语音，但连续八秒没有收到服务器事件，worker 可以重建一次实时会话。重建期间，worker 会从头重放所有已缓冲的原始 PCM packet，同时继续录音。
 3. Toggle off 后，可选择让 Final ASR 对完整录音重新识别一次。如果受控重建失败、唯一一次重试已经用完，或者实时传输落后，程序会拒绝不完整的远程文本，并通过已启用的 final pass 或本地 fallback 对完整音频进行恢复识别。
 4. OpenAI-compatible LLM 对文本做轻量整理。Toggle off 时聚焦的窗口决定 refinement 风格：Pi 和 Codex 使用紧凑的 Markdown，将明确的顺序转换为有序列表，将没有顺序的多项列举转换为无序列表，并将不同部分分成独立段落；系统中已安装的原生即时通讯客户端（WeChat、飞书/Lark、Signal 和 Telegram Desktop）使用自然的聊天标点，保留具有表达作用的口语语气词，并去掉消息末尾的句号，同时保留问号、感叹号和有意使用的省略号；其他窗口继续采用轻度书面化的默认风格。Refinement 使用配置的 timeout（默认 15 秒，最多 30 秒）；预算达到 10 秒时，包含 coding agent 上下文的请求会为纯 transcript 清理重试预留 5 秒，最终失败时使用 Final ASR。
-5. 所有文本都通过剪贴板粘贴，并在结束后自动恢复原剪贴板。Wayland 使用 Hyprland 的 `sendshortcut` dispatcher 发送粘贴快捷键，XWayland 使用 `xdotool`；Voice Input 不再创建 `wtype` 字符 keymap。
+5. 所有文本都通过剪贴板粘贴，并在结束后自动恢复原剪贴板。原生 Wayland 投递会把临时 transcript 和恢复的内容都标记为敏感，使兼容的剪贴板管理器不会保存或重新排序这些内容。Wayland 使用 Hyprland 的 `sendshortcut` dispatcher 发送粘贴快捷键，XWayland 使用 `xdotool`；Voice Input 不再创建 `wtype` 字符 keymap。
 
 Realtime 或 Final ASR 确认没有 transcript 后，无语音 session 会直接回到 idle。音频采集、ASR、HUD、状态持久化和文本输出彼此隔离，缓慢的界面或剪贴板客户端不会阻塞识别。
 
@@ -36,7 +36,7 @@ Realtime 或 Final ASR 确认没有 transcript 后，无语音 session 会直接
 ### 依赖
 
 - 使用 Hyprland 与 Wayland 的 Arch Linux / Omarchy
-- Rust toolchain、PipeWire（`pw-record`）和 `wl-clipboard`
+- Rust toolchain、PipeWire（`pw-record`）和 `wl-clipboard` 2.3 或更高版本（用于敏感剪贴板标记）
 - HUD 和 Settings 使用 [Quickshell](https://quickshell.org/)
 - 安装时使用 Qt Shader Tools 6.7 或更高版本（Arch 软件包为 `qt6-shadertools`）编译 HUD 光晕；非标准 Qt 安装可通过 `QSB=/path/to/qsb` 指定工具
 - 可选：本地 fallback 使用 `/usr/bin/voxtype`；XWayland 使用 `xclip` + `xdotool`
@@ -81,7 +81,7 @@ systemctl --user status voice-input.service voice-input-hud.service
 
 ## 安全的支持诊断信息
 
-提交支持报告时，请使用 `voice-input diagnostics [--format text|json]` 作为标准诊断输出。该命令只提供当前 session 或最近完成的 session，并使用固定字段记录各阶段状态、失败类别、耗时和安全的配置摘要。完成后的摘要会保留到下一次录音开始，并在新录音开始时重置。输出不包含音频、识别或整理后的文本、凭据、tooltip，也不包含 session 历史记录。
+提交支持报告时，请使用 `voice-input diagnostics [--format text|json]` 作为标准诊断输出。Schema 3 只提供当前 session 或最近完成的 session，并使用固定字段记录各阶段状态和失败类别、流式投递与结果的汇总耗时和计数（ready、partial、非空 partial、segment-final、音频包及已发送音频时长、队列延迟、finish、任务完成或失败以及 finalization）、Audio3 原生最终处理的模式/决定/原因，以及安全的配置摘要。安全摘要说明 Audio3 语言提示和 heartbeat 是否启用、配置的最大句末静音时长、语义标点状态和动态词汇表的词条数量；它不会包含词条内容。提供商任务失败时，诊断信息可能包含一个可选且长度和字符范围受到严格限制的提供商错误标识符。完成后的摘要会保留到下一次录音开始，并在新录音开始时重置。输出不包含音频、凭据、端点、模型名称、提供商消息、窗口或应用信息、prompt context、tooltip、session 历史记录，也不包含正常的识别或整理后 transcript 文本。
 
 请勿把 `voice-input status` 的输出粘贴到报告中，无论是否使用 `--extended`。状态输出用于本地 UI 集成，可能包含当前或最近一次 transcript 和 tooltip 文本。
 
@@ -89,7 +89,13 @@ systemctl --user status voice-input.service voice-input-hud.service
 
 Qwen-Audio-3 目前作为需要明确启用的实验性提供商使用。该选项默认关闭，稳定安装向导也不会提供它。在 beta 准备期间，明确的实验功能开关以及安装向导不提供该选项都是有意保留的设计。如需试用，请打开 Settings，选择 **Qwen-Audio-3（实验性）**，确认实验功能警告后保存。该提供商与现有 Alibaba 实时识别共用同一份加密凭据。
 
-流式模型负责提供实时文本。用户还可以启用**原生最终处理**：流式识别结束后，程序会把完整录音发送给 `qwen-audio-3.0-asr-flash`。成功的原生 transcript 优先级最高。如果原生服务返回无词结果，并且没有可用的流式 transcript，该结果具有最终效力；如果已有可用的流式 transcript，程序会保留它。原生请求失败时，程序会保留可用的流式文本；仍无可用文本时，可以使用已配置的本地备用识别。原生请求最多接受 10 MiB 的原始 WAV 音频。
+流式模型负责提供实时文本。**语言提示**和**流式 heartbeat** 是两个相互独立的选用设置，默认均为关闭。启用语言提示后，程序会把现有语言选项发送给 Audio3：英语使用 `en`；简体中文和繁体中文使用 `zh,en`；日语使用 `ja,en`；韩语使用 `ko,en`。中文、日语和韩语的额外英语提示用于保留英语混合识别；关闭该开关会保留服务商的自动检测行为。启用流式 heartbeat 后，只要程序继续发送格式正确的音频帧，它就能使长时间静音的按键说话 session 保持连接。
+
+用户可以配置可选的全局**动态词汇表**。程序只在配置不为空时，才会把词条发送给 Audio3 的流式请求和原生请求。Settings 会用每行一个 JSON 对象的方式显示所有将发送到远程服务的词条，例如 `{"term":"Voice Input","weight":5}`。权重可以是 `1`–`5` 或 `50`；本地验证会检查服务商规定的词条、重复项、数量和权重限制。常规支持诊断信息不会包含动态词条。
+
+**原生最终处理**提供三种模式。默认的**仅流式识别**不会发送完整录音。**自适应**模式会在实时音频传输过载、后端或事件 worker 中断、流式识别为空/失败/降级、服务端未发送明确的 `Finished` 完成事件，或者录音达到 30 秒时运行原生识别。只有可用、未过载、明确完成且短于 30 秒的流式识别才会跳过原生识别。**始终运行**是明确请求最高准确度的选项，会对每段未取消且非空的录音运行原生识别。旧配置中的 boolean 为 `true` 时会迁移到**始终运行**，为 `false` 时会迁移到**仅流式识别**。
+
+运行原生识别时，程序会把完整录音发送给 `qwen-audio-3.0-asr-flash`。成功的原生 transcript 优先级最高。如果原生服务返回无词结果，并且没有可用的流式 transcript，该结果具有最终效力；如果已有可用的流式 transcript，程序会保留它。原生请求失败或超时时，程序会保留可用的流式文本；仍无可用文本时，才会使用已配置的本地备用识别。取消操作不会启动原生识别。原生请求最多接受 10 MiB 的原始 WAV 音频。
 
 开发者可以使用预先录制的 16 kHz、单声道、PCM16 WAV 分别测试两个 API。以下命令不会启动守护进程，也不会把识别文本输入其他应用：
 
@@ -107,7 +113,7 @@ voice-input asr test --file sample.wav         # 原生完整音频识别
 - 一次受控的实时会话重建与完整缓冲音频重放；重建失败后使用完整音频进行最终恢复
 - 根据目标窗口选择风格的 LLM refinement，包括 Pi/Codex 的结构化 Markdown 和所有已安装原生即时通讯客户端共用的口语化整理，并保留延迟限制和纯 transcript fallback
 - Pi/Codex 术语上下文：进程验证、脱敏、截断与 prompt-injection 隔离
-- Wayland/XWayland 统一使用剪贴板输入并自动恢复原内容，不再通过 `wtype` 注入字符
+- Wayland/XWayland 统一使用剪贴板输入并自动恢复原内容；原生 Wayland payload 使用敏感剪贴板标记，避免进入兼容的历史记录管理器；不再通过 `wtype` 注入字符
 - systemd 加密凭据：配置、argv、日志和 UI 中不保存密钥
 - 跟随 Omarchy 主题、焦点显示器且不抢焦点的 Quickshell HUD，并在内部显示阶段和有效录音计时
 - 内置采用 SIL Open Font License 的 Noto Sans SC 可变 UI 字体，同时保留 Qt 的系统字体 fallback

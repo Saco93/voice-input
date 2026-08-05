@@ -545,7 +545,7 @@ struct RetainedAudio {
 impl RetainedAudio {
     fn accept_control(&mut self, control: AsrControl) -> bool {
         match control {
-            AsrControl::AppendPcm16(samples) => {
+            AsrControl::AppendPcm16 { samples, .. } => {
                 self.retain(samples);
                 false
             }
@@ -1083,14 +1083,47 @@ fn push_transcript_piece(target: &mut String, piece: &str) {
 mod tests {
     use std::{sync::mpsc, time::Duration};
 
-    use crate::{backend::AsrEvent, diagnostics::FailureKind};
+    use crate::{
+        backend::{AsrEvent, AudioSpec},
+        config::{AsrProvider, Audio3VocabularyTerm, Config},
+        diagnostics::FailureKind,
+    };
 
     use super::{
         ACTIVE_TRANSCRIPTION_STALL_TIMEOUT, AsrControl, InterruptionReason, Message,
         POST_TRANSCRIPT_SPEECH_STALL_TIMEOUT, PcmNoiseGate, RetainedAudio, RetryBudget,
         TranscriptAssembler, parse_server_event, push_transcript_piece, realtime_stall_reason,
-        report_provider_failure, update_local_voiced_evidence,
+        report_provider_failure, session_update_payload, update_local_voiced_evidence,
     };
+
+    #[test]
+    fn realtime_provider_ignores_audio3_only_request_controls() {
+        let mut config = Config::default();
+        config.asr.provider = AsrProvider::AlibabaQwenRealtime;
+        config.asr.alibaba_audio3.language_hints_enabled = true;
+        config.asr.alibaba_audio3.heartbeat_enabled = true;
+        config.asr.alibaba_audio3.vocabulary = vec![Audio3VocabularyTerm {
+            term: "Audio3-only term".into(),
+            weight: 5,
+        }];
+
+        let payload = session_update_payload(
+            &config,
+            AudioSpec {
+                sample_rate_hz: 16_000,
+            },
+            "event-1",
+        );
+        let encoded = payload.to_string();
+        for audio3_only_value in [
+            "language_hints",
+            "heartbeat",
+            "vocabulary",
+            "Audio3-only term",
+        ] {
+            assert!(!encoded.contains(audio3_only_value));
+        }
+    }
 
     #[test]
     fn noise_gate_zeros_idle_noise_and_preserves_speech_with_hangover() {
@@ -1225,8 +1258,8 @@ mod tests {
     #[test]
     fn retained_audio_replays_in_order_before_later_controls() {
         let mut audio = RetainedAudio::default();
-        assert!(!audio.accept_control(AsrControl::AppendPcm16(vec![1, 2])));
-        assert!(!audio.accept_control(AsrControl::AppendPcm16(vec![3])));
+        assert!(!audio.accept_control(AsrControl::append_pcm16(vec![1, 2])));
+        assert!(!audio.accept_control(AsrControl::append_pcm16(vec![3])));
         assert_eq!(audio.packet_count(), 2);
         assert_eq!(audio.sample_count(), 3);
 

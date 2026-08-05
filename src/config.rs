@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashSet},
     error::Error,
     fmt, fs,
     io::Write,
@@ -97,19 +97,133 @@ pub struct AlibabaRealtimeConfig {
     pub final_pass_enable_itn: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[derive(Debug, Clone, Serialize)]
 pub struct AlibabaAudio3Config {
     pub experimental_enabled: bool,
     pub endpoint: String,
     #[serde(default, skip_serializing)]
     pub api_key: String,
     pub model: String,
+    pub language_hints_enabled: bool,
+    pub heartbeat_enabled: bool,
+    pub max_sentence_silence_ms: u32,
+    pub semantic_punctuation_enabled: bool,
+    pub vocabulary: Vec<Audio3VocabularyTerm>,
     pub native_endpoint: String,
     pub native_model: String,
-    pub native_final_pass_enabled: bool,
+    pub native_final_pass_mode: NativeFinalPassMode,
     pub native_timeout_ms: u64,
 }
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum NativeFinalPassMode {
+    #[default]
+    StreamingOnly,
+    Adaptive,
+    Always,
+}
+
+impl NativeFinalPassMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::StreamingOnly => "streaming-only",
+            Self::Adaptive => "adaptive",
+            Self::Always => "always",
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(default)]
+struct RawAlibabaAudio3Config {
+    experimental_enabled: bool,
+    endpoint: String,
+    api_key: String,
+    model: String,
+    language_hints_enabled: bool,
+    heartbeat_enabled: bool,
+    max_sentence_silence_ms: u32,
+    semantic_punctuation_enabled: bool,
+    vocabulary: Vec<Audio3VocabularyTerm>,
+    native_endpoint: String,
+    native_model: String,
+    native_final_pass_mode: Option<NativeFinalPassMode>,
+    native_final_pass_enabled: Option<bool>,
+    native_timeout_ms: u64,
+}
+
+impl Default for RawAlibabaAudio3Config {
+    fn default() -> Self {
+        let defaults = AlibabaAudio3Config::default();
+        Self {
+            experimental_enabled: defaults.experimental_enabled,
+            endpoint: defaults.endpoint,
+            api_key: defaults.api_key,
+            model: defaults.model,
+            language_hints_enabled: defaults.language_hints_enabled,
+            heartbeat_enabled: defaults.heartbeat_enabled,
+            max_sentence_silence_ms: defaults.max_sentence_silence_ms,
+            semantic_punctuation_enabled: defaults.semantic_punctuation_enabled,
+            vocabulary: defaults.vocabulary,
+            native_endpoint: defaults.native_endpoint,
+            native_model: defaults.native_model,
+            native_final_pass_mode: None,
+            native_final_pass_enabled: None,
+            native_timeout_ms: defaults.native_timeout_ms,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for AlibabaAudio3Config {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = RawAlibabaAudio3Config::deserialize(deserializer)?;
+        let legacy_mode = raw.native_final_pass_enabled.map(|enabled| {
+            if enabled {
+                NativeFinalPassMode::Always
+            } else {
+                NativeFinalPassMode::StreamingOnly
+            }
+        });
+        let native_final_pass_mode = match (raw.native_final_pass_mode, legacy_mode) {
+            (Some(mode), Some(legacy)) if mode != legacy => {
+                return Err(serde::de::Error::custom(
+                    "ambiguous Audio3 native final-pass configuration: mode conflicts with legacy setting",
+                ));
+            }
+            (Some(mode), _) => mode,
+            (None, Some(mode)) => mode,
+            (None, None) => NativeFinalPassMode::StreamingOnly,
+        };
+        Ok(Self {
+            experimental_enabled: raw.experimental_enabled,
+            endpoint: raw.endpoint,
+            api_key: raw.api_key,
+            model: raw.model,
+            language_hints_enabled: raw.language_hints_enabled,
+            heartbeat_enabled: raw.heartbeat_enabled,
+            max_sentence_silence_ms: raw.max_sentence_silence_ms,
+            semantic_punctuation_enabled: raw.semantic_punctuation_enabled,
+            vocabulary: raw.vocabulary,
+            native_endpoint: raw.native_endpoint,
+            native_model: raw.native_model,
+            native_final_pass_mode,
+            native_timeout_ms: raw.native_timeout_ms,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Audio3VocabularyTerm {
+    pub term: String,
+    pub weight: i64,
+}
+
+pub const MAX_AUDIO3_VOCABULARY_TERMS: usize = 2_000;
+pub const MAX_AUDIO3_VOCABULARY_BYTES: usize = 256 * 1024;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
@@ -308,9 +422,14 @@ impl Default for Config {
                     endpoint: "wss://dashscope.aliyuncs.com/api-ws/v1/inference".into(),
                     api_key: String::new(),
                     model: "qwen-audio-3.0-asr-flash-streaming".into(),
+                    language_hints_enabled: false,
+                    heartbeat_enabled: false,
+                    max_sentence_silence_ms: 800,
+                    semantic_punctuation_enabled: false,
+                    vocabulary: Vec::new(),
                     native_endpoint: "https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation".into(),
                     native_model: "qwen-audio-3.0-asr-flash".into(),
-                    native_final_pass_enabled: false,
+                    native_final_pass_mode: NativeFinalPassMode::StreamingOnly,
                     native_timeout_ms: 20_000,
                 },
             },
@@ -550,7 +669,18 @@ impl Config {
                 512,
                 false,
             );
-            if self.asr.alibaba_audio3.native_final_pass_enabled {
+            range(
+                &mut fields,
+                "asr.alibaba_audio3.max_sentence_silence_ms",
+                self.asr.alibaba_audio3.max_sentence_silence_ms,
+                200,
+                6_000,
+            );
+            if let Some(message) = validate_audio3_vocabulary(&self.asr.alibaba_audio3.vocabulary) {
+                fields.insert("asr.alibaba_audio3.vocabulary".into(), message);
+            }
+            if self.asr.alibaba_audio3.native_final_pass_mode != NativeFinalPassMode::StreamingOnly
+            {
                 range(
                     &mut fields,
                     "asr.alibaba_audio3.native_timeout_ms",
@@ -892,6 +1022,65 @@ fn missing_revision() -> String {
     "missing:fnv1a64:cbf29ce484222325".into()
 }
 
+fn validate_audio3_vocabulary(vocabulary: &[Audio3VocabularyTerm]) -> Option<String> {
+    if vocabulary.len() > MAX_AUDIO3_VOCABULARY_TERMS {
+        return Some(format!(
+            "must contain at most {MAX_AUDIO3_VOCABULARY_TERMS} entries"
+        ));
+    }
+    let configured_bytes = vocabulary.iter().fold(0_usize, |total, entry| {
+        total.saturating_add(entry.term.len())
+    });
+    if configured_bytes > MAX_AUDIO3_VOCABULARY_BYTES {
+        return Some(format!(
+            "must contain at most {MAX_AUDIO3_VOCABULARY_BYTES} configured term bytes"
+        ));
+    }
+
+    let mut seen = HashSet::with_capacity(vocabulary.len());
+    let mut weight_50_count = 0_usize;
+    for (index, entry) in vocabulary.iter().enumerate() {
+        let entry_number = index + 1;
+        if entry.term.chars().any(char::is_control) {
+            return Some(format!(
+                "entry {entry_number} must not contain control characters"
+            ));
+        }
+        let term = entry.term.trim();
+        if term.is_empty() {
+            return Some(format!("entry {entry_number} must not be empty"));
+        }
+        if term.is_ascii() {
+            if term.split_whitespace().count() > 7 {
+                return Some(format!(
+                    "entry {entry_number} must contain at most 7 whitespace-separated segments"
+                ));
+            }
+        } else if term.chars().count() > 15 {
+            return Some(format!(
+                "entry {entry_number} must contain at most 15 Unicode characters"
+            ));
+        }
+        if !matches!(entry.weight, 1..=5 | 50) {
+            return Some(format!(
+                "entry {entry_number} weight must be between 1 and 5 or exactly 50"
+            ));
+        }
+        if !seen.insert(term) {
+            return Some(format!(
+                "entry {entry_number} duplicates an earlier entry after trimming"
+            ));
+        }
+        if entry.weight == 50 {
+            weight_50_count += 1;
+        }
+    }
+    if weight_50_count > 50 {
+        return Some("must contain at most 50 entries with weight 50".into());
+    }
+    None
+}
+
 fn validate_text(
     fields: &mut BTreeMap<String, String>,
     field: &str,
@@ -1015,7 +1204,8 @@ impl AsrConfig {
                 }
             }
             AsrProvider::AlibabaQwenAudio3 => {
-                if self.alibaba_audio3.native_final_pass_enabled {
+                if self.alibaba_audio3.native_final_pass_mode != NativeFinalPassMode::StreamingOnly
+                {
                     format!(
                         "{} -> {}",
                         self.alibaba_audio3.model, self.alibaba_audio3.native_model
@@ -1029,6 +1219,15 @@ impl AsrConfig {
 }
 
 impl Language {
+    pub fn audio3_language_hints(self) -> &'static [&'static str] {
+        match self {
+            Language::English => &["en"],
+            Language::SimplifiedChinese | Language::TraditionalChinese => &["zh", "en"],
+            Language::Japanese => &["ja", "en"],
+            Language::Korean => &["ko", "en"],
+        }
+    }
+
     pub fn asr_code(self) -> &'static str {
         match self {
             Language::English => "en",
@@ -1070,7 +1269,10 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
 
-    use super::{AsrProvider, Config, ConfigStore, HudPosition, RevisionConflict};
+    use super::{
+        AsrProvider, Audio3VocabularyTerm, Config, ConfigStore, HudPosition, Language,
+        MAX_AUDIO3_VOCABULARY_BYTES, NativeFinalPassMode, RevisionConflict,
+    };
 
     #[test]
     fn validation_reports_field_map() {
@@ -1205,6 +1407,11 @@ mod tests {
             config.asr.alibaba_audio3.model,
             "qwen-audio-3.0-asr-flash-streaming"
         );
+        assert!(!config.asr.alibaba_audio3.language_hints_enabled);
+        assert!(!config.asr.alibaba_audio3.heartbeat_enabled);
+        assert_eq!(config.asr.alibaba_audio3.max_sentence_silence_ms, 800);
+        assert!(!config.asr.alibaba_audio3.semantic_punctuation_enabled);
+        assert!(config.asr.alibaba_audio3.vocabulary.is_empty());
         assert_eq!(
             config.asr.alibaba_audio3.native_endpoint,
             "https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation"
@@ -1213,7 +1420,10 @@ mod tests {
             config.asr.alibaba_audio3.native_model,
             "qwen-audio-3.0-asr-flash"
         );
-        assert!(!config.asr.alibaba_audio3.native_final_pass_enabled);
+        assert_eq!(
+            config.asr.alibaba_audio3.native_final_pass_mode,
+            NativeFinalPassMode::StreamingOnly
+        );
         assert_eq!(config.asr.alibaba_audio3.native_timeout_ms, 20_000);
     }
 
@@ -1243,6 +1453,22 @@ mod tests {
             "wss://dashscope.aliyuncs.com/api-ws/v1/inference".into();
         config.asr.alibaba_audio3.model = "qwen-audio-3.0-asr-flash-streaming".into();
         config.validate().expect("gated provider configuration");
+
+        for invalid in [199, 6_001] {
+            config.asr.alibaba_audio3.max_sentence_silence_ms = invalid;
+            let error = config
+                .validate()
+                .expect_err("sentence silence must follow the provider range");
+            assert!(
+                error
+                    .fields
+                    .contains_key("asr.alibaba_audio3.max_sentence_silence_ms")
+            );
+        }
+        config.asr.alibaba_audio3.max_sentence_silence_ms = 200;
+        config.validate().expect("minimum sentence silence");
+        config.asr.alibaba_audio3.max_sentence_silence_ms = 6_000;
+        config.validate().expect("maximum sentence silence");
         assert!(
             toml::to_string(&config)
                 .unwrap()
@@ -1259,7 +1485,7 @@ mod tests {
             "qwen-audio-3.0-asr-flash-streaming"
         );
 
-        config.asr.alibaba_audio3.native_final_pass_enabled = true;
+        config.asr.alibaba_audio3.native_final_pass_mode = NativeFinalPassMode::Always;
         assert_eq!(
             config.asr.active_model_label(),
             "qwen-audio-3.0-asr-flash-streaming -> qwen-audio-3.0-asr-flash"
@@ -1280,7 +1506,7 @@ mod tests {
             .validate()
             .expect("disabled Audio3 final pass ignores its timeout");
 
-        config.asr.alibaba_audio3.native_final_pass_enabled = true;
+        config.asr.alibaba_audio3.native_final_pass_mode = NativeFinalPassMode::Adaptive;
         let error = config
             .validate()
             .expect_err("enabled Audio3 final pass validates its timeout");
@@ -1315,7 +1541,13 @@ model = "legacy-model"
             asr.alibaba_audio3.model,
             "qwen-audio-3.0-asr-flash-streaming"
         );
-        assert!(!asr.alibaba_audio3.native_final_pass_enabled);
+        assert!(!asr.alibaba_audio3.language_hints_enabled);
+        assert!(!asr.alibaba_audio3.heartbeat_enabled);
+        assert!(asr.alibaba_audio3.vocabulary.is_empty());
+        assert_eq!(
+            asr.alibaba_audio3.native_final_pass_mode,
+            NativeFinalPassMode::StreamingOnly
+        );
         assert_eq!(asr.alibaba_audio3.native_timeout_ms, 20_000);
     }
 
@@ -1331,8 +1563,308 @@ native_model = "native-model"
 "#,
         )
         .expect("pre-milestone Audio3 config");
-        assert!(!audio3.native_final_pass_enabled);
+        assert!(!audio3.language_hints_enabled);
+        assert!(!audio3.heartbeat_enabled);
+        assert!(audio3.vocabulary.is_empty());
+        assert_eq!(
+            audio3.native_final_pass_mode,
+            NativeFinalPassMode::StreamingOnly
+        );
         assert_eq!(audio3.native_timeout_ms, 20_000);
+    }
+
+    #[test]
+    fn config_store_loads_pre_milestone_audio3_controls_as_disabled_and_empty() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("config.toml");
+        fs::write(
+            &path,
+            r#"
+state_file = "auto"
+
+[asr]
+provider = "alibaba-qwen-audio3"
+backend_command = "/usr/bin/voxtype"
+engine = "sensevoice"
+model = ""
+language = "simplified-chinese"
+connect_timeout_ms = 5000
+finalize_timeout_ms = 8000
+fallback_to_local = true
+
+[asr.alibaba_audio3]
+experimental_enabled = true
+endpoint = "wss://dashscope.aliyuncs.com/api-ws/v1/inference"
+model = "qwen-audio-3.0-asr-flash-streaming"
+native_endpoint = "https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation"
+native_model = "qwen-audio-3.0-asr-flash"
+native_final_pass_enabled = false
+native_timeout_ms = 20000
+"#,
+        )
+        .unwrap();
+
+        let audio3 = ConfigStore::new(path)
+            .load()
+            .expect("representative pre-milestone config")
+            .config
+            .asr
+            .alibaba_audio3;
+        assert!(!audio3.language_hints_enabled);
+        assert!(!audio3.heartbeat_enabled);
+        assert!(audio3.vocabulary.is_empty());
+    }
+
+    #[test]
+    fn audio3_native_final_pass_direct_serde_migrates_and_rejects_ambiguity() {
+        for (value, expected) in [
+            (serde_json::json!({}), NativeFinalPassMode::StreamingOnly),
+            (
+                serde_json::json!({"native_final_pass_enabled": false}),
+                NativeFinalPassMode::StreamingOnly,
+            ),
+            (
+                serde_json::json!({"native_final_pass_enabled": true}),
+                NativeFinalPassMode::Always,
+            ),
+            (
+                serde_json::json!({"native_final_pass_mode": "adaptive"}),
+                NativeFinalPassMode::Adaptive,
+            ),
+            (
+                serde_json::json!({
+                    "native_final_pass_mode": "streaming-only",
+                    "native_final_pass_enabled": false
+                }),
+                NativeFinalPassMode::StreamingOnly,
+            ),
+            (
+                serde_json::json!({
+                    "native_final_pass_mode": "always",
+                    "native_final_pass_enabled": true
+                }),
+                NativeFinalPassMode::Always,
+            ),
+        ] {
+            let config: super::AlibabaAudio3Config = serde_json::from_value(value).unwrap();
+            assert_eq!(config.native_final_pass_mode, expected);
+            let serialized = serde_json::to_value(config).unwrap();
+            assert_eq!(
+                serialized["native_final_pass_mode"],
+                serde_json::to_value(expected).unwrap()
+            );
+            assert!(serialized.get("native_final_pass_enabled").is_none());
+        }
+
+        for value in [
+            serde_json::json!({
+                "native_final_pass_mode": "always",
+                "native_final_pass_enabled": false
+            }),
+            serde_json::json!({
+                "native_final_pass_mode": "adaptive",
+                "native_final_pass_enabled": true
+            }),
+        ] {
+            let error = serde_json::from_value::<super::AlibabaAudio3Config>(value)
+                .expect_err("conflicting settings must fail")
+                .to_string();
+            assert!(error.contains("ambiguous Audio3 native final-pass configuration"));
+            assert!(!error.contains("true"));
+            assert!(!error.contains("false"));
+            assert!(!error.contains("adaptive"));
+            assert!(!error.contains("always"));
+        }
+    }
+
+    #[test]
+    fn config_store_migrates_legacy_audio3_native_final_pass_boolean() {
+        for (legacy, expected) in [
+            (false, NativeFinalPassMode::StreamingOnly),
+            (true, NativeFinalPassMode::Always),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("config.toml");
+            let source = toml::to_string_pretty(&Config::default()).unwrap().replace(
+                "native_final_pass_mode = \"streaming-only\"",
+                &format!("native_final_pass_enabled = {legacy}"),
+            );
+            fs::write(&path, source).unwrap();
+            let loaded = ConfigStore::new(&path).load().unwrap().config;
+            assert_eq!(loaded.asr.alibaba_audio3.native_final_pass_mode, expected);
+
+            ConfigStore::new(&path).save(&loaded, None).unwrap();
+            let saved = fs::read_to_string(path).unwrap();
+            assert!(saved.contains(&format!(
+                "native_final_pass_mode = \"{}\"",
+                match expected {
+                    NativeFinalPassMode::StreamingOnly => "streaming-only",
+                    NativeFinalPassMode::Adaptive => "adaptive",
+                    NativeFinalPassMode::Always => "always",
+                }
+            )));
+            assert!(!saved.contains("native_final_pass_enabled"));
+        }
+    }
+
+    #[test]
+    fn config_store_accepts_consistent_dual_audio3_fields_and_rejects_conflicts() {
+        for (mode, legacy, accepted) in [
+            ("streaming-only", false, true),
+            ("always", true, true),
+            ("adaptive", false, false),
+            ("always", false, false),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("config.toml");
+            let source = toml::to_string_pretty(&Config::default()).unwrap().replace(
+                "native_final_pass_mode = \"streaming-only\"",
+                &format!(
+                    "native_final_pass_mode = \"{mode}\"\nnative_final_pass_enabled = {legacy}"
+                ),
+            );
+            fs::write(&path, source).unwrap();
+            let result = ConfigStore::new(path).load();
+            if accepted {
+                assert!(result.is_ok(), "consistent dual fields must load");
+            } else {
+                let message = format!(
+                    "{:#}",
+                    result.expect_err("conflicting dual fields must fail")
+                );
+                assert!(message.contains("ambiguous Audio3 native final-pass configuration"));
+                assert!(!message.contains(mode));
+                assert!(!message.contains(&legacy.to_string()));
+            }
+        }
+    }
+
+    #[test]
+    fn audio3_language_hints_are_deterministic_and_preserve_english_mixing() {
+        for (language, expected) in [
+            (Language::English, &["en"][..]),
+            (Language::SimplifiedChinese, &["zh", "en"][..]),
+            (Language::TraditionalChinese, &["zh", "en"][..]),
+            (Language::Japanese, &["ja", "en"][..]),
+            (Language::Korean, &["ko", "en"][..]),
+        ] {
+            assert_eq!(language.audio3_language_hints(), expected);
+            assert!(language.audio3_language_hints().len() <= 4);
+        }
+    }
+
+    #[test]
+    fn audio3_vocabulary_serializes_as_typed_entries_and_trims_only_for_identity() {
+        let mut config = Config::default();
+        config.asr.provider = AsrProvider::AlibabaQwenAudio3;
+        config.asr.alibaba_audio3.experimental_enabled = true;
+        config.asr.alibaba_audio3.vocabulary = vec![
+            Audio3VocabularyTerm {
+                term: " Voice Input ".into(),
+                weight: 5,
+            },
+            Audio3VocabularyTerm {
+                term: "语音输入".into(),
+                weight: 50,
+            },
+        ];
+        config.validate().expect("valid dynamic vocabulary");
+
+        let serialized = toml::to_string(&config).unwrap();
+        assert!(serialized.contains("[[asr.alibaba_audio3.vocabulary]]"));
+        let round_trip: Config = toml::from_str(&serialized).unwrap();
+        assert_eq!(
+            round_trip.asr.alibaba_audio3.vocabulary,
+            config.asr.alibaba_audio3.vocabulary
+        );
+    }
+
+    #[test]
+    fn audio3_vocabulary_enforces_term_weight_duplicate_and_super_hotword_limits() {
+        let valid = |term: &str, weight| Audio3VocabularyTerm {
+            term: term.into(),
+            weight,
+        };
+        for (vocabulary, expected) in [
+            (vec![valid("   ", 1)], "entry 1 must not be empty"),
+            (
+                vec![valid("private\tterm", 1)],
+                "entry 1 must not contain control characters",
+            ),
+            (
+                vec![valid("one two three four five six seven eight", 1)],
+                "entry 1 must contain at most 7 whitespace-separated segments",
+            ),
+            (
+                vec![valid("一二三四五六七八九十一二三四五六", 1)],
+                "entry 1 must contain at most 15 Unicode characters",
+            ),
+            (
+                vec![valid("valid", 6)],
+                "entry 1 weight must be between 1 and 5 or exactly 50",
+            ),
+            (
+                vec![valid("same", 1), valid(" same ", 2)],
+                "entry 2 duplicates an earlier entry after trimming",
+            ),
+        ] {
+            let mut config = Config::default();
+            config.asr.provider = AsrProvider::AlibabaQwenAudio3;
+            config.asr.alibaba_audio3.experimental_enabled = true;
+            config.asr.alibaba_audio3.vocabulary = vocabulary;
+            let error = config.validate().expect_err("invalid vocabulary");
+            assert_eq!(error.fields["asr.alibaba_audio3.vocabulary"], expected);
+        }
+
+        let mut config = Config::default();
+        config.asr.provider = AsrProvider::AlibabaQwenAudio3;
+        config.asr.alibaba_audio3.experimental_enabled = true;
+        config.asr.alibaba_audio3.vocabulary = (0..51)
+            .map(|index| valid(&format!("term{index}"), 50))
+            .collect();
+        assert_eq!(
+            config.validate().unwrap_err().fields["asr.alibaba_audio3.vocabulary"],
+            "must contain at most 50 entries with weight 50"
+        );
+
+        config.asr.alibaba_audio3.vocabulary = (0..2_000)
+            .map(|index| valid(&format!("term{index}"), 1))
+            .collect();
+        config.validate().expect("2,000 unique terms are valid");
+        config
+            .asr
+            .alibaba_audio3
+            .vocabulary
+            .push(valid("one-too-many", 1));
+        assert_eq!(
+            config.validate().unwrap_err().fields["asr.alibaba_audio3.vocabulary"],
+            "must contain at most 2000 entries"
+        );
+    }
+
+    #[test]
+    fn audio3_vocabulary_is_bounded_and_validation_errors_do_not_expose_terms() {
+        const SENTINEL: &str = "private-vocabulary-sentinel";
+        let mut config = Config::default();
+        config.asr.provider = AsrProvider::AlibabaQwenAudio3;
+        config.asr.alibaba_audio3.experimental_enabled = true;
+        config.asr.alibaba_audio3.vocabulary = vec![Audio3VocabularyTerm {
+            term: format!("{SENTINEL}{}", "x".repeat(MAX_AUDIO3_VOCABULARY_BYTES)),
+            weight: 1,
+        }];
+        let error = config.validate().expect_err("oversized vocabulary");
+        let formatted = format!("{error}: {:?}", error.fields);
+        assert!(formatted.contains("configured term bytes"));
+        assert!(!formatted.contains(SENTINEL));
+
+        config.asr.provider = AsrProvider::LocalCli;
+        config
+            .validate()
+            .expect("legacy providers ignore Audio3-only vocabulary controls");
+        config.asr.provider = AsrProvider::AlibabaQwenRealtime;
+        config
+            .validate()
+            .expect("Alibaba realtime ignores Audio3-only vocabulary controls");
     }
 
     #[test]

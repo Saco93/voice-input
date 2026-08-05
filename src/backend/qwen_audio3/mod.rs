@@ -4,10 +4,11 @@ mod streaming;
 use std::path::Path;
 
 use anyhow::Result;
+use serde_json::{Map, Value, json};
 
 use crate::{
     backend::{AsrBackend, AsrSessionHandle, AudioSpec},
-    config::Config,
+    config::{Audio3VocabularyTerm, Config, Language},
 };
 
 pub struct QwenAudio3Backend;
@@ -29,3 +30,18 @@ impl AsrBackend for QwenAudio3Backend {
 }
 
 pub(crate) use native::transcribe_full_audio;
+
+fn language_hints(language: Language) -> Value {
+    json!(language.audio3_language_hints())
+}
+
+fn vocabulary_value(vocabulary: &[Audio3VocabularyTerm]) -> Option<Value> {
+    if vocabulary.is_empty() {
+        return None;
+    }
+    let mut values = Map::new();
+    for entry in vocabulary {
+        values.insert(entry.term.trim().to_owned(), json!(entry.weight));
+    }
+    Some(Value::Object(values))
+}

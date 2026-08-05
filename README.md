@@ -27,7 +27,7 @@ flowchart LR
 2. Qwen Realtime streams partial text to the HUD while Server VAD controls waveform visibility. Realtime delivery uses a bounded, nonblocking queue and fair bidirectional WebSocket processing. The worker may reconstruct the realtime session once after a pre-finish transport failure, an eight-second active-speech transcript stall, or sustained pitch-correlated local speech that receives no server event for eight seconds after text has appeared. Reconstruction replays every buffered raw PCM packet from the beginning while recording continues.
 3. On toggle-off, the complete recording is optionally recognized again by the final ASR model. If the controlled reconstruction fails, its single retry is exhausted, or realtime delivery falls behind, incomplete remote text is rejected and the complete audio is recovered through the enabled final pass or local fallback.
 4. The transcript is lightly cleaned by an OpenAI-compatible LLM. The window focused at toggle-off selects the refinement style: Pi and Codex receive compact Markdown that turns explicit sequences into ordered lists, unordered enumerations into bullet lists, and distinct parts into separate paragraphs; installed native messaging clients (WeChat, Feishu/Lark, Signal, and Telegram Desktop) receive conversational punctuation, preserve meaningful spoken particles, and omit a final full stop while retaining question marks, exclamation marks, and intentional ellipses; other destinations retain the lightly formal default. Refinement uses the configured timeout (15 seconds by default, capped at 30 seconds); when the budget is at least 10 seconds, contextual requests reserve five seconds for a transcript-only cleanup retry and ultimately fail open to Final ASR.
-5. All text is delivered through clipboard paste with automatic restoration. Wayland paste shortcuts use Hyprland's `sendshortcut` dispatcher, while XWayland uses `xdotool`; Voice Input never creates a `wtype` character keymap.
+5. All text is delivered through clipboard paste with automatic restoration. Native Wayland delivery marks both the transient transcript and restored content as sensitive so compatible clipboard managers do not retain or reorder them. Wayland paste shortcuts use Hyprland's `sendshortcut` dispatcher, while XWayland uses `xdotool`; Voice Input never creates a `wtype` character keymap.
 
 No-speech sessions return to idle once realtime or final ASR confirms that no transcript exists. Audio capture, ASR, HUD rendering, persistence, and output are isolated so a slow visual or clipboard client cannot block recognition.
 
@@ -36,7 +36,7 @@ No-speech sessions return to idle once realtime or final ASR confirms that no tr
 ### Requirements
 
 - Arch Linux / Omarchy with Hyprland and Wayland
-- Rust toolchain, PipeWire (`pw-record`), and `wl-clipboard`
+- Rust toolchain, PipeWire (`pw-record`), and `wl-clipboard` 2.3 or newer (for sensitive clipboard hints)
 - [Quickshell](https://quickshell.org/) for the HUD and Settings
 - Qt Shader Tools 6.7 or newer (`qt6-shadertools` on Arch) to compile the HUD halo during installation; set `QSB=/path/to/qsb` for a nonstandard Qt installation
 - Optional: `/usr/bin/voxtype` for local fallback; `xclip` + `xdotool` for XWayland
@@ -81,7 +81,7 @@ systemctl --user status voice-input.service voice-input-hud.service
 
 ## Safe support diagnostics
 
-Use `voice-input diagnostics [--format text|json]` as the canonical output for support reports. It contains bounded stage status, failure categories, timings, and a safe configuration summary for one session only: the active or most recently completed session. That session summary remains available after completion and is reset when the next recording starts. It contains no audio, recognized or refined text, credentials, tooltips, or session history.
+Use `voice-input diagnostics [--format text|json]` as the canonical output for support reports. Schema 3 contains bounded stage statuses and failure categories; aggregate streaming delivery/result timings and counts (ready, partial, nonempty partial, segment-final, audio packets and sent duration, queue delays, finish, task completion/failure, and finalization); the Audio3 native-pass mode/decision/reason; and a safe configuration summary for one session only: the active or most recently completed session. The safe summary reports whether Audio3 language hints and heartbeat are enabled, the configured maximum sentence silence, the semantic-punctuation state, and the dynamic-vocabulary entry count; it never includes vocabulary terms. A failed provider task may include an optional strictly bounded provider error identifier. That session summary remains available after completion and is reset when the next recording starts. It contains no audio, credentials, endpoints, model names, provider messages, window/application data, prompt context, tooltips, session history, or normal recognized/refined transcript text.
 
 Do not paste `voice-input status` output into reports, with or without `--extended`. Status output is intended for local UI integration and can include the current or most recent transcript and tooltip text.
 
@@ -89,7 +89,13 @@ Do not paste `voice-input status` output into reports, with or without `--extend
 
 Qwen-Audio-3 is available as an explicit experimental provider. It is disabled by default and is not offered by the stable setup wizard. The explicit experimental gate and setup-wizard omission remain intentional while the beta is prepared. To try it, open Settings, choose **Qwen-Audio-3 (experimental)**, acknowledge the experimental-provider warning, and save. The existing encrypted Alibaba credential is shared with this provider.
 
-The streaming model supplies realtime text. **Native final pass** sends the complete recording to `qwen-audio-3.0-asr-flash` after streaming ends. A successful native transcript takes precedence. A native no-words result is authoritative when no usable streaming transcript exists; otherwise the usable streaming transcript is retained. If the native request fails, usable streaming text remains available, followed by the configured local fallback when needed. Native requests accept at most 10 MiB of raw WAV audio.
+The streaming model supplies realtime text. **Language hints** and **streaming heartbeat** are independent opt-in settings and are disabled by default. Enabling language hints sends the existing language selection to Audio3: English uses `en`; Simplified and Traditional Chinese use `zh,en`; Japanese uses `ja,en`; and Korean uses `ko,en`. The extra English hint retains mixed-English recognition for Chinese, Japanese, and Korean; leaving the switch disabled preserves the provider's automatic detection. Enabling streaming heartbeat keeps long silent push-to-talk sessions alive while correctly formatted audio frames continue.
+
+Optional **Dynamic vocabulary** entries are global to Audio3 and are sent to both streaming and native requests only when configured. Settings displays every remotely sent entry as one JSON object per line, for example `{"term":"Voice Input","weight":5}`. Terms use weights `1`–`5` or `50`; the local validator enforces the provider's term, duplicate, count, and weight limits. Dynamic terms are deliberately absent from routine support diagnostics.
+
+**Native final pass** has three modes. **Streaming only** (the default) never sends the complete recording. **Adaptive** runs native recognition when realtime delivery is overloaded, a backend/event worker is interrupted, streaming is empty/failed/degraded, the server does not send an explicit `Finished` completion, or captured audio lasts at least 30 seconds. It skips only a usable, non-overloaded, explicitly finished stream shorter than 30 seconds. **Always** is the explicit maximum-accuracy choice and runs native recognition for every non-cancelled, nonempty recording. Existing configurations whose legacy boolean was `true` migrate to **Always**; `false` migrates to **Streaming only**.
+
+When native recognition runs, it sends the complete recording to `qwen-audio-3.0-asr-flash`. A successful native transcript takes precedence. A native no-words result is authoritative when no usable streaming transcript exists; otherwise the usable streaming transcript is retained. If the native request fails or times out, usable streaming text remains available, followed by the configured local fallback only when needed. Cancellation never launches native recognition. Native requests accept at most 10 MiB of raw WAV audio.
 
 Developers can test either API against a prerecorded 16 kHz mono PCM16 WAV without starting the daemon or delivering text to another application:
 
@@ -107,7 +113,7 @@ Both commands require Qwen-Audio-3 to be selected and explicitly enabled in the 
 - One controlled realtime reconstruction with complete buffered-audio replay, followed by complete-audio final recovery if needed
 - Destination-aware LLM refinement, including structured Markdown for Pi/Codex and a shared conversational style for installed native messaging clients, with bounded latency and a transcript-only fallback
 - Pi/Codex terminology context with validation, redaction, truncation, and prompt-injection isolation
-- Clipboard-only text delivery with automatic restoration across Wayland/XWayland; no `wtype` character injection
+- Clipboard-only text delivery with automatic restoration across Wayland/XWayland; native Wayland payloads use sensitive clipboard hints to stay out of compatible history managers, with no `wtype` character injection
 - Encrypted systemd credentials; no secrets in config, argv, logs, or UI
 - Theme-aware, monitor-aware, click-through Quickshell HUD with an integrated stage and effective recording timer
 - Bundled Noto Sans SC variable UI font under the SIL Open Font License, with Qt's system-font fallback retained
