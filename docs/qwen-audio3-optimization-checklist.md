@@ -72,17 +72,19 @@ Complete items 1–4, then stop and evaluate their combined effect before starti
 
 ## Milestone 2 — Advanced recognition controls
 
+Provider-facing decisions, confirmed fields, endpoint constants, ambiguities, and stop conditions are recorded in `docs/qwen-audio3-milestone2-api-decisions.md`.
+
 ### 5. VAD and sentence-boundary settings
 
-- [~] Foundations only: validated `max_sentence_silence` and semantic-punctuation fields are included in Milestone 1 closeout at user direction. Multi-threshold mode and speech/noise thresholds remain unimplemented and must be added only where officially supported.
+- [~] API verification complete; runtime implementation not started. Validated `max_sentence_silence` and semantic-punctuation fields were included in Milestone 1 closeout. Milestone 2 will add the documented `multi_threshold_mode_enabled` boolean and optional `speech_noise_threshold` float; separate speech/noise threshold fields do not exist in the Audio3 documentation and are blocked. Presets and controlled evaluation remain incomplete.
 - [ ] Define presets for low-latency dictation and longer-form speech instead of exposing unexplained raw values by default.
 - [ ] Complete pause/noise evaluation across endpoint latency, long pauses, background noise, cancellation, and final transcript assembly.
 
 ### 6. Parse and use timestamps
 
-- [ ] Parse sentence and word/character timestamps without changing transcript output.
-- [ ] Validate monotonicity and bound stored in-memory metadata.
-- [ ] Use timestamps for duplicate suppression, partial/final assembly, and future reconnect recovery.
+- [ ] Parse sentence and timed word/segment ranges without changing transcript output; the provider does not guarantee one timestamp per Unicode character.
+- [ ] Validate event-local range monotonicity and bound stored in-memory metadata without assuming monotonic revisions.
+- [!] Keep transcript assembly unchanged initially. Identity-dependent duplicate suppression and correction replacement require an official stable revision contract or an algorithm proven correct when IDs/ranges are revised; finite live captures cannot establish that guarantee. Reconnect/replay remains Milestone 3.
 - [ ] Keep timestamp diagnostics aggregate-only and transcript-free.
 
 ### 7. Workspace regional endpoints
@@ -120,6 +122,7 @@ Complete items 1–4, then stop and evaluate their combined effect before starti
 | 2026-08-02 | Milestone 1 live evaluation | Completed with documented limits | Real streaming/native APIs accepted the new controls. Seven controlled, transcript-free diagnostic samples covered short Chinese/English/mixed speech, configured technical terms, silence, repeated noise, long speech, and silence beyond 60 seconds. Healthy short streams skipped native; empty and long cases invoked it; no fallback or ASR failure occurred. One of two noise attempts produced a false positive. Aggregate timings, invocation rate, approximate Beijing pricing, decisions, and limitations are in `docs/qwen-audio3-milestone1-evaluation.md`. |
 | 2026-08-05 | Milestone 1 closeout | Completed locally; no new live evaluation | Added deterministic production-used Audio3 lifecycle coverage for 65 simulated heartbeat-enabled seconds and cancellation, corrected terminal/committed-only streaming telemetry, made malformed persisted provider error codes degrade to unavailable, and advanced diagnostics to schema v3. Included validated `max_sentence_silence` and semantic-punctuation configuration foundations at user direction; Milestone 2 item 5 remains in progress because presets, multi-threshold/noise controls, and full pause/noise evaluation are still outstanding. |
 | 2026-08-05 | Fixed-corpus vocabulary A/B | Completed | Retained a private local Git-excluded corpus with 30 clips and replayed identical audio under no vocabulary, weight 5, and weight 50 in Streaming and Native. All 180 requests succeeded. Weight 50 produced 10/10 recall for each tested term in both modes; weight 5 showed no recall uplift. Streaming had no negative-control insertion, while Native weight 50 inserted a configured term for one deliberately sound-alike control. Only aggregate results are committed. |
+| 2026-08-05 | Milestone 2 Phase 0 API verification | Completed; implementation not started | Confirmed the Audio3 VAD field schema, timestamp paths and units, Beijing/Singapore endpoint matrix, hostname-based workspace routing, and region/workspace credential scope from official documentation. Separate speech/noise thresholds and guaranteed character timestamps are unsupported. Identity-dependent timestamp deduplication remains blocked without an official revision contract or a revision-safe algorithm; finite captures are observational only. Workspace ID has no published business grammar, so only hostname transport safety can be validated. Decisions and live-test gates are in `docs/qwen-audio3-milestone2-api-decisions.md`. |
 
 ## Official references
 
