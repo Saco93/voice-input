@@ -40,11 +40,11 @@ Official interaction rules:
 The configuration retains raw custom values and resolves a named preset:
 
 - `standard`: preserve the existing effective request (`800` ms, semantic punctuation disabled, multi-threshold disabled, speech/noise threshold omitted).
-- `low-latency-dictation`: evaluation candidate using `400` ms, semantic punctuation disabled, multi-threshold enabled, and speech/noise threshold omitted.
-- `long-form`: evaluation candidate using `1300` ms, semantic punctuation enabled, multi-threshold disabled, and speech/noise threshold omitted.
+- `low-latency-dictation`: use `400` ms, semantic punctuation disabled, multi-threshold enabled, and speech/noise threshold omitted.
+- `long-form`: use `1300` ms, semantic punctuation enabled, multi-threshold disabled, and speech/noise threshold omitted.
 - `custom`: send the user's validated raw controls. `speech_noise_threshold` remains optional.
 
-`standard` remains the default. The two candidate mappings require authorized pause/noise evaluation and are not yet provider-validated recommendations. A preset will not become the default based only on API documentation.
+`standard` remains the default. Authorized bounded pause/noise evaluation accepted both named mappings and retained all tested pause clauses, so they remain explicit options. The one-speaker sample does not establish a general accuracy or latency recommendation, and neither mapping becomes the default based on API documentation or this bounded evaluation alone.
 
 Any configured raw `speech_noise_threshold` must be finite so it can round-trip through Settings JSON. The provider's `-1.0`–`1.0` range is enforced only when that threshold is effective for the active Audio3 custom preset; finite dormant out-of-range values remain preserved under named presets and inactive providers.
 
@@ -131,7 +131,7 @@ Milestone 2 item 7 is implemented and validated locally without network access:
 - normal Settings displays mode, region, optional Workspace ID, and the credential-scope warning without displaying a derived URL; raw URLs are shown only for Custom routing or a routed validation error;
 - schema 4 diagnostics add only endpoint mode, region, and a Workspace-ID-configured boolean. They never include the Workspace ID, endpoint/host, model, or key, and schema-3/schema-4 compatibility defaults remain readable.
 
-Authorized live validation of the specific Beijing/Singapore regional and workspace routes remains pending. This local implementation does not establish Singapore feature parity or successful live routing.
+Authorized live canaries subsequently succeeded for the Beijing Regional empty-workspace Streaming and Native routes. Singapore and workspace-specific routes remain untested because no matching scoped credential is configured. The implementation and Beijing canaries do not establish Singapore feature parity or workspace-route success.
 
 Official pages do not provide a complete per-region matrix for language hints, heartbeat, vocabulary, sentence controls, thresholds, and timestamp behavior. The shared API reference documents these controls without a regional exclusion. Each model, field combination, and scenario used in Singapore still requires its own authorized live validation; the result will not be presented as complete feature parity.
 
@@ -155,14 +155,19 @@ Official pages do not provide a complete per-region matrix for language hints, h
 - automatic credential-region probing;
 - claims of complete regional feature parity.
 
-### Require authorized live validation
+### Authorized live-validation status
 
-- low-latency and long-form preset values;
-- accepted VAD field combinations and observable segmentation effects;
-- observed partial/final `sentence_id` behavior, for parser validation and counterexample discovery only;
-- the specific Beijing/Singapore models, fields, and scenarios exercised by the evaluation, without claiming complete regional parity;
-- Singapore dynamic vocabulary;
-- workspace-specific Streaming and Native routing with a credential belonging to that region/workspace.
+Completed within the bounded scope documented in [`qwen-audio3-milestone2-evaluation.md`](qwen-audio3-milestone2-evaluation.md):
+
+- Low-latency and Long-form field combinations and observable segmentation effects across a private pause/noise corpus;
+- aggregate-only parser compatibility observation for live partial/final timestamp metadata, without retaining sentence IDs or inferring a revision identity contract;
+- Beijing Regional empty-workspace Streaming and Native canaries.
+
+Still requires a matching scoped credential and separate authorization:
+
+- Singapore model/control scenarios, including dynamic vocabulary;
+- workspace-specific Streaming and Native routing;
+- any broader regional feature-parity claim.
 
 ## Official sources
 
