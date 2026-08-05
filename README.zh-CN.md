@@ -81,7 +81,7 @@ systemctl --user status voice-input.service voice-input-hud.service
 
 ## 安全的支持诊断信息
 
-提交支持报告时，请使用 `voice-input diagnostics [--format text|json]` 作为标准诊断输出。Schema 3 只提供当前 session 或最近完成的 session，并使用固定字段记录各阶段状态和失败类别、流式投递与结果的汇总耗时和计数（ready、partial、非空 partial、segment-final、音频包及已发送音频时长、队列延迟、finish、任务完成或失败以及 finalization）、Audio3 原生最终处理的模式/决定/原因，以及安全的配置摘要。安全摘要说明 Audio3 语言提示和 heartbeat 是否启用、解析预设后生效的最大句末静音时长和语义标点状态，以及动态词汇表的词条数量；它不会包含词条内容。提供商任务失败时，诊断信息可能包含一个可选且长度和字符范围受到严格限制的提供商错误标识符。完成后的摘要会保留到下一次录音开始，并在新录音开始时重置。输出不包含音频、凭据、端点、模型名称、提供商消息、窗口或应用信息、prompt context、tooltip、session 历史记录，也不包含正常的识别或整理后 transcript 文本。
+提交支持报告时，请使用 `voice-input diagnostics [--format text|json]` 作为标准诊断输出。Schema 4 只提供当前 session 或最近完成的 session，并使用固定字段记录各阶段状态和失败类别、流式投递与结果的汇总耗时和计数（ready、partial、非空 partial、segment-final、音频包及已发送音频时长、队列延迟、finish、任务完成或失败以及 finalization）、有明确数量上限的 Audio3 时间戳汇总数据（包含时间戳的结果数、接受的计时单元数、因超过上限而截断的单元数、时间戳元数据被拒绝的结果数，以及最近一个事件报告的有效音频相对结束毫秒数）、Audio3 原生最终处理的模式/决定/原因，以及安全的配置摘要。如果一个普通结果的时间戳块包含任何无效标量、关系、`words` 结构或已处理单元，该结果最多使“时间戳元数据被拒绝的结果数”增加 1；仅发生截断时不会增加该计数。如果后续事件提供有效结束时间，诊断信息会直接覆盖此前的值，不假设不同事件之间单调递增。时间戳诊断信息不会包含句子 ID、计时单元文本或标点、transcript 或提供商消息。安全摘要说明 Audio3 语言提示和 heartbeat 是否启用、解析预设后生效的最大句末静音时长和语义标点状态，以及动态词汇表的词条数量；它不会包含词条内容。提供商任务失败时，诊断信息可能包含一个可选且长度和字符范围受到严格限制的提供商错误标识符。完成后的摘要会保留到下一次录音开始，并在新录音开始时重置。输出不包含音频、凭据、端点、模型名称、提供商消息、窗口或应用信息、prompt context、tooltip、session 历史记录，也不包含正常的识别或整理后 transcript 文本。
 
 请勿把 `voice-input status` 的输出粘贴到报告中，无论是否使用 `--extended`。状态输出用于本地 UI 集成，可能包含当前或最近一次 transcript 和 tooltip 文本。
 

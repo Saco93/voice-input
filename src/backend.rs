@@ -53,6 +53,15 @@ impl AsrControl {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TimestampDiagnosticsDelta {
+    pub timestamp_bearing_result_count: u64,
+    pub accepted_timed_unit_count: u64,
+    pub result_with_rejected_timestamp_metadata_count: u64,
+    pub truncated_timed_unit_count: u64,
+    pub latest_valid_audio_end_ms: Option<u64>,
+}
+
 #[derive(Debug, Clone)]
 pub enum AsrEvent {
     Ready,
@@ -66,6 +75,9 @@ pub enum AsrEvent {
         sample_count: u64,
         max_queue_delay_ms: u64,
         last_queue_delay_ms: u64,
+    },
+    TimestampDiagnostics {
+        delta: TimestampDiagnosticsDelta,
     },
     Partial {
         committed: String,

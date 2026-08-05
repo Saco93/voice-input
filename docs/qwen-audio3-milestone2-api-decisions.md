@@ -73,13 +73,19 @@ Official documentation does not guarantee:
 - that a final event cannot repeat;
 - correction, retraction, reconnect, replay, or idempotency semantics.
 
-Therefore Milestone 2 will initially:
+Milestone 2 item 6 now implements the initial safe subset locally:
 
-- parse optional sentence and timed-unit ranges;
-- validate type, range, event-local timed-unit monotonicity, and bounded counts without dropping valid transcript text when metadata is malformed; no monotonicity assumption will be applied across partial revisions;
-- retain only bounded numeric metadata and counters;
-- keep untimed transcript assembly behavior unchanged;
-- treat `task-finished` as task completion after preceding `result-generated` events.
+- a borrowed typed parser for normal `result-generated` events, with heartbeat filtering before transcript or timestamp event construction;
+- positive-integer `sentence_id`, integer `begin_time`, and explicit integer-or-null partial `end_time` validation; final `end_time` must be an integer, and missing required bounds reject all timed units while preserving text;
+- partial results with explicit null `end_time` accept only nonoverlapping units whose starts are at or after the sentence start, with no upper bound; results with valid integer sentence bounds require every accepted unit to remain inside those bounds;
+- a limit of 512 processed timed units per result, with every excess array entry counted as truncated through saturating counters;
+- a text-free numeric telemetry delta for every normal result and best-effort diagnostics persistence;
+- diagnostics schema 4 counters for timestamp-bearing results, accepted timed units, truncated timed units, and results with rejected timestamp metadata, plus the latest event-reported valid numeric audio-relative end time; schema-3 snapshots remain readable;
+- unchanged transcript event/output assembly for partial, segment-final and authoritative `task-finished` text.
+
+The rejection counter's unit is one normal result whose timestamp block contains any invalid scalar, relationship, `words` shape, or processed unit. A malformed result increments it exactly once regardless of the number of defects; absent metadata, valid metadata, and truncation alone increment it zero times. The latest valid end is overwritten by each later event that supplies one, because partial revisions are not assumed to be monotonic across events.
+
+The parser borrows transcript text only long enough to apply the existing 16 KiB transcript bound and copy it into the unchanged event type. It retains at most 512 begin/end candidates. Unknown timed-unit fields, including text and punctuation, are consumed with Serde's `IgnoredAny` without copying or retaining their values; entries beyond the candidate limit are also ignored after counting. Complete WebSocket messages and frames are capped at 1 MiB. Messages beyond that transport cap remain protocol errors, while timestamp-array overflow within an accepted message is semantically truncated and never drops otherwise valid transcript text. `sentence_id` is validated and then discarded. No provider event-shape live observation was performed as part of this local implementation.
 
 Duplicate-final suppression and correction replacement remain blocked unless Alibaba publishes a stable revision-identity contract or an implementation is proven correct even when IDs and ranges are reused or revised. A finite live capture can validate parser compatibility and reveal counterexamples, but it cannot establish an undocumented identity guarantee. Reconnect and replay remain Milestone 3 and will not be implemented here.
 

@@ -7,7 +7,7 @@ use crate::{
     state::{Phase, Snapshot},
 };
 
-pub const DIAGNOSTICS_SCHEMA_VERSION: u32 = 3;
+pub const DIAGNOSTICS_SCHEMA_VERSION: u32 = 4;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
@@ -252,6 +252,39 @@ impl SessionDiagnostics {
                 self.streaming.segment_final_event_count
             );
         }
+        if self.streaming.timestamp_bearing_result_count > 0 {
+            let _ = write!(
+                output,
+                ", timestamp-bearing-results={}",
+                self.streaming.timestamp_bearing_result_count
+            );
+        }
+        if self.streaming.accepted_timed_unit_count > 0 {
+            let _ = write!(
+                output,
+                ", accepted-timed-units={}",
+                self.streaming.accepted_timed_unit_count
+            );
+        }
+        if self.streaming.result_with_rejected_timestamp_metadata_count > 0 {
+            let _ = write!(
+                output,
+                ", results-with-rejected-timestamp-metadata={}",
+                self.streaming.result_with_rejected_timestamp_metadata_count
+            );
+        }
+        if self.streaming.truncated_timed_unit_count > 0 {
+            let _ = write!(
+                output,
+                ", truncated-timed-units={}",
+                self.streaming.truncated_timed_unit_count
+            );
+        }
+        append_latency(
+            output,
+            "latest-valid-audio-end-ms",
+            self.streaming.latest_valid_audio_end_ms,
+        );
         if self.streaming.audio_packet_count > 0 {
             let _ = write!(
                 output,
@@ -362,6 +395,14 @@ pub struct StreamingStage {
     pub partial_event_count: u64,
     pub nonempty_partial_event_count: u64,
     pub segment_final_event_count: u64,
+    pub timestamp_bearing_result_count: u64,
+    pub accepted_timed_unit_count: u64,
+    /// Number of normal results whose timestamp metadata block contained at
+    /// least one invalid scalar, relationship, words shape, or processed unit.
+    /// Each malformed result contributes exactly one; truncation alone does not.
+    pub result_with_rejected_timestamp_metadata_count: u64,
+    pub truncated_timed_unit_count: u64,
+    pub latest_valid_audio_end_ms: Option<u64>,
     pub audio_packet_count: u64,
     pub audio_sent_duration_ms: Option<u64>,
     pub max_audio_queue_delay_ms: Option<u64>,
@@ -944,6 +985,7 @@ mod tests {
 
     #[test]
     fn streaming_event_diagnostics_are_aggregate_and_safe() {
+        const PRIVATE_TIMED_UNIT_SENTINEL: &str = "private-timed-unit-diagnostics-sentinel";
         let mut session =
             SessionDiagnostics::new(24, Provider::AlibabaQwenAudio3, FinalPassKind::None, false);
         session.streaming.ready_latency_ms = Some(150);
@@ -953,6 +995,13 @@ mod tests {
         session.streaming.partial_event_count = 3;
         session.streaming.nonempty_partial_event_count = 2;
         session.streaming.segment_final_event_count = 1;
+        session.streaming.timestamp_bearing_result_count = 4;
+        session.streaming.accepted_timed_unit_count = 12;
+        session
+            .streaming
+            .result_with_rejected_timestamp_metadata_count = 2;
+        session.streaming.truncated_timed_unit_count = 3;
+        session.streaming.latest_valid_audio_end_ms = Some(2_420);
         session.streaming.audio_packet_count = 20;
         session.streaming.audio_sent_duration_ms = Some(2_560);
         session.streaming.max_audio_queue_delay_ms = Some(151);
@@ -968,17 +1017,32 @@ mod tests {
         let json = serde_json::to_value(&session).unwrap();
         assert!(text.contains("first-partial-latency-ms=900"));
         assert!(text.contains("nonempty-partial-events=2"));
+        assert!(text.contains("timestamp-bearing-results=4"));
+        assert!(text.contains("accepted-timed-units=12"));
+        assert!(text.contains("results-with-rejected-timestamp-metadata=2"));
+        assert!(text.contains("truncated-timed-units=3"));
+        assert!(text.contains("latest-valid-audio-end-ms=2420"));
         assert!(text.contains("provider-error-code=ServiceUnavailable"));
         assert_eq!(
             json["streaming"]["first_nonempty_partial_latency_ms"],
             1_200
         );
+        assert_eq!(json["streaming"]["timestamp_bearing_result_count"], 4);
+        assert_eq!(json["streaming"]["accepted_timed_unit_count"], 12);
+        assert_eq!(
+            json["streaming"]["result_with_rejected_timestamp_metadata_count"],
+            2
+        );
+        assert_eq!(json["streaming"]["truncated_timed_unit_count"], 3);
+        assert_eq!(json["streaming"]["latest_valid_audio_end_ms"], 2_420);
         assert_eq!(
             json["streaming"]["provider_error_code"],
             "ServiceUnavailable"
         );
         assert!(!text.contains("transcript"));
         assert!(!json.to_string().contains("transcript"));
+        assert!(!text.contains(PRIVATE_TIMED_UNIT_SENTINEL));
+        assert!(!json.to_string().contains(PRIVATE_TIMED_UNIT_SENTINEL));
     }
 
     #[test]
@@ -1000,6 +1064,40 @@ mod tests {
         assert_eq!(session.local_primary.status, StageStatus::Pending);
         assert_eq!(session.local_fallback.status, StageStatus::Inactive);
         assert_eq!(session.selected_result, SelectedResult::Pending);
+    }
+
+    #[test]
+    fn schema_three_snapshot_defaults_new_timestamp_aggregates() {
+        let mut diagnostics = Diagnostics::inactive();
+        diagnostics.start_session(31, Provider::AlibabaQwenAudio3, FinalPassKind::None, false);
+        let mut persisted = serde_json::to_value(&diagnostics).unwrap();
+        persisted["schema_version"] = json!(3);
+        let streaming = persisted["session"]["streaming"].as_object_mut().unwrap();
+        for field in [
+            "timestamp_bearing_result_count",
+            "accepted_timed_unit_count",
+            "result_with_rejected_timestamp_metadata_count",
+            "truncated_timed_unit_count",
+            "latest_valid_audio_end_ms",
+        ] {
+            streaming.remove(field);
+        }
+
+        let restored: Diagnostics =
+            serde_json::from_value(persisted).expect("schema 3 diagnostics remain readable");
+        assert_eq!(restored.schema_version, 3);
+        let streaming = &restored.session.as_ref().unwrap().streaming;
+        assert_eq!(streaming.timestamp_bearing_result_count, 0);
+        assert_eq!(streaming.accepted_timed_unit_count, 0);
+        assert_eq!(streaming.result_with_rejected_timestamp_metadata_count, 0);
+        assert_eq!(streaming.truncated_timed_unit_count, 0);
+        assert_eq!(streaming.latest_valid_audio_end_ms, None);
+
+        let config = Config::default();
+        let mut snapshot = crate::state::Snapshot::idle(&config);
+        snapshot.diagnostics = restored;
+        let support = SupportPayload::new(&config, Some(&snapshot));
+        assert_eq!(support.schema_version, 4);
     }
 
     #[test]
@@ -1045,6 +1143,16 @@ mod tests {
         assert_eq!(session.provider, Provider::AlibabaQwenAudio3);
         assert_eq!(session.asr_outcome, OverallOutcome::InProgress);
         assert_eq!(session.selected_result, SelectedResult::Pending);
+        assert_eq!(session.streaming.timestamp_bearing_result_count, 0);
+        assert_eq!(session.streaming.accepted_timed_unit_count, 0);
+        assert_eq!(
+            session
+                .streaming
+                .result_with_rejected_timestamp_metadata_count,
+            0
+        );
+        assert_eq!(session.streaming.truncated_timed_unit_count, 0);
+        assert_eq!(session.streaming.latest_valid_audio_end_ms, None);
     }
 
     #[test]
@@ -1260,7 +1368,7 @@ mod tests {
 
         let payload = SupportPayload::new(&config, None);
         let json = serde_json::to_value(&payload).unwrap();
-        assert_eq!(json["schema_version"], 3);
+        assert_eq!(json["schema_version"], 4);
         assert_eq!(json["config"]["audio3_native_final_pass_mode"], "adaptive");
         assert_eq!(json["config"]["audio3_language_hints_enabled"], true);
         assert_eq!(json["config"]["audio3_heartbeat_enabled"], true);
