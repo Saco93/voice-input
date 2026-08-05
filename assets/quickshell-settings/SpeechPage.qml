@@ -491,6 +491,30 @@ SettingsPage {
                     }
                 }
 
+                SettingTextField {
+                    theme: root.theme
+                    label: "Maximum sentence silence"
+                    value: root.controller.value("asr.alibaba_audio3.max_sentence_silence_ms", 800)
+                    help: "Milliseconds from 200 to 6000. Lower values finalize speech segments sooner."
+                    error: root.controller.errorFor("asr.alibaba_audio3.max_sentence_silence_ms")
+                    enabled: !root.controller.busy
+                    onEdited: (value) => {
+                        return root.controller.setValue("asr.alibaba_audio3.max_sentence_silence_ms", value);
+                    }
+                }
+
+                SettingSwitch {
+                    theme: root.theme
+                    label: "Enable semantic punctuation"
+                    checked: root.controller.value("asr.alibaba_audio3.semantic_punctuation_enabled", false)
+                    help: "Allow the streaming model to use semantic punctuation when finalizing speech segments."
+                    error: root.controller.errorFor("asr.alibaba_audio3.semantic_punctuation_enabled")
+                    enabled: !root.controller.busy
+                    onToggled: (checked) => {
+                        return root.controller.setValue("asr.alibaba_audio3.semantic_punctuation_enabled", checked);
+                    }
+                }
+
             }
 
             SectionCard {

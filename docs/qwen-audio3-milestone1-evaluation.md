@@ -2,7 +2,7 @@
 
 Date: 2026-08-02
 
-This report contains aggregate, transcript-free results. It does not include audio, recognized or refined text, credentials, endpoints, model responses, window/application data, or vocabulary terms.
+This report contains aggregate results. It does not include audio, normal recognized or refined text, credentials, endpoints, window/application data, prompt context, or vocabulary terms. Diagnostics may retain a bounded upstream error identifier verbatim for operational accuracy; none of the measured sessions had an ASR failure.
 
 ## Candidate
 
@@ -14,8 +14,8 @@ This report contains aggregate, transcript-free results. It does not include aud
 - Streaming heartbeat: enabled
 - Dynamic vocabulary: 2 explicitly configured global entries
 - Local fallback: enabled
-- Diagnostics schema: 2
-- Local validation: 182 Rust tests, Clippy with warnings denied, and QML validation
+- Diagnostics schema: 3
+- Local validation: 199 Rust tests, Clippy with warnings denied, and QML validation
 
 ## Live test coverage
 
@@ -79,10 +79,15 @@ The estimate excludes free quota and is not billing evidence. This test set is d
 3. **Dynamic vocabulary — retain with limited claims.** The real APIs accepted the configured entries and the UI exposes every transmitted term. Accuracy benefit was not isolated with an A/B corpus; per-application profiles remain deferred.
 4. **Adaptive native final pass — retain.** Healthy short streams avoided native latency and requests; empty and long-duration cases invoked native correctly. Record the non-speech false positive as input for Milestone 2 VAD/timestamp work rather than adding transcript-dependent heuristics now.
 
+## Closeout additions
+
+No new live evaluation was run, and the previously measured timing values above are unchanged. Local closeout added deterministic tests through the production-used Audio3 client state machine for startup and finalization deadline expiration, 65 simulated heartbeat-enabled seconds, finish completion, and cancellation. Scripted provider events validate client behavior without wall-clock sleeps or a network; the earlier real 65-second session remains the evidence for remote-provider behavior. Closeout also corrected committed-only and terminal-only streaming telemetry, advanced diagnostics to schema 3, and included validated `max_sentence_silence` and semantic-punctuation configuration foundations at user direction.
+
+Milestone 2 item 5 remains in progress: presets, multi-threshold/noise controls, and full pause/noise evaluation are not complete.
+
 ## Remaining limitations
 
-- No fixed opt-in transcript/reference corpus was committed or retained, so CER/WER and vocabulary uplift are not measured.
+- No fixed opt-in transcript/reference corpus was committed or retained, so CER/WER and vocabulary uplift are not measured; a fixed-corpus A/B remains under discussion.
 - The pre-milestone baseline has only one diagnostic sample.
-- A deterministic no-wall-clock WebSocket long-idle test seam remains deferred; the real 65-second test passed.
 - Per-application vocabulary profiles remain deferred.
 - Noise behavior requires a larger repeatable corpus before changing defaults or policy.

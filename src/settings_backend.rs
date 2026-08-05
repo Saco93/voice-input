@@ -819,6 +819,8 @@ mod tests {
                 "model": "qwen-audio-3.0-asr-flash-streaming",
                 "language_hints_enabled": false,
                 "heartbeat_enabled": false,
+                "max_sentence_silence_ms": 800,
+                "semantic_punctuation_enabled": false,
                 "vocabulary": [],
                 "native_endpoint": "https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation",
                 "native_model": "qwen-audio-3.0-asr-flash",
@@ -842,6 +844,8 @@ mod tests {
             "model": "audio3-stream-test",
             "language_hints_enabled": true,
             "heartbeat_enabled": true,
+            "max_sentence_silence_ms": 200,
+            "semantic_punctuation_enabled": true,
             "vocabulary": [
                 {"term": "Voice Input", "weight": 5},
                 {"term": "语音输入", "weight": 50}
@@ -882,6 +886,8 @@ mod tests {
         assert!(saved.asr.alibaba_audio3.experimental_enabled);
         assert!(saved.asr.alibaba_audio3.language_hints_enabled);
         assert!(saved.asr.alibaba_audio3.heartbeat_enabled);
+        assert_eq!(saved.asr.alibaba_audio3.max_sentence_silence_ms, 200);
+        assert!(saved.asr.alibaba_audio3.semantic_punctuation_enabled);
         assert_eq!(saved.asr.alibaba_audio3.vocabulary.len(), 2);
         assert_eq!(
             saved.asr.alibaba_audio3.native_final_pass_mode,

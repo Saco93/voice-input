@@ -296,7 +296,7 @@ fn stream_pcm_with_backend(
     // prerecorded input can be submitted without sleeping for its duration.
     let send_result = samples
         .chunks(chunk_samples)
-        .try_for_each(|chunk| control_tx.send(AsrControl::AppendPcm16(chunk.to_vec())))
+        .try_for_each(|chunk| control_tx.send(AsrControl::append_pcm16(chunk.to_vec())))
         .and_then(|()| control_tx.send(AsrControl::Finish));
     drop(control_tx);
     if send_result.is_err() {
@@ -347,7 +347,9 @@ fn collect_stream_events(event_rx: &Receiver<AsrEvent>, timeout: Duration) -> St
         match event_rx.recv_timeout(remaining) {
             Ok(AsrEvent::Final { text }) if !text.trim().is_empty() => transcript = Some(text),
             Ok(AsrEvent::Finished) => return StreamOutcome::Finished(transcript),
-            Ok(AsrEvent::Error { .. }) => return StreamOutcome::Error,
+            Ok(AsrEvent::Error { .. } | AsrEvent::TaskFailed { .. }) => {
+                return StreamOutcome::Error;
+            }
             Ok(_) => {}
             Err(mpsc::RecvTimeoutError::Timeout) => return StreamOutcome::TimedOut,
             Err(mpsc::RecvTimeoutError::Disconnected) => return StreamOutcome::Disconnected,
@@ -462,7 +464,7 @@ mod tests {
                 event_tx.send(AsrEvent::Ready).unwrap();
                 while let Ok(control) = control_rx.recv() {
                     match control {
-                        AsrControl::AppendPcm16(samples) => {
+                        AsrControl::AppendPcm16 { samples, .. } => {
                             controls.lock().unwrap().push(samples.len());
                         }
                         AsrControl::Finish => {
@@ -545,7 +547,7 @@ mod tests {
         let config = Config::default();
         let unavailable = SupportPayload::new(&config, None);
         let text = format_diagnostics(&unavailable, OutputFormat::Text).unwrap();
-        assert!(text.starts_with("Voice Input diagnostics (schema 2)\n"));
+        assert!(text.starts_with("Voice Input diagnostics (schema 3)\n"));
         assert!(text.contains("Runtime: unavailable\n"));
         assert!(text.contains("Session: none\n"));
 
@@ -578,7 +580,7 @@ mod tests {
 
         let json = format_diagnostics(&payload, OutputFormat::Json).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed["schema_version"], 2);
+        assert_eq!(parsed["schema_version"], 3);
         assert_eq!(parsed["session"]["session_id"], 7);
         assert_eq!(parsed["session"]["asr_outcome"], "completed");
         assert!(parsed["session"].get("outcome").is_none());

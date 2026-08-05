@@ -27,7 +27,7 @@ flowchart LR
 2. Qwen Realtime streams partial text to the HUD while Server VAD controls waveform visibility. Realtime delivery uses a bounded, nonblocking queue and fair bidirectional WebSocket processing. The worker may reconstruct the realtime session once after a pre-finish transport failure, an eight-second active-speech transcript stall, or sustained pitch-correlated local speech that receives no server event for eight seconds after text has appeared. Reconstruction replays every buffered raw PCM packet from the beginning while recording continues.
 3. On toggle-off, the complete recording is optionally recognized again by the final ASR model. If the controlled reconstruction fails, its single retry is exhausted, or realtime delivery falls behind, incomplete remote text is rejected and the complete audio is recovered through the enabled final pass or local fallback.
 4. The transcript is lightly cleaned by an OpenAI-compatible LLM. The window focused at toggle-off selects the refinement style: Pi and Codex receive compact Markdown that turns explicit sequences into ordered lists, unordered enumerations into bullet lists, and distinct parts into separate paragraphs; installed native messaging clients (WeChat, Feishu/Lark, Signal, and Telegram Desktop) receive conversational punctuation, preserve meaningful spoken particles, and omit a final full stop while retaining question marks, exclamation marks, and intentional ellipses; other destinations retain the lightly formal default. Refinement uses the configured timeout (15 seconds by default, capped at 30 seconds); when the budget is at least 10 seconds, contextual requests reserve five seconds for a transcript-only cleanup retry and ultimately fail open to Final ASR.
-5. All text is delivered through clipboard paste with automatic restoration. Wayland paste shortcuts use Hyprland's `sendshortcut` dispatcher, while XWayland uses `xdotool`; Voice Input never creates a `wtype` character keymap.
+5. All text is delivered through clipboard paste with automatic restoration. Native Wayland delivery marks both the transient transcript and restored content as sensitive so compatible clipboard managers do not retain or reorder them. Wayland paste shortcuts use Hyprland's `sendshortcut` dispatcher, while XWayland uses `xdotool`; Voice Input never creates a `wtype` character keymap.
 
 No-speech sessions return to idle once realtime or final ASR confirms that no transcript exists. Audio capture, ASR, HUD rendering, persistence, and output are isolated so a slow visual or clipboard client cannot block recognition.
 
@@ -36,7 +36,7 @@ No-speech sessions return to idle once realtime or final ASR confirms that no tr
 ### Requirements
 
 - Arch Linux / Omarchy with Hyprland and Wayland
-- Rust toolchain, PipeWire (`pw-record`), and `wl-clipboard`
+- Rust toolchain, PipeWire (`pw-record`), and `wl-clipboard` 2.3 or newer (for sensitive clipboard hints)
 - [Quickshell](https://quickshell.org/) for the HUD and Settings
 - Qt Shader Tools 6.7 or newer (`qt6-shadertools` on Arch) to compile the HUD halo during installation; set `QSB=/path/to/qsb` for a nonstandard Qt installation
 - Optional: `/usr/bin/voxtype` for local fallback; `xclip` + `xdotool` for XWayland
@@ -81,7 +81,7 @@ systemctl --user status voice-input.service voice-input-hud.service
 
 ## Safe support diagnostics
 
-Use `voice-input diagnostics [--format text|json]` as the canonical output for support reports. It contains bounded stage status, failure categories, timings, the Audio3 native-pass mode/decision/reason, and a safe configuration summary for one session only: the active or most recently completed session. The safe summary reports only whether Audio3 language hints and heartbeat are enabled and the dynamic-vocabulary entry count; it never includes vocabulary terms. That session summary remains available after completion and is reset when the next recording starts. It contains no audio, recognized or refined text, credentials, endpoints, model names, provider messages, window/application data, tooltips, or session history.
+Use `voice-input diagnostics [--format text|json]` as the canonical output for support reports. Schema 3 contains bounded stage statuses and failure categories; aggregate streaming delivery/result timings and counts (ready, partial, nonempty partial, segment-final, audio packets and sent duration, queue delays, finish, task completion/failure, and finalization); the Audio3 native-pass mode/decision/reason; and a safe configuration summary for one session only: the active or most recently completed session. The safe summary reports whether Audio3 language hints and heartbeat are enabled, the configured maximum sentence silence, the semantic-punctuation state, and the dynamic-vocabulary entry count; it never includes vocabulary terms. A failed provider task may include an optional strictly bounded provider error identifier. That session summary remains available after completion and is reset when the next recording starts. It contains no audio, credentials, endpoints, model names, provider messages, window/application data, prompt context, tooltips, session history, or normal recognized/refined transcript text.
 
 Do not paste `voice-input status` output into reports, with or without `--extended`. Status output is intended for local UI integration and can include the current or most recent transcript and tooltip text.
 
@@ -113,7 +113,7 @@ Both commands require Qwen-Audio-3 to be selected and explicitly enabled in the 
 - One controlled realtime reconstruction with complete buffered-audio replay, followed by complete-audio final recovery if needed
 - Destination-aware LLM refinement, including structured Markdown for Pi/Codex and a shared conversational style for installed native messaging clients, with bounded latency and a transcript-only fallback
 - Pi/Codex terminology context with validation, redaction, truncation, and prompt-injection isolation
-- Clipboard-only text delivery with automatic restoration across Wayland/XWayland; no `wtype` character injection
+- Clipboard-only text delivery with automatic restoration across Wayland/XWayland; native Wayland payloads use sensitive clipboard hints to stay out of compatible history managers, with no `wtype` character injection
 - Encrypted systemd credentials; no secrets in config, argv, logs, or UI
 - Theme-aware, monitor-aware, click-through Quickshell HUD with an integrated stage and effective recording timer
 - Bundled Noto Sans SC variable UI font under the SIL Open Font License, with Qt's system-font fallback retained

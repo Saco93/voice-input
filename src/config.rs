@@ -106,6 +106,8 @@ pub struct AlibabaAudio3Config {
     pub model: String,
     pub language_hints_enabled: bool,
     pub heartbeat_enabled: bool,
+    pub max_sentence_silence_ms: u32,
+    pub semantic_punctuation_enabled: bool,
     pub vocabulary: Vec<Audio3VocabularyTerm>,
     pub native_endpoint: String,
     pub native_model: String,
@@ -141,6 +143,8 @@ struct RawAlibabaAudio3Config {
     model: String,
     language_hints_enabled: bool,
     heartbeat_enabled: bool,
+    max_sentence_silence_ms: u32,
+    semantic_punctuation_enabled: bool,
     vocabulary: Vec<Audio3VocabularyTerm>,
     native_endpoint: String,
     native_model: String,
@@ -159,6 +163,8 @@ impl Default for RawAlibabaAudio3Config {
             model: defaults.model,
             language_hints_enabled: defaults.language_hints_enabled,
             heartbeat_enabled: defaults.heartbeat_enabled,
+            max_sentence_silence_ms: defaults.max_sentence_silence_ms,
+            semantic_punctuation_enabled: defaults.semantic_punctuation_enabled,
             vocabulary: defaults.vocabulary,
             native_endpoint: defaults.native_endpoint,
             native_model: defaults.native_model,
@@ -199,6 +205,8 @@ impl<'de> Deserialize<'de> for AlibabaAudio3Config {
             model: raw.model,
             language_hints_enabled: raw.language_hints_enabled,
             heartbeat_enabled: raw.heartbeat_enabled,
+            max_sentence_silence_ms: raw.max_sentence_silence_ms,
+            semantic_punctuation_enabled: raw.semantic_punctuation_enabled,
             vocabulary: raw.vocabulary,
             native_endpoint: raw.native_endpoint,
             native_model: raw.native_model,
@@ -416,6 +424,8 @@ impl Default for Config {
                     model: "qwen-audio-3.0-asr-flash-streaming".into(),
                     language_hints_enabled: false,
                     heartbeat_enabled: false,
+                    max_sentence_silence_ms: 800,
+                    semantic_punctuation_enabled: false,
                     vocabulary: Vec::new(),
                     native_endpoint: "https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation".into(),
                     native_model: "qwen-audio-3.0-asr-flash".into(),
@@ -658,6 +668,13 @@ impl Config {
                 &self.asr.alibaba_audio3.native_model,
                 512,
                 false,
+            );
+            range(
+                &mut fields,
+                "asr.alibaba_audio3.max_sentence_silence_ms",
+                self.asr.alibaba_audio3.max_sentence_silence_ms,
+                200,
+                6_000,
             );
             if let Some(message) = validate_audio3_vocabulary(&self.asr.alibaba_audio3.vocabulary) {
                 fields.insert("asr.alibaba_audio3.vocabulary".into(), message);
@@ -1392,6 +1409,8 @@ mod tests {
         );
         assert!(!config.asr.alibaba_audio3.language_hints_enabled);
         assert!(!config.asr.alibaba_audio3.heartbeat_enabled);
+        assert_eq!(config.asr.alibaba_audio3.max_sentence_silence_ms, 800);
+        assert!(!config.asr.alibaba_audio3.semantic_punctuation_enabled);
         assert!(config.asr.alibaba_audio3.vocabulary.is_empty());
         assert_eq!(
             config.asr.alibaba_audio3.native_endpoint,
@@ -1434,6 +1453,22 @@ mod tests {
             "wss://dashscope.aliyuncs.com/api-ws/v1/inference".into();
         config.asr.alibaba_audio3.model = "qwen-audio-3.0-asr-flash-streaming".into();
         config.validate().expect("gated provider configuration");
+
+        for invalid in [199, 6_001] {
+            config.asr.alibaba_audio3.max_sentence_silence_ms = invalid;
+            let error = config
+                .validate()
+                .expect_err("sentence silence must follow the provider range");
+            assert!(
+                error
+                    .fields
+                    .contains_key("asr.alibaba_audio3.max_sentence_silence_ms")
+            );
+        }
+        config.asr.alibaba_audio3.max_sentence_silence_ms = 200;
+        config.validate().expect("minimum sentence silence");
+        config.asr.alibaba_audio3.max_sentence_silence_ms = 6_000;
+        config.validate().expect("maximum sentence silence");
         assert!(
             toml::to_string(&config)
                 .unwrap()

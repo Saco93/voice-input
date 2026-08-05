@@ -1473,7 +1473,7 @@ impl Daemon {
                     abort_flag.store(true, Ordering::SeqCst);
                 } else {
                     if let Some(packet) = final_asr_packet {
-                        let _ = control_tx.send(backend::AsrControl::AppendPcm16(packet));
+                        let _ = control_tx.send(backend::AsrControl::append_pcm16(packet));
                     }
                     let _ = control_tx.send(backend::AsrControl::Finish);
                 }
@@ -2208,7 +2208,7 @@ fn try_enqueue_realtime_audio(
     sender: &mpsc::SyncSender<backend::AsrControl>,
     packet: Vec<i16>,
 ) -> RealtimeAudioEnqueue {
-    match sender.try_send(backend::AsrControl::AppendPcm16(packet)) {
+    match sender.try_send(backend::AsrControl::append_pcm16(packet)) {
         Ok(()) => RealtimeAudioEnqueue::Sent,
         Err(mpsc::TrySendError::Full(_)) => RealtimeAudioEnqueue::Full,
         Err(mpsc::TrySendError::Disconnected(_)) => RealtimeAudioEnqueue::Disconnected,
@@ -2417,6 +2417,58 @@ struct RealtimeEventOutcome {
     saw_finished: bool,
 }
 
+#[derive(Clone, Copy)]
+enum StreamingResultKind {
+    Partial,
+    SegmentFinal,
+    Final,
+}
+
+#[derive(Clone, Copy)]
+struct StreamingTelemetryUpdate {
+    kind: StreamingResultKind,
+    latency_ms: u64,
+    nonempty: bool,
+}
+
+impl StreamingTelemetryUpdate {
+    fn new(kind: StreamingResultKind, displayed_text: &str, latency_ms: u64) -> Self {
+        Self {
+            kind,
+            latency_ms,
+            nonempty: !displayed_text.trim().is_empty(),
+        }
+    }
+
+    fn apply(self, stage: &mut crate::diagnostics::StreamingStage) {
+        stage.last_result_latency_ms = Some(self.latency_ms);
+        match self.kind {
+            StreamingResultKind::Partial => {
+                stage
+                    .first_partial_latency_ms
+                    .get_or_insert(self.latency_ms);
+                stage.partial_event_count = stage.partial_event_count.saturating_add(1);
+                if self.nonempty {
+                    stage
+                        .first_nonempty_partial_latency_ms
+                        .get_or_insert(self.latency_ms);
+                    stage.nonempty_partial_event_count =
+                        stage.nonempty_partial_event_count.saturating_add(1);
+                }
+            }
+            StreamingResultKind::SegmentFinal => {
+                stage.segment_final_event_count = stage.segment_final_event_count.saturating_add(1);
+            }
+            StreamingResultKind::Final => {}
+        }
+    }
+}
+
+fn record_finished_telemetry(update_diagnostics: impl FnOnce() -> Result<()>) -> bool {
+    let _ = update_diagnostics();
+    true
+}
+
 fn finalize_realtime_events(
     saw_finished: bool,
     final_transcript: Option<String>,
@@ -2474,11 +2526,17 @@ fn spawn_realtime_event_thread(
         let mut final_transcript = None;
         let mut realtime_reconstructing = false;
         let mut saw_finished = false;
+        let mut logged_first_partial = false;
+        let mut logged_first_nonempty_partial = false;
 
         while let Ok(event) = event_rx.recv() {
             match event {
                 backend::AsrEvent::Ready => {
                     asr_ready.store(true, Ordering::SeqCst);
+                    let latency_ms = elapsed_ms(asr_started_at);
+                    eprintln!(
+                        "voice-input realtime ASR timing: session {session_id} event=ready elapsed_ms={latency_ms}"
+                    );
                     let _ = state.update(|snapshot| {
                         if snapshot_matches_session(snapshot, session_id) {
                             snapshot.diagnostics.update_session(session_id, |session| {
@@ -2486,8 +2544,7 @@ fn spawn_realtime_event_thread(
                                     session.streaming.status = StageStatus::InProgress;
                                     session.streaming.failure_kind = None;
                                 }
-                                session.streaming.ready_latency_ms =
-                                    Some(elapsed_ms(asr_started_at));
+                                session.streaming.ready_latency_ms = Some(latency_ms);
                             });
                         }
                     });
@@ -2554,25 +2611,76 @@ fn spawn_realtime_event_thread(
                         }
                     })?;
                 }
+                backend::AsrEvent::AudioDeliveryCompleted {
+                    packet_count,
+                    sample_count,
+                    max_queue_delay_ms,
+                    last_queue_delay_ms,
+                } => {
+                    let latency_ms = elapsed_ms(asr_started_at);
+                    let audio_duration_ms = sample_count
+                        .saturating_mul(1_000)
+                        .checked_div(u64::from(config.audio.sample_rate))
+                        .unwrap_or(0);
+                    eprintln!(
+                        "voice-input realtime ASR timing: session {session_id} event=finish-sent elapsed_ms={latency_ms} audio_duration_ms={audio_duration_ms} packets={packet_count} max_queue_delay_ms={max_queue_delay_ms} last_queue_delay_ms={last_queue_delay_ms}"
+                    );
+                    let _ = state.update(|snapshot| {
+                        if snapshot_matches_session(snapshot, session_id) {
+                            snapshot.diagnostics.update_session(session_id, |session| {
+                                session.streaming.audio_packet_count = packet_count;
+                                session.streaming.audio_sent_duration_ms = Some(audio_duration_ms);
+                                session.streaming.max_audio_queue_delay_ms =
+                                    Some(max_queue_delay_ms);
+                                session.streaming.last_audio_queue_delay_ms =
+                                    Some(last_queue_delay_ms);
+                                session.streaming.finish_sent_latency_ms = Some(latency_ms);
+                            });
+                        }
+                    });
+                }
                 backend::AsrEvent::Partial {
                     committed,
                     unstable,
                 } => {
                     realtime_reconstructing = false;
+                    let latency_ms = elapsed_ms(asr_started_at);
                     let transcript = format!("{committed}{unstable}");
-                    if !transcript.trim().is_empty() {
+                    let telemetry = StreamingTelemetryUpdate::new(
+                        StreamingResultKind::Partial,
+                        &transcript,
+                        latency_ms,
+                    );
+                    let nonempty = telemetry.nonempty;
+                    if !logged_first_partial {
+                        logged_first_partial = true;
+                        eprintln!(
+                            "voice-input realtime ASR timing: session {session_id} event=first-partial elapsed_ms={latency_ms} nonempty={nonempty}"
+                        );
+                    }
+                    if nonempty && !logged_first_nonempty_partial {
+                        logged_first_nonempty_partial = true;
+                        eprintln!(
+                            "voice-input realtime ASR timing: session {session_id} event=first-nonempty-partial elapsed_ms={latency_ms}"
+                        );
+                    }
+                    if nonempty {
                         speech_detected.store(true, Ordering::SeqCst);
                     }
                     *partial_transcript
                         .lock()
                         .expect("partial transcript mutex poisoned") = transcript.clone();
                     state.update(|snapshot| {
-                        if snapshot_matches_session(snapshot, session_id)
-                            && matches!(
-                                snapshot.phase,
-                                Phase::Arming | Phase::Recording | Phase::Transcribing
-                            )
-                        {
+                        if !snapshot_matches_session(snapshot, session_id) {
+                            return;
+                        }
+                        snapshot.diagnostics.update_session(session_id, |session| {
+                            telemetry.apply(&mut session.streaming);
+                        });
+                        if matches!(
+                            snapshot.phase,
+                            Phase::Arming | Phase::Recording | Phase::Transcribing
+                        ) {
                             snapshot.transcript = transcript.clone();
                             snapshot.tooltip = if realtime_overloaded.load(Ordering::SeqCst) {
                                 "Realtime transcript delayed — recording continues".into()
@@ -2593,19 +2701,29 @@ fn spawn_realtime_event_thread(
                 }
                 backend::AsrEvent::SegmentFinal { text } => {
                     realtime_reconstructing = false;
-                    if !text.trim().is_empty() {
+                    let latency_ms = elapsed_ms(asr_started_at);
+                    let telemetry = StreamingTelemetryUpdate::new(
+                        StreamingResultKind::SegmentFinal,
+                        &text,
+                        latency_ms,
+                    );
+                    if telemetry.nonempty {
                         speech_detected.store(true, Ordering::SeqCst);
                     }
                     *partial_transcript
                         .lock()
                         .expect("partial transcript mutex poisoned") = text.clone();
                     state.update(|snapshot| {
-                        if snapshot_matches_session(snapshot, session_id)
-                            && matches!(
-                                snapshot.phase,
-                                Phase::Arming | Phase::Recording | Phase::Transcribing
-                            )
-                        {
+                        if !snapshot_matches_session(snapshot, session_id) {
+                            return;
+                        }
+                        snapshot.diagnostics.update_session(session_id, |session| {
+                            telemetry.apply(&mut session.streaming);
+                        });
+                        if matches!(
+                            snapshot.phase,
+                            Phase::Arming | Phase::Recording | Phase::Transcribing
+                        ) {
                             snapshot.transcript = text.clone();
                             snapshot.tooltip = if realtime_overloaded.load(Ordering::SeqCst) {
                                 "Realtime transcript delayed — recording continues".into()
@@ -2617,7 +2735,13 @@ fn spawn_realtime_event_thread(
                     })?;
                 }
                 backend::AsrEvent::Final { text } => {
-                    if !text.trim().is_empty() {
+                    let latency_ms = elapsed_ms(asr_started_at);
+                    let telemetry = StreamingTelemetryUpdate::new(
+                        StreamingResultKind::Final,
+                        &text,
+                        latency_ms,
+                    );
+                    if telemetry.nonempty {
                         speech_detected.store(true, Ordering::SeqCst);
                     }
                     *partial_transcript
@@ -2625,20 +2749,69 @@ fn spawn_realtime_event_thread(
                         .expect("partial transcript mutex poisoned") = text.clone();
                     final_transcript = Some(text.clone());
                     state.update(|snapshot| {
-                        if snapshot_matches_session(snapshot, session_id)
-                            && matches!(
-                                snapshot.phase,
-                                Phase::Arming | Phase::Recording | Phase::Transcribing
-                            )
-                        {
+                        if !snapshot_matches_session(snapshot, session_id) {
+                            return;
+                        }
+                        snapshot.diagnostics.update_session(session_id, |session| {
+                            telemetry.apply(&mut session.streaming);
+                        });
+                        if matches!(
+                            snapshot.phase,
+                            Phase::Arming | Phase::Recording | Phase::Transcribing
+                        ) {
                             snapshot.transcript = text.clone();
                             snapshot.tooltip = text.clone();
                         }
                     })?;
                 }
                 backend::AsrEvent::Finished => {
-                    saw_finished = true;
+                    let latency_ms = elapsed_ms(asr_started_at);
+                    eprintln!(
+                        "voice-input realtime ASR timing: session {session_id} event=task-finished elapsed_ms={latency_ms}"
+                    );
+                    saw_finished = record_finished_telemetry(|| {
+                        state.update(|snapshot| {
+                            if snapshot_matches_session(snapshot, session_id) {
+                                snapshot.diagnostics.update_session(session_id, |session| {
+                                    session.streaming.task_finished_latency_ms = Some(latency_ms);
+                                });
+                            }
+                        })
+                    });
                     break;
+                }
+                backend::AsrEvent::TaskFailed {
+                    kind,
+                    provider_error_code,
+                } => {
+                    let latency_ms = elapsed_ms(asr_started_at);
+                    let code = provider_error_code
+                        .as_ref()
+                        .map(|code| code.as_str())
+                        .unwrap_or("unavailable");
+                    eprintln!(
+                        "voice-input realtime ASR timing: session {session_id} event=task-failed elapsed_ms={latency_ms} failure={} provider_code={code}",
+                        kind.as_str()
+                    );
+                    speech_detected.store(true, Ordering::SeqCst);
+                    realtime_overloaded.store(true, Ordering::SeqCst);
+                    state.update(|snapshot| {
+                        if snapshot_matches_session(snapshot, session_id) {
+                            snapshot.diagnostics.update_session(session_id, |session| {
+                                session.streaming.status = StageStatus::Failed;
+                                if session.streaming.failure_kind != Some(FailureKind::Overloaded) {
+                                    session.streaming.failure_kind = Some(kind);
+                                }
+                                session.streaming.task_failed_latency_ms = Some(latency_ms);
+                                session.streaming.provider_error_code = provider_error_code.clone();
+                                session.streaming.finalize_latency_ms = finalization_started_at
+                                    .lock()
+                                    .expect("finalization timer mutex poisoned")
+                                    .map(elapsed_ms);
+                            });
+                        }
+                    })?;
+                    return Err(anyhow!("realtime ASR failed ({})", kind.as_str()));
                 }
                 backend::AsrEvent::Error { kind } => {
                     speech_detected.store(true, Ordering::SeqCst);
@@ -3064,6 +3237,36 @@ mod tests {
     }
 
     #[test]
+    fn committed_only_partial_is_nonempty_in_streaming_telemetry() {
+        let mut stage = crate::diagnostics::StreamingStage::default();
+        let update =
+            StreamingTelemetryUpdate::new(StreamingResultKind::Partial, "committed text", 41);
+        assert!(update.nonempty);
+        update.apply(&mut stage);
+
+        assert_eq!(stage.first_partial_latency_ms, Some(41));
+        assert_eq!(stage.first_nonempty_partial_latency_ms, Some(41));
+        assert_eq!(stage.last_result_latency_ms, Some(41));
+        assert_eq!(stage.partial_event_count, 1);
+        assert_eq!(stage.nonempty_partial_event_count, 1);
+    }
+
+    #[test]
+    fn final_only_sequence_records_nonempty_last_result_telemetry() {
+        let mut stage = crate::diagnostics::StreamingStage::default();
+        let update =
+            StreamingTelemetryUpdate::new(StreamingResultKind::Final, "terminal result", 73);
+        assert!(update.nonempty);
+        update.apply(&mut stage);
+
+        assert_eq!(stage.last_result_latency_ms, Some(73));
+        assert_eq!(stage.first_partial_latency_ms, None);
+        assert_eq!(stage.first_nonempty_partial_latency_ms, None);
+        assert_eq!(stage.partial_event_count, 0);
+        assert_eq!(stage.nonempty_partial_event_count, 0);
+    }
+
+    #[test]
     fn old_alibaba_final_then_channel_close_keeps_usable_transcript() {
         let observed = std::cell::Cell::new(None);
         let transcript = finalize_realtime_events(
@@ -3081,6 +3284,22 @@ mod tests {
             observed.get(),
             Some((StageStatus::Degraded, Some(FailureKind::Worker)))
         );
+    }
+
+    #[test]
+    fn finished_telemetry_failure_preserves_terminal_transcript_outcome() {
+        let saw_finished = record_finished_telemetry(|| {
+            Err(anyhow!(
+                "injected task-finished telemetry persistence failure"
+            ))
+        });
+        let outcome =
+            finalize_realtime_events(saw_finished, Some("successful final".into()), |_, _| {
+                Err(anyhow!("injected terminal telemetry persistence failure"))
+            });
+
+        assert!(outcome.saw_finished);
+        assert_eq!(outcome.transcript.as_deref(), Some("successful final"));
     }
 
     #[test]

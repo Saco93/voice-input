@@ -1,13 +1,13 @@
 use std::fmt::Write as _;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, de};
 
 use crate::{
     config::{AsrProvider, Config, NativeFinalPassMode},
     state::{Phase, Snapshot},
 };
 
-pub const DIAGNOSTICS_SCHEMA_VERSION: u32 = 2;
+pub const DIAGNOSTICS_SCHEMA_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
@@ -218,10 +218,86 @@ impl SessionDiagnostics {
         append_latency(output, "ready-latency-ms", self.streaming.ready_latency_ms);
         append_latency(
             output,
+            "first-partial-latency-ms",
+            self.streaming.first_partial_latency_ms,
+        );
+        append_latency(
+            output,
+            "first-nonempty-partial-latency-ms",
+            self.streaming.first_nonempty_partial_latency_ms,
+        );
+        append_latency(
+            output,
+            "last-result-latency-ms",
+            self.streaming.last_result_latency_ms,
+        );
+        if self.streaming.partial_event_count > 0 {
+            let _ = write!(
+                output,
+                ", partial-events={}",
+                self.streaming.partial_event_count
+            );
+        }
+        if self.streaming.nonempty_partial_event_count > 0 {
+            let _ = write!(
+                output,
+                ", nonempty-partial-events={}",
+                self.streaming.nonempty_partial_event_count
+            );
+        }
+        if self.streaming.segment_final_event_count > 0 {
+            let _ = write!(
+                output,
+                ", segment-final-events={}",
+                self.streaming.segment_final_event_count
+            );
+        }
+        if self.streaming.audio_packet_count > 0 {
+            let _ = write!(
+                output,
+                ", audio-packets={}",
+                self.streaming.audio_packet_count
+            );
+        }
+        append_latency(
+            output,
+            "audio-sent-duration-ms",
+            self.streaming.audio_sent_duration_ms,
+        );
+        append_latency(
+            output,
+            "max-audio-queue-delay-ms",
+            self.streaming.max_audio_queue_delay_ms,
+        );
+        append_latency(
+            output,
+            "last-audio-queue-delay-ms",
+            self.streaming.last_audio_queue_delay_ms,
+        );
+        append_latency(
+            output,
+            "finish-sent-latency-ms",
+            self.streaming.finish_sent_latency_ms,
+        );
+        append_latency(
+            output,
+            "task-finished-latency-ms",
+            self.streaming.task_finished_latency_ms,
+        );
+        append_latency(
+            output,
+            "task-failed-latency-ms",
+            self.streaming.task_failed_latency_ms,
+        );
+        append_latency(
+            output,
             "finalize-latency-ms",
             self.streaming.finalize_latency_ms,
         );
         append_failure(output, self.streaming.failure_kind);
+        if let Some(code) = &self.streaming.provider_error_code {
+            let _ = write!(output, ", provider-error-code={}", code.as_str());
+        }
         output.push('\n');
 
         let _ = write!(
@@ -280,8 +356,78 @@ impl Default for SessionDiagnostics {
 pub struct StreamingStage {
     pub status: StageStatus,
     pub ready_latency_ms: Option<u64>,
+    pub first_partial_latency_ms: Option<u64>,
+    pub first_nonempty_partial_latency_ms: Option<u64>,
+    pub last_result_latency_ms: Option<u64>,
+    pub partial_event_count: u64,
+    pub nonempty_partial_event_count: u64,
+    pub segment_final_event_count: u64,
+    pub audio_packet_count: u64,
+    pub audio_sent_duration_ms: Option<u64>,
+    pub max_audio_queue_delay_ms: Option<u64>,
+    pub last_audio_queue_delay_ms: Option<u64>,
+    pub finish_sent_latency_ms: Option<u64>,
+    pub task_finished_latency_ms: Option<u64>,
+    pub task_failed_latency_ms: Option<u64>,
     pub finalize_latency_ms: Option<u64>,
     pub failure_kind: Option<FailureKind>,
+    #[serde(default, deserialize_with = "deserialize_provider_error_code")]
+    pub provider_error_code: Option<ProviderErrorCode>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum PersistedProviderErrorCode {
+    String(String),
+    Other(de::IgnoredAny),
+}
+
+fn deserialize_provider_error_code<'de, D>(
+    deserializer: D,
+) -> Result<Option<ProviderErrorCode>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<PersistedProviderErrorCode>::deserialize(deserializer)?;
+    Ok(match value {
+        Some(PersistedProviderErrorCode::String(value)) => ProviderErrorCode::try_new(&value),
+        Some(PersistedProviderErrorCode::Other(_)) | None => None,
+    })
+}
+
+/// A provider error identifier that is safe to persist in support diagnostics.
+///
+/// Values are accepted only when the complete value is a short ASCII token.
+/// Provider messages and malformed identifiers are discarded rather than
+/// truncated or normalized, so private response content cannot be smuggled
+/// into diagnostics through this field.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(transparent)]
+pub struct ProviderErrorCode(String);
+
+impl ProviderErrorCode {
+    pub(crate) fn try_new(value: &str) -> Option<Self> {
+        (!value.is_empty()
+            && value.len() <= 64
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-')))
+        .then(|| Self(value.to_string()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for ProviderErrorCode {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::try_new(&value).ok_or_else(|| de::Error::custom("invalid provider error code"))
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -580,13 +726,15 @@ impl SupportPayload {
         }
         let _ = writeln!(
             output,
-            "Configuration: provider={}, final-pass={}, fallback={}, audio3-native-mode={}, audio3-language-hints={}, audio3-heartbeat={}, audio3-vocabulary-count={}",
+            "Configuration: provider={}, final-pass={}, fallback={}, audio3-native-mode={}, audio3-language-hints={}, audio3-heartbeat={}, audio3-max-sentence-silence-ms={}, audio3-semantic-punctuation={}, audio3-vocabulary-count={}",
             self.config.provider.as_str(),
             enabled_name(self.config.final_pass_enabled),
             enabled_name(self.config.fallback_enabled),
             self.config.audio3_native_final_pass_mode.as_str(),
             enabled_name(self.config.audio3_language_hints_enabled),
             enabled_name(self.config.audio3_heartbeat_enabled),
+            self.config.audio3_max_sentence_silence_ms,
+            enabled_name(self.config.audio3_semantic_punctuation_enabled),
             self.config.audio3_vocabulary_count
         );
         match &self.session {
@@ -631,6 +779,8 @@ pub struct SafeConfigSummary {
     pub audio3_native_final_pass_mode: NativeFinalPassMode,
     pub audio3_language_hints_enabled: bool,
     pub audio3_heartbeat_enabled: bool,
+    pub audio3_max_sentence_silence_ms: u32,
+    pub audio3_semantic_punctuation_enabled: bool,
     pub audio3_vocabulary_count: usize,
 }
 
@@ -651,6 +801,11 @@ impl SafeConfigSummary {
             audio3_native_final_pass_mode: config.asr.alibaba_audio3.native_final_pass_mode,
             audio3_language_hints_enabled: config.asr.alibaba_audio3.language_hints_enabled,
             audio3_heartbeat_enabled: config.asr.alibaba_audio3.heartbeat_enabled,
+            audio3_max_sentence_silence_ms: config.asr.alibaba_audio3.max_sentence_silence_ms,
+            audio3_semantic_punctuation_enabled: config
+                .asr
+                .alibaba_audio3
+                .semantic_punctuation_enabled,
             audio3_vocabulary_count: config.asr.alibaba_audio3.vocabulary.len(),
         }
     }
@@ -728,6 +883,104 @@ mod tests {
             serde_json::from_value::<FailureKind>(json!("future-private-error")).unwrap(),
             FailureKind::Unknown
         );
+    }
+
+    #[test]
+    fn provider_error_codes_are_strictly_bounded_safe_tokens() {
+        let maximum = "A".repeat(64);
+        for valid in [
+            "InvalidParameter",
+            "Service-500",
+            "quota.rate_limited",
+            &maximum,
+        ] {
+            let code = ProviderErrorCode::try_new(valid).expect("valid provider code");
+            assert_eq!(code.as_str(), valid);
+            assert_eq!(serde_json::to_value(&code).unwrap(), json!(valid));
+            assert_eq!(
+                serde_json::from_value::<ProviderErrorCode>(json!(valid)).unwrap(),
+                code
+            );
+        }
+
+        for invalid in [
+            "",
+            "contains space",
+            "path/value",
+            "line\nbreak",
+            "私密内容",
+            &"A".repeat(65),
+        ] {
+            assert!(ProviderErrorCode::try_new(invalid).is_none());
+            assert!(serde_json::from_value::<ProviderErrorCode>(json!(invalid)).is_err());
+        }
+    }
+
+    #[test]
+    fn malformed_persisted_provider_error_code_does_not_reject_snapshot() {
+        let mut snapshot = crate::state::Snapshot::idle(&Config::default());
+        snapshot.diagnostics.start_session(
+            25,
+            Provider::AlibabaQwenAudio3,
+            FinalPassKind::None,
+            false,
+        );
+        snapshot
+            .diagnostics
+            .update_session(25, |session| session.streaming.ready_latency_ms = Some(17));
+        let mut persisted = serde_json::to_value(snapshot).unwrap();
+
+        for malformed in [
+            json!("contains space"),
+            json!(65),
+            json!({"code": "nested"}),
+        ] {
+            persisted["diagnostics"]["session"]["streaming"]["provider_error_code"] = malformed;
+            let restored: crate::state::Snapshot =
+                serde_json::from_value(persisted.clone()).expect("snapshot must remain readable");
+            let streaming = &restored.diagnostics.session.unwrap().streaming;
+            assert_eq!(streaming.provider_error_code, None);
+            assert_eq!(streaming.ready_latency_ms, Some(17));
+        }
+    }
+
+    #[test]
+    fn streaming_event_diagnostics_are_aggregate_and_safe() {
+        let mut session =
+            SessionDiagnostics::new(24, Provider::AlibabaQwenAudio3, FinalPassKind::None, false);
+        session.streaming.ready_latency_ms = Some(150);
+        session.streaming.first_partial_latency_ms = Some(900);
+        session.streaming.first_nonempty_partial_latency_ms = Some(1_200);
+        session.streaming.last_result_latency_ms = Some(2_500);
+        session.streaming.partial_event_count = 3;
+        session.streaming.nonempty_partial_event_count = 2;
+        session.streaming.segment_final_event_count = 1;
+        session.streaming.audio_packet_count = 20;
+        session.streaming.audio_sent_duration_ms = Some(2_560);
+        session.streaming.max_audio_queue_delay_ms = Some(151);
+        session.streaming.last_audio_queue_delay_ms = Some(4);
+        session.streaming.finish_sent_latency_ms = Some(2_600);
+        session.streaming.task_finished_latency_ms = Some(2_650);
+        session.streaming.task_failed_latency_ms = Some(2_700);
+        session.streaming.failure_kind = Some(FailureKind::Service);
+        session.streaming.provider_error_code = ProviderErrorCode::try_new("ServiceUnavailable");
+
+        let mut text = String::new();
+        session.format_safe_text(&mut text);
+        let json = serde_json::to_value(&session).unwrap();
+        assert!(text.contains("first-partial-latency-ms=900"));
+        assert!(text.contains("nonempty-partial-events=2"));
+        assert!(text.contains("provider-error-code=ServiceUnavailable"));
+        assert_eq!(
+            json["streaming"]["first_nonempty_partial_latency_ms"],
+            1_200
+        );
+        assert_eq!(
+            json["streaming"]["provider_error_code"],
+            "ServiceUnavailable"
+        );
+        assert!(!text.contains("transcript"));
+        assert!(!json.to_string().contains("transcript"));
     }
 
     #[test]
@@ -1003,10 +1256,12 @@ mod tests {
 
         let payload = SupportPayload::new(&config, None);
         let json = serde_json::to_value(&payload).unwrap();
-        assert_eq!(json["schema_version"], 2);
+        assert_eq!(json["schema_version"], 3);
         assert_eq!(json["config"]["audio3_native_final_pass_mode"], "adaptive");
         assert_eq!(json["config"]["audio3_language_hints_enabled"], true);
         assert_eq!(json["config"]["audio3_heartbeat_enabled"], true);
+        assert_eq!(json["config"]["audio3_max_sentence_silence_ms"], 800);
+        assert_eq!(json["config"]["audio3_semantic_punctuation_enabled"], false);
         assert_eq!(json["config"]["audio3_vocabulary_count"], 1);
         assert!(!json.to_string().contains(TERM));
 

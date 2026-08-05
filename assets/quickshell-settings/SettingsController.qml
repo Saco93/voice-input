@@ -92,6 +92,8 @@ QtObject {
                     "model": "qwen-audio-3.0-asr-flash-streaming",
                     "language_hints_enabled": false,
                     "heartbeat_enabled": false,
+                    "max_sentence_silence_ms": 800,
+                    "semantic_punctuation_enabled": false,
                     "vocabulary": [],
                     "native_endpoint": "https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation",
                     "native_model": "qwen-audio-3.0-asr-flash",
@@ -430,7 +432,7 @@ QtObject {
         fieldErrors = ({
         });
         const config = withoutPlaintextSecrets(draft);
-        const unsignedIntegers = [["audio.sample_rate", 1], ["audio.max_duration_secs", 0], ["audio.partial_interval_ms", 0], ["audio.pre_roll_ms", 0], ["asr.connect_timeout_ms", 0], ["asr.finalize_timeout_ms", 0], ["asr.alibaba.silence_duration_ms", 0], ["asr.alibaba.final_pass_timeout_ms", 0], ["asr.alibaba_audio3.native_timeout_ms", 0], ["output.type_delay_ms", 0], ["output.pre_type_delay_ms", 0], ["llm.timeout_ms", 0], ["llm.agent_context_max_chars", 0]];
+        const unsignedIntegers = [["audio.sample_rate", 1], ["audio.max_duration_secs", 0], ["audio.partial_interval_ms", 0], ["audio.pre_roll_ms", 0], ["asr.connect_timeout_ms", 0], ["asr.finalize_timeout_ms", 0], ["asr.alibaba.silence_duration_ms", 0], ["asr.alibaba.final_pass_timeout_ms", 0], ["asr.alibaba_audio3.max_sentence_silence_ms", 0], ["asr.alibaba_audio3.native_timeout_ms", 0], ["output.type_delay_ms", 0], ["output.pre_type_delay_ms", 0], ["llm.timeout_ms", 0], ["llm.agent_context_max_chars", 0]];
         const signedIntegers = ["hud.margin_bottom", "hud.height", "hud.offset_x", "hud.offset_y", "hud.nudge_step"];
         let valid = true;
         for (let i = 0; i < unsignedIntegers.length; ++i) valid = asNumber(config, unsignedIntegers[i][0], true, unsignedIntegers[i][1]) && valid

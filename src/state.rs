@@ -364,7 +364,7 @@ mod tests {
         assert_eq!(extended["hud_height"], 64);
         assert_eq!(extended["recording_started_at_ms"], Value::Null);
         assert_eq!(extended["recording_duration_ms"], 0);
-        assert_eq!(extended["diagnostics"]["schema_version"], 2);
+        assert_eq!(extended["diagnostics"]["schema_version"], 3);
         assert_eq!(extended["revision"], 0);
 
         assert_eq!(

@@ -12,13 +12,14 @@ use std::{
         mpsc::{Receiver, SyncSender},
     },
     thread::JoinHandle,
+    time::Instant,
 };
 
 use anyhow::Result;
 
 use crate::{
     config::{AsrProvider, Config},
-    diagnostics::FailureKind,
+    diagnostics::{FailureKind, ProviderErrorCode},
 };
 
 pub(crate) use qwen_audio3::transcribe_full_audio as transcribe_qwen_audio3_full_audio;
@@ -36,8 +37,20 @@ pub const ASR_CONTROL_QUEUE_CAPACITY: usize = 128;
 
 #[derive(Debug)]
 pub enum AsrControl {
-    AppendPcm16(Vec<i16>),
+    AppendPcm16 {
+        samples: Vec<i16>,
+        enqueued_at: Instant,
+    },
     Finish,
+}
+
+impl AsrControl {
+    pub fn append_pcm16(samples: Vec<i16>) -> Self {
+        Self::AppendPcm16 {
+            samples,
+            enqueued_at: Instant::now(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -48,11 +61,30 @@ pub enum AsrEvent {
     RealtimeRestarting,
     RealtimeRestarted,
     RealtimeTranscriptDelayed,
-    Partial { committed: String, unstable: String },
-    SegmentFinal { text: String },
-    Final { text: String },
+    AudioDeliveryCompleted {
+        packet_count: u64,
+        sample_count: u64,
+        max_queue_delay_ms: u64,
+        last_queue_delay_ms: u64,
+    },
+    Partial {
+        committed: String,
+        unstable: String,
+    },
+    SegmentFinal {
+        text: String,
+    },
+    Final {
+        text: String,
+    },
     Finished,
-    Error { kind: FailureKind },
+    Error {
+        kind: FailureKind,
+    },
+    TaskFailed {
+        kind: FailureKind,
+        provider_error_code: Option<ProviderErrorCode>,
+    },
 }
 
 pub struct AsrSessionHandle {

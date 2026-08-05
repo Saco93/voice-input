@@ -13,7 +13,7 @@ This document tracks the next Qwen-Audio-3 improvements for Voice Input. Update 
 
 - Preserve `alibaba-qwen-realtime`, `alibaba-qwen-audio3`, and `local-cli` provider behavior unless a task explicitly changes it.
 - Keep experimental capabilities behind explicit configuration and retain safe defaults.
-- Never include audio, transcripts, credentials, endpoints, provider response text, window content, or prompt context in diagnostics or routine logs.
+- Never include audio, credentials, endpoints, window/application data, prompt context, or normal recognized/refined text in diagnostics or routine logs. Bounded upstream error fields may be recorded verbatim for operational accuracy.
 - Add deterministic protocol and policy tests before live-provider validation.
 - Use official Alibaba Cloud documentation as the source of truth; record any API ambiguity or provider behavior discovered during implementation.
 - Do not broaden a milestone merely because a related API field exists.
@@ -37,7 +37,7 @@ Complete items 1–4, then stop and evaluate their combined effect before starti
 - [x] Add the streaming request parameter as an explicit opt-in switch, disabled by default while continuing to send the boolean in every streaming request.
 - [x] Verify long-silence sessions remain cancellable and do not alter normal completion semantics. A controlled silent session longer than 60 seconds completed normally with an empty result.
 - [x] Add deterministic request-envelope tests.
-- [ ] Add long-idle lifecycle tests without wall-clock sleeps. This remains deferred until a practical deterministic socket seam exists.
+- [x] Add lifecycle tests without wall-clock sleeps. Scripted in-memory provider events and a manual deadline clock now validate the production-used client state machine for startup and finalization deadline expiration with stable timeout errors and socket close, plus 65 simulated seconds including heartbeat filtering, all PCM delivery, finish completion, and cancellation observed on the next retryable read/poll. Setting the abort flag does not itself wake a blocked read; production polling remains bounded by the configured 50 ms socket read timeout. This validates client lifecycle behavior; the separate real 65-second test validates remote-provider behavior.
 - [x] Confirm no observed regression in shutdown latency or worker cleanup during controlled short, long, empty, and 65-second silent sessions.
 
 ### 3. Dynamic hotwords (`vocabulary`)
@@ -74,9 +74,9 @@ Complete items 1–4, then stop and evaluate their combined effect before starti
 
 ### 5. VAD and sentence-boundary settings
 
-- [ ] Add validated advanced controls for `max_sentence_silence`, semantic punctuation, multi-threshold mode, and speech/noise threshold only where officially supported.
+- [~] Foundations only: validated `max_sentence_silence` and semantic-punctuation fields are included in Milestone 1 closeout at user direction. Multi-threshold mode and speech/noise thresholds remain unimplemented and must be added only where officially supported.
 - [ ] Define presets for low-latency dictation and longer-form speech instead of exposing unexplained raw values by default.
-- [ ] Test endpoint latency, long pauses, background noise, cancellation, and final transcript assembly.
+- [ ] Complete pause/noise evaluation across endpoint latency, long pauses, background noise, cancellation, and final transcript assembly.
 
 ### 6. Parse and use timestamps
 
@@ -115,9 +115,10 @@ Complete items 1–4, then stop and evaluate their combined effect before starti
 | --- | --- | --- | --- |
 | 2026-08-02 | Planning | Completed | Created the feature branch, isolated worktree, three-milestone checklist, and Milestone 1 evaluation gate from `main` at `b28af17`. No implementation started. |
 | 2026-08-02 | Milestone 1 API verification | Completed | Confirmed the official request placement, language-code allowlist, heartbeat semantics, and dynamic-vocabulary limits for the streaming and short Flash models. Recorded the Singapore hotword-support ambiguity; no inference request was made. |
-| 2026-08-02 | Milestone 1 items 1–3 implementation | Completed with documented follow-ups | Implemented opt-in language hints, opt-in explicit streaming heartbeat, and bounded global dynamic vocabulary for streaming and native requests. Added Settings controls, migration/default/validation/request/privacy/isolation tests, sample configuration, and documentation. Per-application profiles, a deterministic no-wall-clock long-idle socket test, and fixed-corpus vocabulary A/B measurement remain deferred and are explicitly recorded above. |
+| 2026-08-02 | Milestone 1 items 1–3 implementation | Completed with documented follow-ups | Implemented opt-in language hints, opt-in explicit streaming heartbeat, and bounded global dynamic vocabulary for streaming and native requests. Added Settings controls, migration/default/validation/request/privacy/isolation tests, sample configuration, and documentation. Per-application profiles remain deferred, and fixed-corpus vocabulary A/B measurement remains under discussion. |
 | 2026-08-02 | Milestone 1 item 4 implementation | Completed locally | Replaced the Audio3 native-pass boolean with streaming-only, adaptive, and always modes; migrated legacy `true` to always and `false` to streaming-only. Added a text-free 30-second adaptive policy, explicit completion tracking, privacy-safe diagnostics schema v2, Settings/QML controls, bilingual documentation, and exhaustive migration/policy/result tests through production-used planning and injectable invocation seams. |
 | 2026-08-02 | Milestone 1 live evaluation | Completed with documented limits | Real streaming/native APIs accepted the new controls. Seven controlled, transcript-free diagnostic samples covered short Chinese/English/mixed speech, configured technical terms, silence, repeated noise, long speech, and silence beyond 60 seconds. Healthy short streams skipped native; empty and long cases invoked it; no fallback or ASR failure occurred. One of two noise attempts produced a false positive. Aggregate timings, invocation rate, approximate Beijing pricing, decisions, and limitations are in `docs/qwen-audio3-milestone1-evaluation.md`. |
+| 2026-08-05 | Milestone 1 closeout | Completed locally; no new live evaluation | Added deterministic production-used Audio3 lifecycle coverage for 65 simulated heartbeat-enabled seconds and cancellation, corrected terminal/committed-only streaming telemetry, made malformed persisted provider error codes degrade to unavailable, and advanced diagnostics to schema v3. Included validated `max_sentence_silence` and semantic-punctuation configuration foundations at user direction; Milestone 2 item 5 remains in progress because presets, multi-threshold/noise controls, and full pause/noise evaluation are still outstanding. |
 
 ## Official references
 

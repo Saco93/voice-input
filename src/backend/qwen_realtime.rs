@@ -545,7 +545,7 @@ struct RetainedAudio {
 impl RetainedAudio {
     fn accept_control(&mut self, control: AsrControl) -> bool {
         match control {
-            AsrControl::AppendPcm16(samples) => {
+            AsrControl::AppendPcm16 { samples, .. } => {
                 self.retain(samples);
                 false
             }
@@ -1258,8 +1258,8 @@ mod tests {
     #[test]
     fn retained_audio_replays_in_order_before_later_controls() {
         let mut audio = RetainedAudio::default();
-        assert!(!audio.accept_control(AsrControl::AppendPcm16(vec![1, 2])));
-        assert!(!audio.accept_control(AsrControl::AppendPcm16(vec![3])));
+        assert!(!audio.accept_control(AsrControl::append_pcm16(vec![1, 2])));
+        assert!(!audio.accept_control(AsrControl::append_pcm16(vec![3])));
         assert_eq!(audio.packet_count(), 2);
         assert_eq!(audio.sample_count(), 3);
 
