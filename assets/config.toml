@@ -36,6 +36,9 @@ final_pass_enable_itn = false
 
 [asr.alibaba_audio3]
 experimental_enabled = false
+endpoint_mode = "regional"
+region = "beijing"
+workspace_id = ""
 endpoint = "wss://dashscope.aliyuncs.com/api-ws/v1/inference"
 model = "qwen-audio-3.0-asr-flash-streaming"
 language_hints_enabled = false

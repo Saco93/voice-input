@@ -100,6 +100,10 @@ pub struct AlibabaRealtimeConfig {
 #[derive(Debug, Clone, Serialize)]
 pub struct AlibabaAudio3Config {
     pub experimental_enabled: bool,
+    pub endpoint_mode: Audio3EndpointMode,
+    pub region: Audio3Region,
+    pub workspace_id: String,
+    /// Dormant in regional mode; retained for custom routing and migration.
     pub endpoint: String,
     #[serde(default, skip_serializing)]
     pub api_key: String,
@@ -121,6 +125,81 @@ pub struct AlibabaAudio3Config {
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
+pub enum Audio3EndpointMode {
+    #[default]
+    Regional,
+    Custom,
+}
+
+impl Audio3EndpointMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Regional => "regional",
+            Self::Custom => "custom",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum Audio3Region {
+    #[default]
+    Beijing,
+    Singapore,
+}
+
+impl Audio3Region {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Beijing => "beijing",
+            Self::Singapore => "singapore",
+        }
+    }
+}
+
+pub const AUDIO3_BEIJING_STREAMING_ENDPOINT: &str =
+    "wss://dashscope.aliyuncs.com/api-ws/v1/inference";
+pub const AUDIO3_SINGAPORE_STREAMING_ENDPOINT: &str =
+    "wss://dashscope-intl.aliyuncs.com/api-ws/v1/inference";
+pub const AUDIO3_BEIJING_NATIVE_ENDPOINT: &str =
+    "https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation";
+pub const AUDIO3_SINGAPORE_NATIVE_ENDPOINT: &str =
+    "https://dashscope-intl.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation";
+
+const AUDIO3_BEIJING_WORKSPACE_SUFFIX: &str = "cn-beijing.maas.aliyuncs.com";
+const AUDIO3_SINGAPORE_WORKSPACE_SUFFIX: &str = "ap-southeast-1.maas.aliyuncs.com";
+const AUDIO3_STREAMING_PATH: &str = "/api-ws/v1/inference";
+const AUDIO3_NATIVE_PATH: &str = "/api/v1/services/aigc/multimodal-generation/generation";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedAudio3Endpoints {
+    streaming: String,
+    native: String,
+}
+
+impl ResolvedAudio3Endpoints {
+    pub fn streaming(&self) -> &str {
+        &self.streaming
+    }
+
+    pub fn native(&self) -> &str {
+        &self.native
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Audio3EndpointResolutionError;
+
+impl fmt::Display for Audio3EndpointResolutionError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("invalid Audio3 regional endpoint configuration")
+    }
+}
+
+impl Error for Audio3EndpointResolutionError {}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
 pub enum Audio3RecognitionPreset {
     #[default]
     Standard,
@@ -138,6 +217,49 @@ pub struct EffectiveAudio3RecognitionControls {
 }
 
 impl AlibabaAudio3Config {
+    pub fn resolve_endpoints(
+        &self,
+    ) -> std::result::Result<ResolvedAudio3Endpoints, Audio3EndpointResolutionError> {
+        if self.endpoint_mode == Audio3EndpointMode::Custom {
+            return Ok(ResolvedAudio3Endpoints {
+                streaming: self.endpoint.clone(),
+                native: self.native_endpoint.clone(),
+            });
+        }
+
+        if self.workspace_id.is_empty() {
+            let (streaming, native) = match self.region {
+                Audio3Region::Beijing => (
+                    AUDIO3_BEIJING_STREAMING_ENDPOINT,
+                    AUDIO3_BEIJING_NATIVE_ENDPOINT,
+                ),
+                Audio3Region::Singapore => (
+                    AUDIO3_SINGAPORE_STREAMING_ENDPOINT,
+                    AUDIO3_SINGAPORE_NATIVE_ENDPOINT,
+                ),
+            };
+            return Ok(ResolvedAudio3Endpoints {
+                streaming: streaming.into(),
+                native: native.into(),
+            });
+        }
+
+        if !audio3_workspace_is_transport_safe(&self.workspace_id) {
+            return Err(Audio3EndpointResolutionError);
+        }
+        let suffix = match self.region {
+            Audio3Region::Beijing => AUDIO3_BEIJING_WORKSPACE_SUFFIX,
+            Audio3Region::Singapore => AUDIO3_SINGAPORE_WORKSPACE_SUFFIX,
+        };
+        Ok(ResolvedAudio3Endpoints {
+            streaming: format!(
+                "wss://{}.{suffix}{AUDIO3_STREAMING_PATH}",
+                self.workspace_id
+            ),
+            native: format!("https://{}.{suffix}{AUDIO3_NATIVE_PATH}", self.workspace_id),
+        })
+    }
+
     pub fn effective_recognition_controls(&self) -> EffectiveAudio3RecognitionControls {
         match self.recognition_preset {
             Audio3RecognitionPreset::Standard => EffectiveAudio3RecognitionControls {
@@ -191,6 +313,9 @@ impl NativeFinalPassMode {
 #[serde(default)]
 struct RawAlibabaAudio3Config {
     experimental_enabled: bool,
+    endpoint_mode: Option<Audio3EndpointMode>,
+    region: Option<Audio3Region>,
+    workspace_id: String,
     endpoint: String,
     api_key: String,
     model: String,
@@ -214,6 +339,9 @@ impl Default for RawAlibabaAudio3Config {
         let defaults = AlibabaAudio3Config::default();
         Self {
             experimental_enabled: defaults.experimental_enabled,
+            endpoint_mode: None,
+            region: None,
+            workspace_id: defaults.workspace_id,
             endpoint: defaults.endpoint,
             api_key: defaults.api_key,
             model: defaults.model,
@@ -257,6 +385,36 @@ impl<'de> Deserialize<'de> for AlibabaAudio3Config {
             (None, Some(mode)) => mode,
             (None, None) => NativeFinalPassMode::StreamingOnly,
         };
+        let (endpoint_mode, region, workspace_id) = match raw.endpoint_mode {
+            Some(mode) => (
+                mode,
+                raw.region.unwrap_or_default(),
+                raw.workspace_id.clone(),
+            ),
+            None if raw.endpoint == AUDIO3_BEIJING_STREAMING_ENDPOINT
+                && raw.native_endpoint == AUDIO3_BEIJING_NATIVE_ENDPOINT =>
+            {
+                (
+                    Audio3EndpointMode::Regional,
+                    raw.region.unwrap_or(Audio3Region::Beijing),
+                    raw.workspace_id.clone(),
+                )
+            }
+            None if raw.endpoint == AUDIO3_SINGAPORE_STREAMING_ENDPOINT
+                && raw.native_endpoint == AUDIO3_SINGAPORE_NATIVE_ENDPOINT =>
+            {
+                (
+                    Audio3EndpointMode::Regional,
+                    raw.region.unwrap_or(Audio3Region::Singapore),
+                    raw.workspace_id.clone(),
+                )
+            }
+            None => (
+                Audio3EndpointMode::Custom,
+                raw.region.unwrap_or_default(),
+                raw.workspace_id.clone(),
+            ),
+        };
         let multi_threshold_mode_enabled = raw.multi_threshold_mode_enabled.unwrap_or(false);
         let recognition_preset = raw.recognition_preset.unwrap_or_else(|| {
             if raw.max_sentence_silence_ms == 800
@@ -271,6 +429,9 @@ impl<'de> Deserialize<'de> for AlibabaAudio3Config {
         });
         Ok(Self {
             experimental_enabled: raw.experimental_enabled,
+            endpoint_mode,
+            region,
+            workspace_id,
             endpoint: raw.endpoint,
             api_key: raw.api_key,
             model: raw.model,
@@ -493,7 +654,10 @@ impl Default for Config {
                 },
                 alibaba_audio3: AlibabaAudio3Config {
                     experimental_enabled: false,
-                    endpoint: "wss://dashscope.aliyuncs.com/api-ws/v1/inference".into(),
+                    endpoint_mode: Audio3EndpointMode::Regional,
+                    region: Audio3Region::Beijing,
+                    workspace_id: String::new(),
+                    endpoint: AUDIO3_BEIJING_STREAMING_ENDPOINT.into(),
                     api_key: String::new(),
                     model: "qwen-audio-3.0-asr-flash-streaming".into(),
                     language_hints_enabled: false,
@@ -504,7 +668,7 @@ impl Default for Config {
                     multi_threshold_mode_enabled: false,
                     speech_noise_threshold: None,
                     vocabulary: Vec::new(),
-                    native_endpoint: "https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation".into(),
+                    native_endpoint: AUDIO3_BEIJING_NATIVE_ENDPOINT.into(),
                     native_model: "qwen-audio-3.0-asr-flash".into(),
                     native_final_pass_mode: NativeFinalPassMode::StreamingOnly,
                     native_timeout_ms: 20_000,
@@ -730,25 +894,42 @@ impl Config {
                     "must be true when the experimental provider is selected".into(),
                 );
             }
-            validate_url(
-                &mut fields,
-                "asr.alibaba_audio3.endpoint",
-                &self.asr.alibaba_audio3.endpoint,
-                &["ws", "wss"],
-                false,
-            );
+            match self.asr.alibaba_audio3.endpoint_mode {
+                Audio3EndpointMode::Custom => {
+                    validate_url(
+                        &mut fields,
+                        "asr.alibaba_audio3.endpoint",
+                        &self.asr.alibaba_audio3.endpoint,
+                        &["ws", "wss"],
+                        false,
+                    );
+                    validate_url(
+                        &mut fields,
+                        "asr.alibaba_audio3.native_endpoint",
+                        &self.asr.alibaba_audio3.native_endpoint,
+                        &["http", "https"],
+                        false,
+                    );
+                }
+                Audio3EndpointMode::Regional => {
+                    if !self.asr.alibaba_audio3.workspace_id.is_empty()
+                        && !audio3_workspace_is_transport_safe(
+                            &self.asr.alibaba_audio3.workspace_id,
+                        )
+                    {
+                        fields.insert(
+                            "asr.alibaba_audio3.workspace_id".into(),
+                            "must be a valid DNS label for hostname transport".into(),
+                        );
+                    }
+                }
+            }
+
             validate_text(
                 &mut fields,
                 "asr.alibaba_audio3.model",
                 &self.asr.alibaba_audio3.model,
                 512,
-                false,
-            );
-            validate_url(
-                &mut fields,
-                "asr.alibaba_audio3.native_endpoint",
-                &self.asr.alibaba_audio3.native_endpoint,
-                &["http", "https"],
                 false,
             );
             validate_text(
@@ -1130,6 +1311,16 @@ fn missing_revision() -> String {
     "missing:fnv1a64:cbf29ce484222325".into()
 }
 
+fn audio3_workspace_is_transport_safe(workspace_id: &str) -> bool {
+    let bytes = workspace_id.as_bytes();
+    (1..=63).contains(&bytes.len())
+        && bytes.first() != Some(&b'-')
+        && bytes.last() != Some(&b'-')
+        && bytes
+            .iter()
+            .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'-')
+}
+
 fn validate_audio3_vocabulary(vocabulary: &[Audio3VocabularyTerm]) -> Option<String> {
     if vocabulary.len() > MAX_AUDIO3_VOCABULARY_TERMS {
         return Some(format!(
@@ -1378,9 +1569,11 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     use super::{
-        AsrProvider, Audio3RecognitionPreset, Audio3VocabularyTerm, Config, ConfigStore,
-        EffectiveAudio3RecognitionControls, HudPosition, Language, MAX_AUDIO3_VOCABULARY_BYTES,
-        NativeFinalPassMode, RevisionConflict,
+        AUDIO3_BEIJING_NATIVE_ENDPOINT, AUDIO3_BEIJING_STREAMING_ENDPOINT,
+        AUDIO3_SINGAPORE_NATIVE_ENDPOINT, AUDIO3_SINGAPORE_STREAMING_ENDPOINT, AsrProvider,
+        Audio3EndpointMode, Audio3RecognitionPreset, Audio3Region, Audio3VocabularyTerm, Config,
+        ConfigStore, EffectiveAudio3RecognitionControls, HudPosition, Language,
+        MAX_AUDIO3_VOCABULARY_BYTES, NativeFinalPassMode, RevisionConflict,
     };
 
     #[test]
@@ -1509,6 +1702,12 @@ mod tests {
         let config = Config::default();
         assert!(!config.asr.alibaba_audio3.experimental_enabled);
         assert_eq!(
+            config.asr.alibaba_audio3.endpoint_mode,
+            Audio3EndpointMode::Regional
+        );
+        assert_eq!(config.asr.alibaba_audio3.region, Audio3Region::Beijing);
+        assert!(config.asr.alibaba_audio3.workspace_id.is_empty());
+        assert_eq!(
             config.asr.alibaba_audio3.endpoint,
             "wss://dashscope.aliyuncs.com/api-ws/v1/inference"
         );
@@ -1554,6 +1753,7 @@ mod tests {
     #[test]
     fn audio3_selection_requires_gate_and_validates_only_when_selected() {
         let mut config = Config::default();
+        config.asr.alibaba_audio3.endpoint_mode = Audio3EndpointMode::Custom;
         config.asr.alibaba_audio3.endpoint = "not a URL".into();
         config.asr.alibaba_audio3.model.clear();
         config
@@ -2221,6 +2421,309 @@ native_timeout_ms = 20000
         config
             .validate()
             .expect("Alibaba realtime ignores Audio3-only vocabulary controls");
+    }
+
+    #[test]
+    fn audio3_endpoint_enums_and_resolver_cover_exact_region_api_matrix() {
+        assert_eq!(
+            serde_json::to_value(Audio3EndpointMode::Regional).unwrap(),
+            serde_json::json!("regional")
+        );
+        assert_eq!(
+            serde_json::to_value(Audio3Region::Singapore).unwrap(),
+            serde_json::json!("singapore")
+        );
+
+        let mut audio3 = super::AlibabaAudio3Config::default();
+        for (region, workspace, streaming, native) in [
+            (
+                Audio3Region::Beijing,
+                "",
+                AUDIO3_BEIJING_STREAMING_ENDPOINT.to_string(),
+                AUDIO3_BEIJING_NATIVE_ENDPOINT.to_string(),
+            ),
+            (
+                Audio3Region::Singapore,
+                "",
+                AUDIO3_SINGAPORE_STREAMING_ENDPOINT.to_string(),
+                AUDIO3_SINGAPORE_NATIVE_ENDPOINT.to_string(),
+            ),
+            (
+                Audio3Region::Beijing,
+                "Workspace-9",
+                "wss://Workspace-9.cn-beijing.maas.aliyuncs.com/api-ws/v1/inference".into(),
+                "https://Workspace-9.cn-beijing.maas.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation".into(),
+            ),
+            (
+                Audio3Region::Singapore,
+                "Workspace-9",
+                "wss://Workspace-9.ap-southeast-1.maas.aliyuncs.com/api-ws/v1/inference".into(),
+                "https://Workspace-9.ap-southeast-1.maas.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation".into(),
+            ),
+        ] {
+            audio3.region = region;
+            audio3.workspace_id = workspace.into();
+            let resolved = audio3.resolve_endpoints().unwrap();
+            assert_eq!(resolved.streaming(), streaming);
+            assert_eq!(resolved.native(), native);
+        }
+    }
+
+    #[test]
+    fn legacy_audio3_endpoint_pairs_migrate_only_when_both_are_exact() {
+        let parse =
+            |streaming: &str, native: &str, workspace_id: &str| -> super::AlibabaAudio3Config {
+                serde_json::from_value(serde_json::json!({
+                    "workspace_id": workspace_id,
+                    "endpoint": streaming,
+                    "native_endpoint": native
+                }))
+                .unwrap()
+            };
+        for (streaming, native, region) in [
+            (
+                AUDIO3_BEIJING_STREAMING_ENDPOINT,
+                AUDIO3_BEIJING_NATIVE_ENDPOINT,
+                Audio3Region::Beijing,
+            ),
+            (
+                AUDIO3_SINGAPORE_STREAMING_ENDPOINT,
+                AUDIO3_SINGAPORE_NATIVE_ENDPOINT,
+                Audio3Region::Singapore,
+            ),
+        ] {
+            let migrated = parse(streaming, native, "explicit-workspace");
+            assert_eq!(migrated.endpoint_mode, Audio3EndpointMode::Regional);
+            assert_eq!(migrated.region, region);
+            assert_eq!(migrated.workspace_id, "explicit-workspace");
+            assert_eq!(migrated.endpoint, streaming);
+            assert_eq!(migrated.native_endpoint, native);
+        }
+        let migrated_empty = parse(
+            AUDIO3_BEIJING_STREAMING_ENDPOINT,
+            AUDIO3_BEIJING_NATIVE_ENDPOINT,
+            "",
+        );
+        assert_eq!(migrated_empty.endpoint_mode, Audio3EndpointMode::Regional);
+        assert!(migrated_empty.workspace_id.is_empty());
+
+        let custom_pairs = [
+            (
+                AUDIO3_BEIJING_STREAMING_ENDPOINT,
+                AUDIO3_SINGAPORE_NATIVE_ENDPOINT,
+            ),
+            (
+                AUDIO3_SINGAPORE_STREAMING_ENDPOINT,
+                AUDIO3_BEIJING_NATIVE_ENDPOINT,
+            ),
+            (
+                "wss://legacy-workspace.cn-beijing.maas.aliyuncs.com/api-ws/v1/inference",
+                "https://legacy-workspace.cn-beijing.maas.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation",
+            ),
+            (
+                "wss://legacy-workspace.ap-southeast-1.maas.aliyuncs.com/api-ws/v1/inference",
+                "https://legacy-workspace.ap-southeast-1.maas.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation",
+            ),
+            ("ws://127.0.0.1:8123/stream", "http://localhost:8124/native"),
+            (
+                "wss://proxy.example/custom/path?route=one",
+                "https://proxy.example:9443/custom/native?route=two",
+            ),
+            (
+                "wss://dashscope.aliyuncs.com:443/api-ws/v1/inference",
+                AUDIO3_BEIJING_NATIVE_ENDPOINT,
+            ),
+            (
+                "wss://dashscope.aliyuncs.com/api-ws/v1/inference/custom",
+                AUDIO3_BEIJING_NATIVE_ENDPOINT,
+            ),
+            (
+                AUDIO3_BEIJING_STREAMING_ENDPOINT,
+                "https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation?custom=1",
+            ),
+        ];
+        for (streaming, native) in custom_pairs {
+            let migrated = parse(streaming, native, "");
+            assert_eq!(migrated.endpoint_mode, Audio3EndpointMode::Custom);
+            assert_eq!(migrated.region, Audio3Region::Beijing);
+            assert!(migrated.workspace_id.is_empty());
+            assert_eq!(migrated.endpoint, streaming);
+            assert_eq!(migrated.native_endpoint, native);
+            let resolved = migrated.resolve_endpoints().unwrap();
+            assert_eq!(resolved.streaming(), streaming);
+            assert_eq!(resolved.native(), native);
+        }
+    }
+
+    #[test]
+    fn explicit_audio3_endpoint_mode_and_region_win_and_preserve_dormant_values() {
+        let custom_streaming = "wss://proxy.example/ws?opaque=a%2Fb&x=1";
+        let custom_native = "https://proxy.example/native?opaque=%20";
+        let inferred_custom: super::AlibabaAudio3Config =
+            serde_json::from_value(serde_json::json!({
+                "workspace_id": "opaque dormant value",
+                "endpoint": custom_streaming,
+                "native_endpoint": custom_native
+            }))
+            .unwrap();
+        assert_eq!(inferred_custom.endpoint_mode, Audio3EndpointMode::Custom);
+        assert_eq!(inferred_custom.workspace_id, "opaque dormant value");
+        assert_eq!(inferred_custom.endpoint, custom_streaming);
+        assert_eq!(inferred_custom.native_endpoint, custom_native);
+
+        let custom: super::AlibabaAudio3Config = serde_json::from_value(serde_json::json!({
+            "endpoint_mode": "custom",
+            "region": "singapore",
+            "workspace_id": "dormant workspace value",
+            "endpoint": custom_streaming,
+            "native_endpoint": custom_native
+        }))
+        .unwrap();
+        assert_eq!(custom.endpoint_mode, Audio3EndpointMode::Custom);
+        assert_eq!(custom.region, Audio3Region::Singapore);
+        assert_eq!(custom.workspace_id, "dormant workspace value");
+        let resolved = custom.resolve_endpoints().unwrap();
+        assert_eq!(resolved.streaming(), custom_streaming);
+        assert_eq!(resolved.native(), custom_native);
+
+        let inferred_mode_with_explicit_region: super::AlibabaAudio3Config =
+            serde_json::from_value(serde_json::json!({
+                "region": "singapore",
+                "workspace_id": "retained-for-legacy-pair",
+                "endpoint": AUDIO3_BEIJING_STREAMING_ENDPOINT,
+                "native_endpoint": AUDIO3_BEIJING_NATIVE_ENDPOINT
+            }))
+            .unwrap();
+        assert_eq!(
+            inferred_mode_with_explicit_region.endpoint_mode,
+            Audio3EndpointMode::Regional
+        );
+        assert_eq!(
+            inferred_mode_with_explicit_region.region,
+            Audio3Region::Singapore
+        );
+        assert_eq!(
+            inferred_mode_with_explicit_region.workspace_id,
+            "retained-for-legacy-pair"
+        );
+
+        let regional: super::AlibabaAudio3Config = serde_json::from_value(serde_json::json!({
+            "endpoint_mode": "regional",
+            "region": "singapore",
+            "workspace_id": "workspace-1",
+            "endpoint": "dormant streaming bytes",
+            "native_endpoint": "dormant native bytes"
+        }))
+        .unwrap();
+        assert_eq!(regional.endpoint, "dormant streaming bytes");
+        assert_eq!(regional.native_endpoint, "dormant native bytes");
+        assert_eq!(
+            regional.resolve_endpoints().unwrap().streaming(),
+            "wss://workspace-1.ap-southeast-1.maas.aliyuncs.com/api-ws/v1/inference"
+        );
+    }
+
+    #[test]
+    fn regional_workspace_transport_validation_is_bounded_private_and_active_only() {
+        for valid in ["a", "A-9", &"a".repeat(63)] {
+            let mut config = Config::default();
+            config.asr.provider = AsrProvider::AlibabaQwenAudio3;
+            config.asr.alibaba_audio3.experimental_enabled = true;
+            config.asr.alibaba_audio3.workspace_id = valid.into();
+            config.validate().expect("transport-safe DNS label");
+            config.asr.alibaba_audio3.resolve_endpoints().unwrap();
+        }
+
+        const SENTINEL: &str = "private_workspace_value";
+        for invalid in [
+            "-leading",
+            "trailing-",
+            "under_score",
+            "contains.dot",
+            "工作区",
+            &"a".repeat(64),
+            SENTINEL,
+        ] {
+            let mut config = Config::default();
+            config.asr.provider = AsrProvider::AlibabaQwenAudio3;
+            config.asr.alibaba_audio3.experimental_enabled = true;
+            config.asr.alibaba_audio3.workspace_id = invalid.into();
+            let error = config.validate().expect_err("unsafe hostname label");
+            assert_eq!(
+                error.fields["asr.alibaba_audio3.workspace_id"],
+                "must be a valid DNS label for hostname transport"
+            );
+            assert!(!format!("{error}: {:?}", error.fields).contains(invalid));
+            let resolver_error = config
+                .asr
+                .alibaba_audio3
+                .resolve_endpoints()
+                .expect_err("resolver applies the same transport boundary");
+            assert_eq!(
+                resolver_error.to_string(),
+                "invalid Audio3 regional endpoint configuration"
+            );
+            assert!(!resolver_error.to_string().contains(invalid));
+        }
+
+        let mut inactive = Config::default();
+        inactive.asr.alibaba_audio3.workspace_id = SENTINEL.into();
+        inactive.asr.alibaba_audio3.endpoint = "dormant invalid streaming".into();
+        inactive.asr.alibaba_audio3.native_endpoint = "dormant invalid native".into();
+        inactive
+            .validate()
+            .expect("inactive Audio3 routing is isolated");
+
+        let mut custom = inactive;
+        custom.asr.provider = AsrProvider::AlibabaQwenAudio3;
+        custom.asr.alibaba_audio3.experimental_enabled = true;
+        custom.asr.alibaba_audio3.endpoint_mode = Audio3EndpointMode::Custom;
+        custom.asr.alibaba_audio3.endpoint = "wss://proxy.example/ws".into();
+        custom.asr.alibaba_audio3.native_endpoint = "https://proxy.example/native".into();
+        custom
+            .validate()
+            .expect("custom mode ignores its dormant workspace value");
+    }
+
+    #[test]
+    fn regional_mode_ignores_dormant_custom_urls_while_custom_keeps_tls_rules() {
+        let mut config = Config::default();
+        config.asr.provider = AsrProvider::AlibabaQwenAudio3;
+        config.asr.alibaba_audio3.experimental_enabled = true;
+        config.asr.alibaba_audio3.endpoint = "not a URL".into();
+        config.asr.alibaba_audio3.native_endpoint = "also not a URL".into();
+        config
+            .validate()
+            .expect("regional mode does not validate dormant custom URLs");
+
+        config.asr.alibaba_audio3.endpoint_mode = Audio3EndpointMode::Custom;
+        let error = config.validate().expect_err("custom URLs are active");
+        assert!(error.fields.contains_key("asr.alibaba_audio3.endpoint"));
+        assert!(
+            error
+                .fields
+                .contains_key("asr.alibaba_audio3.native_endpoint")
+        );
+
+        config.asr.alibaba_audio3.endpoint = "ws://provider.example/ws".into();
+        config.asr.alibaba_audio3.native_endpoint = "http://provider.example/native".into();
+        let error = config
+            .validate()
+            .expect_err("custom remote plaintext remains forbidden");
+        assert_eq!(
+            error.fields["asr.alibaba_audio3.endpoint"],
+            "must use transport encryption unless the host is loopback"
+        );
+        assert_eq!(
+            error.fields["asr.alibaba_audio3.native_endpoint"],
+            "must use transport encryption unless the host is loopback"
+        );
+
+        config.asr.alibaba_audio3.endpoint = "ws://127.0.0.1:8123/ws".into();
+        config.asr.alibaba_audio3.native_endpoint = "http://localhost:8124/native".into();
+        config
+            .validate()
+            .expect("custom loopback plaintext remains available for tests");
     }
 
     #[test]

@@ -336,6 +336,8 @@ fn settings_get(store: &ConfigStore) -> std::result::Result<Value, ProtocolError
             "asr.provider": ["local-cli", "alibaba-qwen-realtime", "alibaba-qwen-audio3"],
             "asr.language": ["english", "simplified-chinese", "traditional-chinese", "japanese", "korean"],
             "asr.alibaba.turn_mode": ["server-vad", "manual"],
+            "asr.alibaba_audio3.endpoint_mode": ["regional", "custom"],
+            "asr.alibaba_audio3.region": ["beijing", "singapore"],
             "asr.alibaba_audio3.recognition_preset": ["standard", "low-latency-dictation", "long-form", "custom"],
             "asr.alibaba_audio3.native_final_pass_mode": ["streaming-only", "adaptive", "always"],
             "output.mode": ["type", "clipboard", "paste"],
@@ -811,6 +813,14 @@ mod tests {
             json!(["local-cli", "alibaba-qwen-realtime", "alibaba-qwen-audio3"])
         );
         assert_eq!(
+            response["result"]["choices"]["asr.alibaba_audio3.endpoint_mode"],
+            json!(["regional", "custom"])
+        );
+        assert_eq!(
+            response["result"]["choices"]["asr.alibaba_audio3.region"],
+            json!(["beijing", "singapore"])
+        );
+        assert_eq!(
             response["result"]["choices"]["asr.alibaba_audio3.recognition_preset"],
             json!(["standard", "low-latency-dictation", "long-form", "custom"])
         );
@@ -822,6 +832,9 @@ mod tests {
             response["result"]["config"]["asr"]["alibaba_audio3"],
             json!({
                 "experimental_enabled": false,
+                "endpoint_mode": "regional",
+                "region": "beijing",
+                "workspace_id": "",
                 "endpoint": "wss://dashscope.aliyuncs.com/api-ws/v1/inference",
                 "model": "qwen-audio-3.0-asr-flash-streaming",
                 "language_hints_enabled": false,
@@ -841,6 +854,79 @@ mod tests {
     }
 
     #[test]
+    fn settings_get_applies_presence_aware_audio3_endpoint_migration() {
+        for (streaming, native, workspace_id, mode, region) in [
+            (
+                "wss://dashscope-intl.aliyuncs.com/api-ws/v1/inference",
+                "https://dashscope-intl.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation",
+                "legacy-regional-workspace",
+                "regional",
+                "singapore",
+            ),
+            (
+                "wss://proxy.example/custom?opaque=one",
+                "https://proxy.example/custom?opaque=two",
+                "dormant-custom-workspace",
+                "custom",
+                "beijing",
+            ),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let store = ConfigStore::new(temp.path().join("config.toml"));
+            let source = toml::to_string_pretty(&Config::default())
+                .unwrap()
+                .replace(
+                    "endpoint_mode = \"regional\"\nregion = \"beijing\"\n",
+                    "",
+                )
+                .replace("workspace_id = \"\"", &format!("workspace_id = \"{workspace_id}\""))
+                .replace(
+                    "wss://dashscope.aliyuncs.com/api-ws/v1/inference",
+                    streaming,
+                )
+                .replace(
+                    "https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation",
+                    native,
+                );
+            fs::write(store.path(), source).unwrap();
+
+            let get = json!({"version": 1, "id": 37, "method": "settings.get", "params": {}});
+            let response: Value =
+                serde_json::from_slice(&handle_line(get.to_string().as_bytes(), &store)).unwrap();
+            assert_eq!(response["ok"], true);
+            let audio3 = &response["result"]["config"]["asr"]["alibaba_audio3"];
+            assert_eq!(audio3["endpoint_mode"], mode);
+            assert_eq!(audio3["region"], region);
+            assert_eq!(audio3["workspace_id"], workspace_id);
+            assert_eq!(audio3["endpoint"], streaming);
+            assert_eq!(audio3["native_endpoint"], native);
+
+            let save = json!({
+                "version": 1,
+                "id": 38,
+                "method": "settings.save",
+                "params": {
+                    "revision": response["result"]["revision"],
+                    "config": response["result"]["config"],
+                    "credentials": {},
+                    "restart": false
+                }
+            });
+            let saved: Value =
+                serde_json::from_slice(&handle_line(save.to_string().as_bytes(), &store)).unwrap();
+            assert_eq!(saved["ok"], true);
+            assert_eq!(
+                saved["result"]["config"]["asr"]["alibaba_audio3"]["workspace_id"],
+                workspace_id
+            );
+            assert_eq!(
+                store.load().unwrap().config.asr.alibaba_audio3.workspace_id,
+                workspace_id
+            );
+        }
+    }
+
+    #[test]
     fn audio3_save_round_trip_requires_and_preserves_explicit_gate() {
         let temp = tempfile::tempdir().unwrap();
         let store = ConfigStore::new(temp.path().join("config.toml"));
@@ -849,7 +935,10 @@ mod tests {
         config["asr"]["provider"] = json!("alibaba-qwen-audio3");
         config["asr"]["alibaba_audio3"] = json!({
             "experimental_enabled": true,
-            "endpoint": "wss://audio3.example.test/stream",
+            "endpoint_mode": "custom",
+            "region": "singapore",
+            "workspace_id": "dormant-workspace",
+            "endpoint": "wss://audio3.example.test/stream?opaque=one",
             "model": "audio3-stream-test",
             "language_hints_enabled": true,
             "heartbeat_enabled": true,
@@ -862,7 +951,7 @@ mod tests {
                 {"term": "Voice Input", "weight": 5},
                 {"term": "语音输入", "weight": 50}
             ],
-            "native_endpoint": "https://audio3.example.test/native",
+            "native_endpoint": "https://audio3.example.test/native?opaque=two",
             "native_model": "audio3-native-test",
             "native_final_pass_mode": "adaptive",
             "native_timeout_ms": 42_000
@@ -896,6 +985,33 @@ mod tests {
             crate::config::AsrProvider::AlibabaQwenAudio3
         );
         assert!(saved.asr.alibaba_audio3.experimental_enabled);
+        assert_eq!(
+            saved.asr.alibaba_audio3.endpoint_mode,
+            crate::config::Audio3EndpointMode::Custom
+        );
+        assert_eq!(
+            saved.asr.alibaba_audio3.region,
+            crate::config::Audio3Region::Singapore
+        );
+        assert_eq!(saved.asr.alibaba_audio3.workspace_id, "dormant-workspace");
+        assert_eq!(
+            saved
+                .asr
+                .alibaba_audio3
+                .resolve_endpoints()
+                .unwrap()
+                .streaming(),
+            "wss://audio3.example.test/stream?opaque=one"
+        );
+        assert_eq!(
+            saved
+                .asr
+                .alibaba_audio3
+                .resolve_endpoints()
+                .unwrap()
+                .native(),
+            "https://audio3.example.test/native?opaque=two"
+        );
         assert!(saved.asr.alibaba_audio3.language_hints_enabled);
         assert!(saved.asr.alibaba_audio3.heartbeat_enabled);
         assert_eq!(
@@ -912,6 +1028,61 @@ mod tests {
             crate::config::NativeFinalPassMode::Adaptive
         );
         assert_eq!(saved.asr.alibaba_audio3.native_timeout_ms, 42_000);
+    }
+
+    #[test]
+    fn regional_audio3_settings_round_trip_preserves_workspace_and_dormant_urls() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = ConfigStore::new(temp.path().join("config.toml"));
+        let loaded = store.load().unwrap();
+        let mut config = serde_json::to_value(&loaded.config).unwrap();
+        config["asr"]["provider"] = json!("alibaba-qwen-audio3");
+        config["asr"]["alibaba_audio3"]["experimental_enabled"] = json!(true);
+        config["asr"]["alibaba_audio3"]["endpoint_mode"] = json!("regional");
+        config["asr"]["alibaba_audio3"]["region"] = json!("singapore");
+        config["asr"]["alibaba_audio3"]["workspace_id"] = json!("workspace-9");
+        config["asr"]["alibaba_audio3"]["endpoint"] = json!("dormant streaming bytes");
+        config["asr"]["alibaba_audio3"]["native_endpoint"] = json!("dormant native bytes");
+        let save = json!({
+            "version": 1,
+            "id": 35,
+            "method": "settings.save",
+            "params": {
+                "revision": loaded.revision,
+                "config": config,
+                "credentials": {},
+                "restart": false
+            }
+        });
+        let saved: Value =
+            serde_json::from_slice(&handle_line(save.to_string().as_bytes(), &store)).unwrap();
+        assert_eq!(saved["ok"], true);
+        assert_eq!(
+            saved["result"]["config"]["asr"]["alibaba_audio3"]["region"],
+            "singapore"
+        );
+        assert_eq!(
+            saved["result"]["config"]["asr"]["alibaba_audio3"]["workspace_id"],
+            "workspace-9"
+        );
+        assert_eq!(
+            saved["result"]["config"]["asr"]["alibaba_audio3"]["endpoint"],
+            "dormant streaming bytes"
+        );
+
+        let get = json!({"version": 1, "id": 36, "method": "settings.get", "params": {}});
+        let fetched: Value =
+            serde_json::from_slice(&handle_line(get.to_string().as_bytes(), &store)).unwrap();
+        assert_eq!(fetched["ok"], true);
+        assert_eq!(
+            fetched["result"]["config"]["asr"]["alibaba_audio3"],
+            saved["result"]["config"]["asr"]["alibaba_audio3"]
+        );
+        let loaded = store.load().unwrap().config.asr.alibaba_audio3;
+        assert_eq!(
+            loaded.resolve_endpoints().unwrap().native(),
+            "https://workspace-9.ap-southeast-1.maas.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation"
+        );
     }
 
     #[test]

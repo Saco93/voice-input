@@ -31,7 +31,10 @@ use crate::{
         ASR_CONTROL_QUEUE_CAPACITY, AsrControl, AsrEvent, AsrSessionHandle, AudioSpec,
         TimestampDiagnosticsDelta,
     },
-    config::{Audio3VocabularyTerm, Config, EffectiveAudio3RecognitionControls, Language},
+    config::{
+        AlibabaAudio3Config, Audio3VocabularyTerm, Config, EffectiveAudio3RecognitionControls,
+        Language,
+    },
     diagnostics::{FailureKind, ProviderErrorCode},
 };
 
@@ -131,7 +134,7 @@ fn run_session(
     // Preserve the existing startup budget: connection establishment consumes
     // time from the same deadline as the task-started wait.
     let connect_deadline = clock.deadline_after(connect_timeout);
-    let mut socket = open_socket(&audio3.endpoint, &audio3.api_key, connect_timeout)?;
+    let mut socket = open_socket(audio3, &audio3.api_key, connect_timeout)?;
     configure_socket(socket.get_mut())?;
     run_established_socket(
         &mut socket,
@@ -394,8 +397,12 @@ fn report_task_failure(
     bail!("Qwen-Audio-3 streaming ASR failed ({})", kind.as_str())
 }
 
-fn open_socket(endpoint: &str, api_key: &str, timeout: Duration) -> Result<Audio3Socket> {
-    let request = websocket_request(endpoint, api_key)?;
+fn open_socket(
+    audio3: &AlibabaAudio3Config,
+    api_key: &str,
+    timeout: Duration,
+) -> Result<Audio3Socket> {
+    let request = websocket_request_for_config(audio3, api_key)?;
     let websocket_config = WebSocketConfig {
         max_message_size: Some(MAX_SERVER_MESSAGE_BYTES),
         max_frame_size: Some(MAX_SERVER_MESSAGE_BYTES),
@@ -405,14 +412,24 @@ fn open_socket(endpoint: &str, api_key: &str, timeout: Duration) -> Result<Audio
     Ok(socket)
 }
 
+fn websocket_request_for_config(
+    audio3: &AlibabaAudio3Config,
+    api_key: &str,
+) -> Result<tungstenite::http::Request<()>> {
+    let endpoints = audio3
+        .resolve_endpoints()
+        .map_err(|_| anyhow!("failed to resolve Qwen-Audio-3 routing"))?;
+    websocket_request(endpoints.streaming(), api_key)
+}
+
 fn websocket_request(endpoint: &str, api_key: &str) -> Result<tungstenite::http::Request<()>> {
     let mut request = endpoint
         .into_client_request()
-        .context("failed to build Qwen-Audio-3 websocket request")?;
+        .map_err(|_| anyhow!("failed to build Qwen-Audio-3 websocket request"))?;
     request.headers_mut().insert(
         AUTHORIZATION,
         HeaderValue::from_str(&format!("Bearer {}", api_key.trim()))
-            .context("Alibaba API key contains an invalid header value")?,
+            .map_err(|_| anyhow!("Alibaba API key contains an invalid header value"))?,
     );
     Ok(request)
 }
@@ -440,22 +457,32 @@ fn connect_with_timeout(
     });
     let address = (host, port)
         .to_socket_addrs()
-        .context("failed to resolve Qwen-Audio-3 endpoint")?
+        .map_err(|_| anyhow!("failed to resolve Qwen-Audio-3 endpoint"))?
         .next()
         .ok_or_else(|| anyhow!("Qwen-Audio-3 endpoint resolved to no addresses"))?;
     let stream = TcpStream::connect_timeout(&address, timeout)
-        .context("failed to connect to Qwen-Audio-3 endpoint")?;
+        .map_err(|_| anyhow!("failed to connect to Qwen-Audio-3 endpoint"))?;
     stream.set_nodelay(true).ok();
-    stream.set_read_timeout(Some(timeout))?;
-    stream.set_write_timeout(Some(timeout))?;
+    stream
+        .set_read_timeout(Some(timeout))
+        .map_err(|_| anyhow!("failed to configure Qwen-Audio-3 websocket transport"))?;
+    stream
+        .set_write_timeout(Some(timeout))
+        .map_err(|_| anyhow!("failed to configure Qwen-Audio-3 websocket transport"))?;
 
     match client_tls_with_config(request, stream, Some(websocket_config), None) {
         Ok(value) => Ok(value),
-        Err(tungstenite::HandshakeError::Failure(error)) => Err(error.into()),
+        Err(tungstenite::HandshakeError::Failure(error)) => {
+            Err(sanitize_websocket_handshake_failure(error))
+        }
         Err(tungstenite::HandshakeError::Interrupted(_)) => {
             bail!("unexpected interrupted Qwen-Audio-3 websocket handshake")
         }
     }
+}
+
+fn sanitize_websocket_handshake_failure<E>(_error: E) -> anyhow::Error {
+    anyhow!("Qwen-Audio-3 websocket handshake failed")
 }
 
 fn configure_socket(stream: &mut MaybeTlsStream<TcpStream>) -> Result<()> {
@@ -1505,8 +1532,8 @@ mod tests {
     use crate::{
         backend::AsrEvent,
         config::{
-            AlibabaAudio3Config, Audio3RecognitionPreset, Audio3VocabularyTerm,
-            EffectiveAudio3RecognitionControls, Language,
+            AlibabaAudio3Config, Audio3EndpointMode, Audio3RecognitionPreset, Audio3Region,
+            Audio3VocabularyTerm, EffectiveAudio3RecognitionControls, Language,
         },
         diagnostics::{FailureKind, ProviderErrorCode},
     };
@@ -1516,7 +1543,8 @@ mod tests {
         DeadlineClock, EstablishedSession, MAX_SERVER_MESSAGE_BYTES, MAX_TIMED_UNITS_PER_RESULT,
         ServerEvent, SocketIo, SocketResult, TimestampDiagnosticsDelta, TranscriptAssembler,
         finish_task_envelope, new_task_id, parse_server_event, pcm16_le_bytes, report_task_failure,
-        run_established_socket, run_task_envelope, websocket_request,
+        run_established_socket, run_task_envelope, sanitize_websocket_handshake_failure,
+        websocket_request, websocket_request_for_config,
     };
 
     const TASK_ID: &str = "0123456789abcdef0123456789abcdef";
@@ -2019,6 +2047,56 @@ mod tests {
             request.headers()[tungstenite::http::header::AUTHORIZATION],
             "Bearer test-key"
         );
+        assert!(request.headers().get("X-DashScope-WorkSpace").is_none());
+    }
+
+    #[test]
+    fn production_websocket_request_seam_uses_resolved_target_without_workspace_header() {
+        let mut audio3 = AlibabaAudio3Config {
+            region: Audio3Region::Singapore,
+            workspace_id: "workspace-7".into(),
+            ..AlibabaAudio3Config::default()
+        };
+        let request = websocket_request_for_config(&audio3, "test-key").unwrap();
+        assert_eq!(
+            request.uri().to_string(),
+            "wss://workspace-7.ap-southeast-1.maas.aliyuncs.com/api-ws/v1/inference"
+        );
+        assert!(request.headers().get("X-DashScope-WorkSpace").is_none());
+
+        audio3.endpoint_mode = Audio3EndpointMode::Custom;
+        audio3.workspace_id = "dormant-invalid-workspace".into();
+        audio3.endpoint = "ws://127.0.0.1:1234/custom?opaque=a%2Fb&x=1".into();
+        let custom = websocket_request_for_config(&audio3, "test-key").unwrap();
+        assert_eq!(
+            custom.uri().to_string(),
+            "ws://127.0.0.1:1234/custom?opaque=a%2Fb&x=1"
+        );
+        assert!(custom.headers().get("X-DashScope-WorkSpace").is_none());
+
+        const ENDPOINT_SENTINEL: &str = "private endpoint construction sentinel";
+        audio3.endpoint = ENDPOINT_SENTINEL.into();
+        let error = websocket_request_for_config(&audio3, "test-key")
+            .expect_err("malformed custom target must fail generically");
+        assert_eq!(
+            error.to_string(),
+            "failed to build Qwen-Audio-3 websocket request"
+        );
+        assert!(!format!("{error:#}").contains(ENDPOINT_SENTINEL));
+    }
+
+    #[test]
+    fn websocket_handshake_failure_discards_raw_error_and_source_chain() {
+        const SENTINEL: &str = "private TLS certificate host and workspace sentinel";
+        let error = sanitize_websocket_handshake_failure(io::Error::other(SENTINEL));
+
+        assert_eq!(error.to_string(), "Qwen-Audio-3 websocket handshake failed");
+        assert_eq!(
+            format!("{error:#}"),
+            "Qwen-Audio-3 websocket handshake failed"
+        );
+        assert!(!error.to_string().contains(SENTINEL));
+        assert!(!format!("{error:#}").contains(SENTINEL));
     }
 
     #[test]

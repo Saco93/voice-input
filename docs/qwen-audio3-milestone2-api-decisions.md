@@ -119,6 +119,20 @@ The legacy WebSocket documentation also describes an optional `X-DashScope-WorkS
 
 API keys are region-specific and workspace-scoped. A key cannot be assumed to work across regions or workspaces. Voice Input will retain one encrypted Alibaba credential, warn that changing region/workspace may require replacing it, and never probe another region automatically.
 
+### Deterministic implementation state
+
+Milestone 2 item 7 is implemented and validated locally without network access:
+
+- kebab-case `regional`/`custom` endpoint modes and `beijing`/`singapore` regions use Regional Beijing for new configurations;
+- presence-aware migration recognizes only the two exact canonical legacy pairs and preserves any explicitly configured Workspace ID exactly (absent or empty stays empty); all mixed, workspace-host, loopback, proxy, custom path/port/query, and otherwise changed pairs remain Custom byte-for-byte, without inferring a Workspace ID;
+- one pure typed resolver selects reviewed constants for both Streaming and Native, uses legacy hosts for empty workspaces, and constructs the reviewed regional workspace host only after value-free DNS-label transport validation;
+- Custom mode ignores its dormant Workspace ID, while Regional mode ignores and preserves dormant custom URLs; neither mode sends a workspace header, query field, or request-body field;
+- production WebSocket and Native requests use the resolved target, while authorization, request bodies, response sanitization, redirect behavior, models, and controls remain unchanged;
+- normal Settings displays mode, region, optional Workspace ID, and the credential-scope warning without displaying a derived URL; raw URLs are shown only for Custom routing or a routed validation error;
+- schema 4 diagnostics add only endpoint mode, region, and a Workspace-ID-configured boolean. They never include the Workspace ID, endpoint/host, model, or key, and schema-3/schema-4 compatibility defaults remain readable.
+
+Authorized live validation of the specific Beijing/Singapore regional and workspace routes remains pending. This local implementation does not establish Singapore feature parity or successful live routing.
+
 Official pages do not provide a complete per-region matrix for language hints, heartbeat, vocabulary, sentence controls, thresholds, and timestamp behavior. The shared API reference documents these controls without a regional exclusion. Each model, field combination, and scenario used in Singapore still requires its own authorized live validation; the result will not be presented as complete feature parity.
 
 ## Implementation and live-test gates

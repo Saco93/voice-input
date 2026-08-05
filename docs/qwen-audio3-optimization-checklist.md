@@ -92,10 +92,11 @@ Provider-facing decisions, confirmed fields, endpoint constants, ambiguities, an
 
 ### 7. Workspace regional endpoints
 
-- [ ] Add explicit Beijing/Singapore region selection and derive official workspace endpoints safely.
-- [ ] Validate workspace identifiers and regional credential expectations without logging endpoint or credential values.
-- [ ] Preserve custom endpoints for testing and compatibility.
-- [ ] Document migration from legacy DashScope endpoints.
+- [~] Deterministic implementation, migration, Settings, diagnostics, privacy coverage, and offline validation are complete. Item 7 remains in progress pending authorized live validation of the selected Beijing/Singapore regional and workspace routes; this status does not claim Singapore feature parity or live success.
+- [x] Add explicit Beijing/Singapore region selection and derive official Streaming and Native workspace endpoints from fixed reviewed constants.
+- [x] Validate the optional Workspace ID only as a DNS-label hostname transport constraint and document regional/workspace credential expectations without logging or diagnosing endpoint, host, Workspace ID, model, or credential values.
+- [x] Preserve custom Streaming and Native endpoints byte-for-byte for testing and compatibility; Custom ignores its dormant Workspace ID and sends no workspace header/query/body field.
+- [x] Document presence-aware migration from exact canonical legacy DashScope endpoint pairs while preserving an explicitly configured Workspace ID exactly; an absent or empty value remains empty, and mixed, workspace-host, loopback, proxy, and custom path/port/query pairs remain Custom without Workspace ID inference.
 
 ## Milestone 3 — Context, resilience, and separate workflows
 
@@ -128,6 +129,7 @@ Provider-facing decisions, confirmed fields, endpoint constants, ambiguities, an
 | 2026-08-05 | Milestone 2 Phase 0 API verification | Completed; implementation not started | Confirmed the Audio3 VAD field schema, timestamp paths and units, Beijing/Singapore endpoint matrix, hostname-based workspace routing, and region/workspace credential scope from official documentation. Separate speech/noise thresholds and guaranteed character timestamps are unsupported. Identity-dependent timestamp deduplication remains blocked without an official revision contract or a revision-safe algorithm; finite captures are observational only. Workspace ID has no published business grammar, so only hostname transport safety can be validated. Decisions and live-test gates are in `docs/qwen-audio3-milestone2-api-decisions.md`. |
 | 2026-08-05 | Milestone 2 item 5 deterministic implementation | In progress; live evaluation pending | Added presence-aware preset migration, pure effective-control resolution, universal finite-threshold validation for Settings JSON serialization, active-custom range/combination validation, exact streaming request omission behavior, custom-only advanced Settings controls, effective schema-3 diagnostic summaries, deterministic migration/request/settings/privacy tests, sample configuration, and bilingual documentation. Standard remains unchanged and is the default. Low-latency and long-form values remain evaluation candidates pending authorized pause/noise testing. |
 | 2026-08-05 | Milestone 2 item 6 bounded timestamp implementation | Parsing and aggregate diagnostics completed locally; identity use blocked; live observation pending | Added borrowed typed Audio3 sentence/timed-unit parsing with a 512-candidate per-result bound, a 1 MiB WebSocket transport cap, required-bound and event-local range validation, per-malformed-result rejection counting, event-latest overwrite semantics, saturating aggregate-only telemetry, best-effort daemon persistence, and diagnostics schema 4 with schema-3 compatibility. Transcript event and authoritative task-finished assembly remain unchanged. Timed-unit text, punctuation and sentence IDs are discarded before telemetry. No live provider event-shape observation or evaluation was performed. |
+| 2026-08-05 | Milestone 2 item 7 deterministic regional/workspace routing | Implemented and validated locally; authorized live route validation pending | Added presence-aware exact-pair migration, typed Regional/Custom and Beijing/Singapore configuration, fixed-constant Streaming/Native endpoint resolution, hostname-only workspace routing with value-free DNS-label transport errors, Custom byte preservation, active-provider isolation, normal Settings controls and credential warnings, schema-4-safe routing summaries, bilingual documentation, and offline resolver/request/privacy tests. No provider request was made; Singapore feature parity and live regional/workspace success are not claimed. |
 
 ## Official references
 

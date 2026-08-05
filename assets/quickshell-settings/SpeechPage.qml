@@ -153,7 +153,7 @@ SettingsPage {
                 theme: root.theme
                 label: "Replace Alibaba API key"
                 value: root.controller.alibabaCredential
-                help: root.controller.credentialLabel("alibaba-api-key") + ". Blank keeps it unchanged."
+                help: root.controller.credentialLabel("alibaba-api-key") + ". Blank keeps it unchanged. API keys are region- and workspace-scoped; Voice Input never probes another route or migrates a key automatically."
                 password: true
                 placeholderText: "Enter a new credential"
                 error: root.controller.errorFor("credentials.alibaba-api-key")
@@ -214,6 +214,49 @@ SettingsPage {
                 enabled: !root.controller.busy
                 onToggled: (checked) => {
                     return root.controller.setValue("asr.alibaba_audio3.experimental_enabled", checked);
+                }
+            }
+
+            SettingCombo {
+                theme: root.theme
+                label: "Endpoint mode"
+                value: root.controller.value("asr.alibaba_audio3.endpoint_mode", "regional")
+                labels: ["Regional", "Custom"]
+                values: ["regional", "custom"]
+                help: "Regional routing uses reviewed Alibaba hosts. Custom keeps the raw streaming and native endpoints in Advanced settings."
+                error: root.controller.errorFor("asr.alibaba_audio3.endpoint_mode")
+                enabled: !root.controller.busy
+                onSelected: (value) => {
+                    return root.controller.setValue("asr.alibaba_audio3.endpoint_mode", value);
+                }
+            }
+
+            SettingCombo {
+                visible: root.controller.value("asr.alibaba_audio3.endpoint_mode", "regional") === "regional" || root.controller.errorFor("asr.alibaba_audio3.region").length > 0
+                theme: root.theme
+                label: "Region"
+                value: root.controller.value("asr.alibaba_audio3.region", "beijing")
+                labels: ["Beijing", "Singapore"]
+                values: ["beijing", "singapore"]
+                help: "Select the region that owns the configured Alibaba API key. Singapore controls still require scenario-specific live validation."
+                error: root.controller.errorFor("asr.alibaba_audio3.region")
+                enabled: !root.controller.busy
+                onSelected: (value) => {
+                    return root.controller.setValue("asr.alibaba_audio3.region", value);
+                }
+            }
+
+            SettingTextField {
+                visible: root.controller.value("asr.alibaba_audio3.endpoint_mode", "regional") === "regional" || root.controller.errorFor("asr.alibaba_audio3.workspace_id").length > 0
+                theme: root.theme
+                label: "Workspace ID"
+                value: root.controller.value("asr.alibaba_audio3.workspace_id", "")
+                placeholderText: "Optional"
+                help: "Optional. Empty uses the regional legacy route. A nonempty value must satisfy the DNS-label transport constraint (1–63 ASCII letters, digits, or hyphens; no leading or trailing hyphen). This is not provider business-ID validation. API keys are region- and workspace-scoped; Voice Input never probes or migrates them."
+                error: root.controller.errorFor("asr.alibaba_audio3.workspace_id")
+                enabled: !root.controller.busy
+                onEdited: (value) => {
+                    return root.controller.setValue("asr.alibaba_audio3.workspace_id", value);
                 }
             }
 
@@ -484,6 +527,7 @@ SettingsPage {
                 showDivider: audio3NativeCard.visible
 
                 SettingTextField {
+                    visible: root.controller.value("asr.alibaba_audio3.endpoint_mode", "regional") === "custom" || root.controller.errorFor("asr.alibaba_audio3.endpoint").length > 0
                     theme: root.theme
                     label: "Streaming endpoint"
                     value: root.controller.value("asr.alibaba_audio3.endpoint", "")
@@ -587,6 +631,7 @@ SettingsPage {
                 showDivider: false
 
                 SettingTextField {
+                    visible: root.controller.value("asr.alibaba_audio3.endpoint_mode", "regional") === "custom" || root.controller.errorFor("asr.alibaba_audio3.native_endpoint").length > 0
                     theme: root.theme
                     label: "Native endpoint"
                     value: root.controller.value("asr.alibaba_audio3.native_endpoint", "")
