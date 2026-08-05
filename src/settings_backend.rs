@@ -336,6 +336,7 @@ fn settings_get(store: &ConfigStore) -> std::result::Result<Value, ProtocolError
             "asr.provider": ["local-cli", "alibaba-qwen-realtime", "alibaba-qwen-audio3"],
             "asr.language": ["english", "simplified-chinese", "traditional-chinese", "japanese", "korean"],
             "asr.alibaba.turn_mode": ["server-vad", "manual"],
+            "asr.alibaba_audio3.recognition_preset": ["standard", "low-latency-dictation", "long-form", "custom"],
             "asr.alibaba_audio3.native_final_pass_mode": ["streaming-only", "adaptive", "always"],
             "output.mode": ["type", "clipboard", "paste"],
             "hud.position": ["bottom-center", "bottom-left", "bottom-right"]
@@ -675,6 +676,8 @@ fn drain_line(reader: &mut impl BufRead) -> std::result::Result<(), LineError> {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use serde_json::{Value, json};
 
     use super::{
@@ -808,6 +811,10 @@ mod tests {
             json!(["local-cli", "alibaba-qwen-realtime", "alibaba-qwen-audio3"])
         );
         assert_eq!(
+            response["result"]["choices"]["asr.alibaba_audio3.recognition_preset"],
+            json!(["standard", "low-latency-dictation", "long-form", "custom"])
+        );
+        assert_eq!(
             response["result"]["choices"]["asr.alibaba_audio3.native_final_pass_mode"],
             json!(["streaming-only", "adaptive", "always"])
         );
@@ -819,8 +826,10 @@ mod tests {
                 "model": "qwen-audio-3.0-asr-flash-streaming",
                 "language_hints_enabled": false,
                 "heartbeat_enabled": false,
+                "recognition_preset": "standard",
                 "max_sentence_silence_ms": 800,
                 "semantic_punctuation_enabled": false,
+                "multi_threshold_mode_enabled": false,
                 "vocabulary": [],
                 "native_endpoint": "https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation",
                 "native_model": "qwen-audio-3.0-asr-flash",
@@ -844,8 +853,11 @@ mod tests {
             "model": "audio3-stream-test",
             "language_hints_enabled": true,
             "heartbeat_enabled": true,
+            "recognition_preset": "custom",
             "max_sentence_silence_ms": 200,
-            "semantic_punctuation_enabled": true,
+            "semantic_punctuation_enabled": false,
+            "multi_threshold_mode_enabled": true,
+            "speech_noise_threshold": -0.25,
             "vocabulary": [
                 {"term": "Voice Input", "weight": 5},
                 {"term": "语音输入", "weight": 50}
@@ -886,14 +898,113 @@ mod tests {
         assert!(saved.asr.alibaba_audio3.experimental_enabled);
         assert!(saved.asr.alibaba_audio3.language_hints_enabled);
         assert!(saved.asr.alibaba_audio3.heartbeat_enabled);
+        assert_eq!(
+            saved.asr.alibaba_audio3.recognition_preset,
+            crate::config::Audio3RecognitionPreset::Custom
+        );
         assert_eq!(saved.asr.alibaba_audio3.max_sentence_silence_ms, 200);
-        assert!(saved.asr.alibaba_audio3.semantic_punctuation_enabled);
+        assert!(!saved.asr.alibaba_audio3.semantic_punctuation_enabled);
+        assert!(saved.asr.alibaba_audio3.multi_threshold_mode_enabled);
+        assert_eq!(saved.asr.alibaba_audio3.speech_noise_threshold, Some(-0.25));
         assert_eq!(saved.asr.alibaba_audio3.vocabulary.len(), 2);
         assert_eq!(
             saved.asr.alibaba_audio3.native_final_pass_mode,
             crate::config::NativeFinalPassMode::Adaptive
         );
         assert_eq!(saved.asr.alibaba_audio3.native_timeout_ms, 42_000);
+    }
+
+    #[test]
+    fn named_audio3_preset_settings_round_trip_preserves_finite_dormant_threshold() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = ConfigStore::new(temp.path().join("config.toml"));
+        let loaded = store.load().unwrap();
+        let mut config = serde_json::to_value(&loaded.config).unwrap();
+        config["asr"]["provider"] = json!("alibaba-qwen-audio3");
+        config["asr"]["alibaba_audio3"]["experimental_enabled"] = json!(true);
+        config["asr"]["alibaba_audio3"]["recognition_preset"] = json!("standard");
+        config["asr"]["alibaba_audio3"]["max_sentence_silence_ms"] = json!(1);
+        config["asr"]["alibaba_audio3"]["semantic_punctuation_enabled"] = json!(true);
+        config["asr"]["alibaba_audio3"]["multi_threshold_mode_enabled"] = json!(true);
+        config["asr"]["alibaba_audio3"]["speech_noise_threshold"] = json!(1.5);
+        let save = json!({
+            "version": 1,
+            "id": 32,
+            "method": "settings.save",
+            "params": {
+                "revision": loaded.revision,
+                "config": config,
+                "credentials": {},
+                "restart": false
+            }
+        });
+        let saved: Value =
+            serde_json::from_slice(&handle_line(save.to_string().as_bytes(), &store)).unwrap();
+
+        assert_eq!(saved["ok"], true);
+        assert_eq!(
+            saved["result"]["config"]["asr"]["alibaba_audio3"]["speech_noise_threshold"],
+            1.5
+        );
+        let loaded = store.load().unwrap();
+        assert_eq!(
+            loaded.config.asr.alibaba_audio3.speech_noise_threshold,
+            Some(1.5)
+        );
+        assert_eq!(loaded.config.asr.alibaba_audio3.max_sentence_silence_ms, 1);
+        assert!(
+            loaded
+                .config
+                .asr
+                .alibaba_audio3
+                .semantic_punctuation_enabled
+        );
+        assert!(
+            loaded
+                .config
+                .asr
+                .alibaba_audio3
+                .multi_threshold_mode_enabled
+        );
+        assert_eq!(
+            loaded.config.asr.alibaba_audio3.recognition_preset,
+            crate::config::Audio3RecognitionPreset::Standard
+        );
+
+        let get = json!({"version": 1, "id": 33, "method": "settings.get", "params": {}});
+        let fetched: Value =
+            serde_json::from_slice(&handle_line(get.to_string().as_bytes(), &store)).unwrap();
+        assert_eq!(fetched["ok"], true);
+        assert_eq!(
+            fetched["result"]["config"]["asr"]["alibaba_audio3"]["speech_noise_threshold"],
+            1.5
+        );
+    }
+
+    #[test]
+    fn settings_get_rejects_nonfinite_threshold_before_json_serialization() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = ConfigStore::new(temp.path().join("config.toml"));
+        let mut config = Config::default();
+        config.asr.alibaba_audio3.recognition_preset =
+            crate::config::Audio3RecognitionPreset::Standard;
+        config.asr.alibaba_audio3.speech_noise_threshold = Some(f32::NAN);
+        assert_eq!(
+            config
+                .validate()
+                .expect_err("nonfinite raw threshold must be rejected")
+                .fields["asr.alibaba_audio3.speech_noise_threshold"],
+            "must be finite"
+        );
+        fs::write(store.path(), toml::to_string_pretty(&config).unwrap()).unwrap();
+
+        let get = json!({"version": 1, "id": 34, "method": "settings.get", "params": {}});
+        let response: Value =
+            serde_json::from_slice(&handle_line(get.to_string().as_bytes(), &store)).unwrap();
+        assert_eq!(response["ok"], false);
+        assert_eq!(response["error"]["code"], "config_read_failed");
+        assert!(response.get("result").is_none());
+        assert!(!response.to_string().contains("speech_noise_threshold"));
     }
 
     #[test]

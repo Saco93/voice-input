@@ -106,13 +106,66 @@ pub struct AlibabaAudio3Config {
     pub model: String,
     pub language_hints_enabled: bool,
     pub heartbeat_enabled: bool,
+    pub recognition_preset: Audio3RecognitionPreset,
     pub max_sentence_silence_ms: u32,
     pub semantic_punctuation_enabled: bool,
+    pub multi_threshold_mode_enabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub speech_noise_threshold: Option<f32>,
     pub vocabulary: Vec<Audio3VocabularyTerm>,
     pub native_endpoint: String,
     pub native_model: String,
     pub native_final_pass_mode: NativeFinalPassMode,
     pub native_timeout_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum Audio3RecognitionPreset {
+    #[default]
+    Standard,
+    LowLatencyDictation,
+    LongForm,
+    Custom,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct EffectiveAudio3RecognitionControls {
+    pub max_sentence_silence_ms: u32,
+    pub semantic_punctuation_enabled: bool,
+    pub multi_threshold_mode_enabled: bool,
+    pub speech_noise_threshold: Option<f32>,
+}
+
+impl AlibabaAudio3Config {
+    pub fn effective_recognition_controls(&self) -> EffectiveAudio3RecognitionControls {
+        match self.recognition_preset {
+            Audio3RecognitionPreset::Standard => EffectiveAudio3RecognitionControls {
+                max_sentence_silence_ms: 800,
+                semantic_punctuation_enabled: false,
+                multi_threshold_mode_enabled: false,
+                speech_noise_threshold: None,
+            },
+            Audio3RecognitionPreset::LowLatencyDictation => EffectiveAudio3RecognitionControls {
+                max_sentence_silence_ms: 400,
+                semantic_punctuation_enabled: false,
+                multi_threshold_mode_enabled: true,
+                speech_noise_threshold: None,
+            },
+            Audio3RecognitionPreset::LongForm => EffectiveAudio3RecognitionControls {
+                max_sentence_silence_ms: 1_300,
+                semantic_punctuation_enabled: true,
+                multi_threshold_mode_enabled: false,
+                speech_noise_threshold: None,
+            },
+            Audio3RecognitionPreset::Custom => EffectiveAudio3RecognitionControls {
+                max_sentence_silence_ms: self.max_sentence_silence_ms,
+                semantic_punctuation_enabled: self.semantic_punctuation_enabled,
+                multi_threshold_mode_enabled: self.multi_threshold_mode_enabled,
+                speech_noise_threshold: self.speech_noise_threshold,
+            },
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -143,8 +196,11 @@ struct RawAlibabaAudio3Config {
     model: String,
     language_hints_enabled: bool,
     heartbeat_enabled: bool,
+    recognition_preset: Option<Audio3RecognitionPreset>,
     max_sentence_silence_ms: u32,
     semantic_punctuation_enabled: bool,
+    multi_threshold_mode_enabled: Option<bool>,
+    speech_noise_threshold: Option<f32>,
     vocabulary: Vec<Audio3VocabularyTerm>,
     native_endpoint: String,
     native_model: String,
@@ -163,8 +219,11 @@ impl Default for RawAlibabaAudio3Config {
             model: defaults.model,
             language_hints_enabled: defaults.language_hints_enabled,
             heartbeat_enabled: defaults.heartbeat_enabled,
+            recognition_preset: None,
             max_sentence_silence_ms: defaults.max_sentence_silence_ms,
             semantic_punctuation_enabled: defaults.semantic_punctuation_enabled,
+            multi_threshold_mode_enabled: None,
+            speech_noise_threshold: None,
             vocabulary: defaults.vocabulary,
             native_endpoint: defaults.native_endpoint,
             native_model: defaults.native_model,
@@ -198,6 +257,18 @@ impl<'de> Deserialize<'de> for AlibabaAudio3Config {
             (None, Some(mode)) => mode,
             (None, None) => NativeFinalPassMode::StreamingOnly,
         };
+        let multi_threshold_mode_enabled = raw.multi_threshold_mode_enabled.unwrap_or(false);
+        let recognition_preset = raw.recognition_preset.unwrap_or_else(|| {
+            if raw.max_sentence_silence_ms == 800
+                && !raw.semantic_punctuation_enabled
+                && !multi_threshold_mode_enabled
+                && raw.speech_noise_threshold.is_none()
+            {
+                Audio3RecognitionPreset::Standard
+            } else {
+                Audio3RecognitionPreset::Custom
+            }
+        });
         Ok(Self {
             experimental_enabled: raw.experimental_enabled,
             endpoint: raw.endpoint,
@@ -205,8 +276,11 @@ impl<'de> Deserialize<'de> for AlibabaAudio3Config {
             model: raw.model,
             language_hints_enabled: raw.language_hints_enabled,
             heartbeat_enabled: raw.heartbeat_enabled,
+            recognition_preset,
             max_sentence_silence_ms: raw.max_sentence_silence_ms,
             semantic_punctuation_enabled: raw.semantic_punctuation_enabled,
+            multi_threshold_mode_enabled,
+            speech_noise_threshold: raw.speech_noise_threshold,
             vocabulary: raw.vocabulary,
             native_endpoint: raw.native_endpoint,
             native_model: raw.native_model,
@@ -424,8 +498,11 @@ impl Default for Config {
                     model: "qwen-audio-3.0-asr-flash-streaming".into(),
                     language_hints_enabled: false,
                     heartbeat_enabled: false,
+                    recognition_preset: Audio3RecognitionPreset::Standard,
                     max_sentence_silence_ms: 800,
                     semantic_punctuation_enabled: false,
+                    multi_threshold_mode_enabled: false,
+                    speech_noise_threshold: None,
                     vocabulary: Vec::new(),
                     native_endpoint: "https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation".into(),
                     native_model: "qwen-audio-3.0-asr-flash".into(),
@@ -634,6 +711,18 @@ impl Config {
             120_000,
         );
 
+        if self
+            .asr
+            .alibaba_audio3
+            .speech_noise_threshold
+            .is_some_and(|threshold| !threshold.is_finite())
+        {
+            fields.insert(
+                "asr.alibaba_audio3.speech_noise_threshold".into(),
+                "must be finite".into(),
+            );
+        }
+
         if self.asr.provider == AsrProvider::AlibabaQwenAudio3 {
             if !self.asr.alibaba_audio3.experimental_enabled {
                 fields.insert(
@@ -669,13 +758,32 @@ impl Config {
                 512,
                 false,
             );
+            let recognition = self.asr.alibaba_audio3.effective_recognition_controls();
             range(
                 &mut fields,
                 "asr.alibaba_audio3.max_sentence_silence_ms",
-                self.asr.alibaba_audio3.max_sentence_silence_ms,
+                recognition.max_sentence_silence_ms,
                 200,
                 6_000,
             );
+            if let Some(threshold) = recognition.speech_noise_threshold
+                && threshold.is_finite()
+                && !(-1.0..=1.0).contains(&threshold)
+            {
+                fields.insert(
+                    "asr.alibaba_audio3.speech_noise_threshold".into(),
+                    "must be between -1 and 1".into(),
+                );
+            }
+            if self.asr.alibaba_audio3.recognition_preset == Audio3RecognitionPreset::Custom
+                && recognition.semantic_punctuation_enabled
+                && recognition.multi_threshold_mode_enabled
+            {
+                fields.insert(
+                    "asr.alibaba_audio3.multi_threshold_mode_enabled".into(),
+                    "cannot be combined with semantic punctuation in the custom preset".into(),
+                );
+            }
             if let Some(message) = validate_audio3_vocabulary(&self.asr.alibaba_audio3.vocabulary) {
                 fields.insert("asr.alibaba_audio3.vocabulary".into(), message);
             }
@@ -1270,8 +1378,9 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     use super::{
-        AsrProvider, Audio3VocabularyTerm, Config, ConfigStore, HudPosition, Language,
-        MAX_AUDIO3_VOCABULARY_BYTES, NativeFinalPassMode, RevisionConflict,
+        AsrProvider, Audio3RecognitionPreset, Audio3VocabularyTerm, Config, ConfigStore,
+        EffectiveAudio3RecognitionControls, HudPosition, Language, MAX_AUDIO3_VOCABULARY_BYTES,
+        NativeFinalPassMode, RevisionConflict,
     };
 
     #[test]
@@ -1409,8 +1518,23 @@ mod tests {
         );
         assert!(!config.asr.alibaba_audio3.language_hints_enabled);
         assert!(!config.asr.alibaba_audio3.heartbeat_enabled);
+        assert_eq!(
+            config.asr.alibaba_audio3.recognition_preset,
+            Audio3RecognitionPreset::Standard
+        );
         assert_eq!(config.asr.alibaba_audio3.max_sentence_silence_ms, 800);
         assert!(!config.asr.alibaba_audio3.semantic_punctuation_enabled);
+        assert!(!config.asr.alibaba_audio3.multi_threshold_mode_enabled);
+        assert_eq!(config.asr.alibaba_audio3.speech_noise_threshold, None);
+        assert_eq!(
+            config.asr.alibaba_audio3.effective_recognition_controls(),
+            EffectiveAudio3RecognitionControls {
+                max_sentence_silence_ms: 800,
+                semantic_punctuation_enabled: false,
+                multi_threshold_mode_enabled: false,
+                speech_noise_threshold: None,
+            }
+        );
         assert!(config.asr.alibaba_audio3.vocabulary.is_empty());
         assert_eq!(
             config.asr.alibaba_audio3.native_endpoint,
@@ -1454,6 +1578,7 @@ mod tests {
         config.asr.alibaba_audio3.model = "qwen-audio-3.0-asr-flash-streaming".into();
         config.validate().expect("gated provider configuration");
 
+        config.asr.alibaba_audio3.recognition_preset = Audio3RecognitionPreset::Custom;
         for invalid in [199, 6_001] {
             config.asr.alibaba_audio3.max_sentence_silence_ms = invalid;
             let error = config
@@ -1474,6 +1599,95 @@ mod tests {
                 .unwrap()
                 .contains("provider = \"alibaba-qwen-audio3\"")
         );
+    }
+
+    #[test]
+    fn audio3_custom_threshold_and_control_interactions_are_validated_when_active() {
+        let mut config = Config::default();
+        config.asr.provider = AsrProvider::AlibabaQwenAudio3;
+        config.asr.alibaba_audio3.experimental_enabled = true;
+        config.asr.alibaba_audio3.recognition_preset = Audio3RecognitionPreset::Custom;
+
+        for valid in [-1.0, 0.0, 1.0] {
+            config.asr.alibaba_audio3.speech_noise_threshold = Some(valid);
+            config.validate().expect("threshold boundary is valid");
+        }
+        for invalid in [-1.01, 1.01] {
+            config.asr.alibaba_audio3.speech_noise_threshold = Some(invalid);
+            let error = config.validate().expect_err("invalid threshold range");
+            assert_eq!(
+                error.fields["asr.alibaba_audio3.speech_noise_threshold"],
+                "must be between -1 and 1"
+            );
+        }
+
+        config.asr.alibaba_audio3.speech_noise_threshold = None;
+        config.asr.alibaba_audio3.semantic_punctuation_enabled = true;
+        config.asr.alibaba_audio3.multi_threshold_mode_enabled = true;
+        let error = config
+            .validate()
+            .expect_err("custom semantic and multi-threshold controls conflict");
+        let message = &error.fields["asr.alibaba_audio3.multi_threshold_mode_enabled"];
+        assert!(!message.contains("true"));
+        assert!(!message.contains("false"));
+
+        config.asr.alibaba_audio3.recognition_preset = Audio3RecognitionPreset::LongForm;
+        config.asr.alibaba_audio3.max_sentence_silence_ms = 1;
+        config.asr.alibaba_audio3.speech_noise_threshold = Some(1.5);
+        config
+            .validate()
+            .expect("explicit preset overrides finite dormant custom controls");
+    }
+
+    #[test]
+    fn nonfinite_audio3_threshold_is_rejected_universally_with_one_field_error() {
+        for (provider, preset, threshold) in [
+            (
+                AsrProvider::LocalCli,
+                Audio3RecognitionPreset::Standard,
+                f32::NAN,
+            ),
+            (
+                AsrProvider::AlibabaQwenAudio3,
+                Audio3RecognitionPreset::Standard,
+                f32::INFINITY,
+            ),
+            (
+                AsrProvider::AlibabaQwenAudio3,
+                Audio3RecognitionPreset::Custom,
+                f32::NEG_INFINITY,
+            ),
+        ] {
+            let mut config = Config::default();
+            config.asr.provider = provider;
+            config.asr.alibaba_audio3.experimental_enabled = true;
+            config.asr.alibaba_audio3.recognition_preset = preset;
+            config.asr.alibaba_audio3.speech_noise_threshold = Some(threshold);
+
+            let error = config
+                .validate()
+                .expect_err("a configured nonfinite threshold cannot round-trip through JSON");
+            assert_eq!(
+                error.fields,
+                std::collections::BTreeMap::from([(
+                    "asr.alibaba_audio3.speech_noise_threshold".into(),
+                    "must be finite".into(),
+                )])
+            );
+        }
+    }
+
+    #[test]
+    fn inactive_provider_isolates_finite_audio3_range_and_combination_values() {
+        let mut config = Config::default();
+        config.asr.alibaba_audio3.recognition_preset = Audio3RecognitionPreset::Custom;
+        config.asr.alibaba_audio3.max_sentence_silence_ms = 1;
+        config.asr.alibaba_audio3.semantic_punctuation_enabled = true;
+        config.asr.alibaba_audio3.multi_threshold_mode_enabled = true;
+        config.asr.alibaba_audio3.speech_noise_threshold = Some(1.5);
+        config
+            .validate()
+            .expect("inactive Audio3 effective range and combination validation is isolated");
     }
 
     #[test]
@@ -1543,6 +1757,12 @@ model = "legacy-model"
         );
         assert!(!asr.alibaba_audio3.language_hints_enabled);
         assert!(!asr.alibaba_audio3.heartbeat_enabled);
+        assert_eq!(
+            asr.alibaba_audio3.recognition_preset,
+            Audio3RecognitionPreset::Standard
+        );
+        assert!(!asr.alibaba_audio3.multi_threshold_mode_enabled);
+        assert_eq!(asr.alibaba_audio3.speech_noise_threshold, None);
         assert!(asr.alibaba_audio3.vocabulary.is_empty());
         assert_eq!(
             asr.alibaba_audio3.native_final_pass_mode,
@@ -1565,6 +1785,9 @@ native_model = "native-model"
         .expect("pre-milestone Audio3 config");
         assert!(!audio3.language_hints_enabled);
         assert!(!audio3.heartbeat_enabled);
+        assert_eq!(audio3.recognition_preset, Audio3RecognitionPreset::Standard);
+        assert!(!audio3.multi_threshold_mode_enabled);
+        assert_eq!(audio3.speech_noise_threshold, None);
         assert!(audio3.vocabulary.is_empty());
         assert_eq!(
             audio3.native_final_pass_mode,
@@ -1612,7 +1835,140 @@ native_timeout_ms = 20000
             .alibaba_audio3;
         assert!(!audio3.language_hints_enabled);
         assert!(!audio3.heartbeat_enabled);
+        assert_eq!(audio3.recognition_preset, Audio3RecognitionPreset::Standard);
+        assert!(!audio3.multi_threshold_mode_enabled);
+        assert_eq!(audio3.speech_noise_threshold, None);
         assert!(audio3.vocabulary.is_empty());
+    }
+
+    #[test]
+    fn audio3_recognition_presets_resolve_exact_candidate_controls() {
+        let mut audio3 = super::AlibabaAudio3Config::default();
+        for (preset, expected) in [
+            (
+                Audio3RecognitionPreset::Standard,
+                EffectiveAudio3RecognitionControls {
+                    max_sentence_silence_ms: 800,
+                    semantic_punctuation_enabled: false,
+                    multi_threshold_mode_enabled: false,
+                    speech_noise_threshold: None,
+                },
+            ),
+            (
+                Audio3RecognitionPreset::LowLatencyDictation,
+                EffectiveAudio3RecognitionControls {
+                    max_sentence_silence_ms: 400,
+                    semantic_punctuation_enabled: false,
+                    multi_threshold_mode_enabled: true,
+                    speech_noise_threshold: None,
+                },
+            ),
+            (
+                Audio3RecognitionPreset::LongForm,
+                EffectiveAudio3RecognitionControls {
+                    max_sentence_silence_ms: 1_300,
+                    semantic_punctuation_enabled: true,
+                    multi_threshold_mode_enabled: false,
+                    speech_noise_threshold: None,
+                },
+            ),
+        ] {
+            audio3.recognition_preset = preset;
+            assert_eq!(audio3.effective_recognition_controls(), expected);
+        }
+
+        audio3.recognition_preset = Audio3RecognitionPreset::Custom;
+        audio3.max_sentence_silence_ms = 725;
+        audio3.semantic_punctuation_enabled = false;
+        audio3.multi_threshold_mode_enabled = true;
+        audio3.speech_noise_threshold = Some(-0.25);
+        assert_eq!(
+            audio3.effective_recognition_controls(),
+            EffectiveAudio3RecognitionControls {
+                max_sentence_silence_ms: 725,
+                semantic_punctuation_enabled: false,
+                multi_threshold_mode_enabled: true,
+                speech_noise_threshold: Some(-0.25),
+            }
+        );
+    }
+
+    #[test]
+    fn pre_m2_audio3_recognition_controls_migrate_by_raw_values() {
+        let baseline: super::AlibabaAudio3Config = serde_json::from_value(serde_json::json!({
+            "max_sentence_silence_ms": 800,
+            "semantic_punctuation_enabled": false
+        }))
+        .unwrap();
+        assert_eq!(
+            baseline.recognition_preset,
+            Audio3RecognitionPreset::Standard
+        );
+
+        for value in [
+            serde_json::json!({"max_sentence_silence_ms": 801}),
+            serde_json::json!({"semantic_punctuation_enabled": true}),
+            serde_json::json!({"multi_threshold_mode_enabled": true}),
+            serde_json::json!({"speech_noise_threshold": 0.0}),
+        ] {
+            let migrated: super::AlibabaAudio3Config = serde_json::from_value(value).unwrap();
+            assert_eq!(migrated.recognition_preset, Audio3RecognitionPreset::Custom);
+        }
+    }
+
+    #[test]
+    fn named_audio3_preset_preserves_finite_dormant_raw_controls_in_config_json() {
+        let mut config = Config::default();
+        config.asr.provider = AsrProvider::AlibabaQwenAudio3;
+        config.asr.alibaba_audio3.experimental_enabled = true;
+        config.asr.alibaba_audio3.recognition_preset = Audio3RecognitionPreset::Standard;
+        config.asr.alibaba_audio3.max_sentence_silence_ms = 333;
+        config.asr.alibaba_audio3.semantic_punctuation_enabled = true;
+        config.asr.alibaba_audio3.multi_threshold_mode_enabled = true;
+        config.asr.alibaba_audio3.speech_noise_threshold = Some(1.5);
+        config
+            .validate()
+            .expect("finite dormant out-of-range controls are preserved");
+        assert_eq!(
+            config.asr.alibaba_audio3.effective_recognition_controls(),
+            EffectiveAudio3RecognitionControls {
+                max_sentence_silence_ms: 800,
+                semantic_punctuation_enabled: false,
+                multi_threshold_mode_enabled: false,
+                speech_noise_threshold: None,
+            }
+        );
+
+        let serialized = serde_json::to_value(&config).unwrap();
+        assert_eq!(
+            serialized["asr"]["alibaba_audio3"]["speech_noise_threshold"],
+            1.5
+        );
+        let round_trip: Config = serde_json::from_value(serialized).unwrap();
+        round_trip
+            .validate()
+            .expect("round-tripped config is valid");
+        assert_eq!(
+            round_trip.asr.alibaba_audio3.recognition_preset,
+            Audio3RecognitionPreset::Standard
+        );
+        assert_eq!(round_trip.asr.alibaba_audio3.max_sentence_silence_ms, 333);
+        assert!(round_trip.asr.alibaba_audio3.semantic_punctuation_enabled);
+        assert!(round_trip.asr.alibaba_audio3.multi_threshold_mode_enabled);
+        assert_eq!(
+            round_trip.asr.alibaba_audio3.speech_noise_threshold,
+            Some(1.5)
+        );
+
+        let default_serialized =
+            serde_json::to_value(super::AlibabaAudio3Config::default()).unwrap();
+        assert!(default_serialized.get("speech_noise_threshold").is_none());
+        assert!(
+            serde_json::from_value::<super::AlibabaAudio3Config>(serde_json::json!({
+                "recognition_preset": "not-a-preset"
+            }))
+            .is_err()
+        );
     }
 
     #[test]

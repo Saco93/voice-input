@@ -22,7 +22,7 @@ use tungstenite::{
 
 use crate::{
     backend::{ASR_CONTROL_QUEUE_CAPACITY, AsrControl, AsrEvent, AsrSessionHandle, AudioSpec},
-    config::{Audio3VocabularyTerm, Config, Language},
+    config::{Audio3VocabularyTerm, Config, EffectiveAudio3RecognitionControls, Language},
     diagnostics::{FailureKind, ProviderErrorCode},
 };
 
@@ -160,6 +160,7 @@ fn run_established_socket<S: SocketIo, C: DeadlineClock>(
         event_tx,
     } = session;
     let audio3 = &config.asr.alibaba_audio3;
+    let recognition = audio3.effective_recognition_controls();
     send_json(
         socket,
         run_task_envelope(
@@ -170,8 +171,7 @@ fn run_established_socket<S: SocketIo, C: DeadlineClock>(
                 language: config.asr.language,
                 language_hints_enabled: audio3.language_hints_enabled,
                 heartbeat_enabled: audio3.heartbeat_enabled,
-                max_sentence_silence_ms: audio3.max_sentence_silence_ms,
-                semantic_punctuation_enabled: audio3.semantic_punctuation_enabled,
+                recognition,
                 vocabulary: &audio3.vocabulary,
             },
         ),
@@ -469,8 +469,7 @@ struct Audio3RequestControls<'a> {
     language: Language,
     language_hints_enabled: bool,
     heartbeat_enabled: bool,
-    max_sentence_silence_ms: u32,
-    semantic_punctuation_enabled: bool,
+    recognition: EffectiveAudio3RecognitionControls,
     vocabulary: &'a [Audio3VocabularyTerm],
 }
 
@@ -484,8 +483,7 @@ fn run_task_envelope(
         language,
         language_hints_enabled,
         heartbeat_enabled,
-        max_sentence_silence_ms,
-        semantic_punctuation_enabled,
+        recognition,
         vocabulary,
     } = controls;
     let mut envelope = json!({
@@ -504,11 +502,17 @@ fn run_task_envelope(
                 "format": "pcm",
                 "sample_rate": spec.sample_rate_hz,
                 "heartbeat": heartbeat_enabled,
-                "max_sentence_silence": max_sentence_silence_ms,
-                "semantic_punctuation_enabled": semantic_punctuation_enabled
+                "max_sentence_silence": recognition.max_sentence_silence_ms,
+                "semantic_punctuation_enabled": recognition.semantic_punctuation_enabled
             }
         }
     });
+    if recognition.multi_threshold_mode_enabled {
+        envelope["payload"]["parameters"]["multi_threshold_mode_enabled"] = json!(true);
+    }
+    if let Some(threshold) = recognition.speech_noise_threshold {
+        envelope["payload"]["parameters"]["speech_noise_threshold"] = json!(threshold);
+    }
     if language_hints_enabled {
         envelope["payload"]["parameters"]["language_hints"] = super::language_hints(language);
     }
@@ -771,7 +775,10 @@ mod tests {
 
     use crate::{
         backend::AsrEvent,
-        config::{Audio3VocabularyTerm, Language},
+        config::{
+            AlibabaAudio3Config, Audio3RecognitionPreset, Audio3VocabularyTerm,
+            EffectiveAudio3RecognitionControls, Language,
+        },
         diagnostics::{FailureKind, ProviderErrorCode},
     };
 
@@ -1139,7 +1146,7 @@ mod tests {
     }
 
     #[test]
-    fn run_task_envelope_matches_dashscope_protocol() {
+    fn standard_run_task_envelope_is_exactly_backward_compatible() {
         assert_eq!(
             run_task_envelope(
                 TASK_ID,
@@ -1151,8 +1158,7 @@ mod tests {
                     language: Language::SimplifiedChinese,
                     language_hints_enabled: true,
                     heartbeat_enabled: true,
-                    max_sentence_silence_ms: 800,
-                    semantic_punctuation_enabled: false,
+                    recognition: AlibabaAudio3Config::default().effective_recognition_controls(),
                     vocabulary: &[],
                 },
             ),
@@ -1193,8 +1199,12 @@ mod tests {
                 language: Language::English,
                 language_hints_enabled: false,
                 heartbeat_enabled: false,
-                max_sentence_silence_ms: 200,
-                semantic_punctuation_enabled: true,
+                recognition: EffectiveAudio3RecognitionControls {
+                    max_sentence_silence_ms: 200,
+                    semantic_punctuation_enabled: true,
+                    multi_threshold_mode_enabled: false,
+                    speech_noise_threshold: None,
+                },
                 vocabulary: &[],
             },
         );
@@ -1214,6 +1224,16 @@ mod tests {
         );
         assert!(
             disabled["payload"]["parameters"]
+                .get("multi_threshold_mode_enabled")
+                .is_none()
+        );
+        assert!(
+            disabled["payload"]["parameters"]
+                .get("speech_noise_threshold")
+                .is_none()
+        );
+        assert!(
+            disabled["payload"]["parameters"]
                 .get("vocabulary")
                 .is_none()
         );
@@ -1228,6 +1248,14 @@ mod tests {
                 weight: 50,
             },
         ];
+        let custom_audio3 = AlibabaAudio3Config {
+            recognition_preset: Audio3RecognitionPreset::Custom,
+            max_sentence_silence_ms: 6_000,
+            semantic_punctuation_enabled: false,
+            multi_threshold_mode_enabled: true,
+            speech_noise_threshold: Some(0.25),
+            ..AlibabaAudio3Config::default()
+        };
         let configured = run_task_envelope(
             TASK_ID,
             "model",
@@ -1238,8 +1266,7 @@ mod tests {
                 language: Language::Japanese,
                 language_hints_enabled: true,
                 heartbeat_enabled: true,
-                max_sentence_silence_ms: 6_000,
-                semantic_punctuation_enabled: false,
+                recognition: custom_audio3.effective_recognition_controls(),
                 vocabulary: &vocabulary,
             },
         );
@@ -1255,6 +1282,66 @@ mod tests {
             configured["payload"]["parameters"]["max_sentence_silence"],
             6_000
         );
+        assert_eq!(
+            configured["payload"]["parameters"]["multi_threshold_mode_enabled"],
+            true
+        );
+        assert_eq!(
+            configured["payload"]["parameters"]["speech_noise_threshold"],
+            0.25
+        );
+    }
+
+    #[test]
+    fn candidate_presets_send_only_their_effective_request_fields() {
+        let mut audio3 = AlibabaAudio3Config {
+            recognition_preset: Audio3RecognitionPreset::LowLatencyDictation,
+            ..AlibabaAudio3Config::default()
+        };
+        let low_latency = run_task_envelope(
+            TASK_ID,
+            "model",
+            AudioSpec {
+                sample_rate_hz: 16_000,
+            },
+            Audio3RequestControls {
+                language: Language::English,
+                language_hints_enabled: false,
+                heartbeat_enabled: false,
+                recognition: audio3.effective_recognition_controls(),
+                vocabulary: &[],
+            },
+        );
+        let low_parameters = &low_latency["payload"]["parameters"];
+        assert_eq!(low_parameters["max_sentence_silence"], 400);
+        assert_eq!(low_parameters["semantic_punctuation_enabled"], false);
+        assert_eq!(low_parameters["multi_threshold_mode_enabled"], true);
+        assert!(low_parameters.get("speech_noise_threshold").is_none());
+
+        audio3.recognition_preset = Audio3RecognitionPreset::LongForm;
+        let long_form = run_task_envelope(
+            TASK_ID,
+            "model",
+            AudioSpec {
+                sample_rate_hz: 16_000,
+            },
+            Audio3RequestControls {
+                language: Language::English,
+                language_hints_enabled: false,
+                heartbeat_enabled: false,
+                recognition: audio3.effective_recognition_controls(),
+                vocabulary: &[],
+            },
+        );
+        let long_parameters = &long_form["payload"]["parameters"];
+        assert_eq!(long_parameters["max_sentence_silence"], 1_300);
+        assert_eq!(long_parameters["semantic_punctuation_enabled"], true);
+        assert!(
+            long_parameters
+                .get("multi_threshold_mode_enabled")
+                .is_none()
+        );
+        assert!(long_parameters.get("speech_noise_threshold").is_none());
     }
 
     #[test]

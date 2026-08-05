@@ -37,14 +37,16 @@ Official interaction rules:
 
 ### Preset decisions
 
-The configuration will retain raw custom values and add a named preset resolver:
+The configuration retains raw custom values and resolves a named preset:
 
 - `standard`: preserve the existing effective request (`800` ms, semantic punctuation disabled, multi-threshold disabled, speech/noise threshold omitted).
-- `low-latency-dictation`: candidate values will shorten sentence silence while retaining VAD segmentation. Exact values remain provisional until fixed-audio pause evaluation.
-- `long-form`: candidate values will enable semantic segmentation and use the official silence default as a conservative recognition setting. Exact behavior remains provisional until long-pause evaluation.
+- `low-latency-dictation`: evaluation candidate using `400` ms, semantic punctuation disabled, multi-threshold enabled, and speech/noise threshold omitted.
+- `long-form`: evaluation candidate using `1300` ms, semantic punctuation enabled, multi-threshold disabled, and speech/noise threshold omitted.
 - `custom`: send the user's validated raw controls. `speech_noise_threshold` remains optional.
 
-`standard` remains the default. A preset will not become the default based only on API documentation.
+`standard` remains the default. The two candidate mappings require authorized pause/noise evaluation and are not yet provider-validated recommendations. A preset will not become the default based only on API documentation.
+
+Any configured raw `speech_noise_threshold` must be finite so it can round-trip through Settings JSON. The provider's `-1.0`–`1.0` range is enforced only when that threshold is effective for the active Audio3 custom preset; finite dormant out-of-range values remain preserved under named presets and inactive providers.
 
 ## Timestamp schema and safe use
 

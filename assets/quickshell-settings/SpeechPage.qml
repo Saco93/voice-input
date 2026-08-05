@@ -241,6 +241,20 @@ SettingsPage {
                 }
             }
 
+            SettingCombo {
+                theme: root.theme
+                label: "Recognition preset"
+                value: root.controller.value("asr.alibaba_audio3.recognition_preset", "standard")
+                labels: ["Standard", "Low-latency dictation", "Long-form", "Custom"]
+                values: ["standard", "low-latency-dictation", "long-form", "custom"]
+                help: "Standard preserves existing behavior. Low-latency dictation and long-form are evaluation candidates pending live pause and noise validation. Custom exposes every raw recognition control."
+                error: root.controller.errorFor("asr.alibaba_audio3.recognition_preset")
+                enabled: !root.controller.busy
+                onSelected: (value) => {
+                    return root.controller.setValue("asr.alibaba_audio3.recognition_preset", value);
+                }
+            }
+
             SettingTextArea {
                 theme: root.theme
                 label: "Dynamic vocabulary"
@@ -464,7 +478,7 @@ SettingsPage {
             SectionCard {
                 id: audio3StreamingCard
 
-                visible: root.controller.value("asr.provider", "local-cli") === "alibaba-qwen-audio3" || root.controller.hasErrorPrefix("asr.alibaba_audio3.endpoint") || root.controller.hasErrorPrefix("asr.alibaba_audio3.model")
+                visible: root.controller.value("asr.provider", "local-cli") === "alibaba-qwen-audio3" || root.controller.hasErrorPrefix("asr.alibaba_audio3.endpoint") || root.controller.hasErrorPrefix("asr.alibaba_audio3.model") || root.controller.hasErrorPrefix("asr.alibaba_audio3.max_sentence_silence_ms") || root.controller.hasErrorPrefix("asr.alibaba_audio3.semantic_punctuation_enabled") || root.controller.hasErrorPrefix("asr.alibaba_audio3.multi_threshold_mode_enabled") || root.controller.hasErrorPrefix("asr.alibaba_audio3.speech_noise_threshold")
                 theme: root.theme
                 title: "Qwen-Audio-3 streaming"
                 showDivider: audio3NativeCard.visible
@@ -492,6 +506,7 @@ SettingsPage {
                 }
 
                 SettingTextField {
+                    visible: root.controller.value("asr.alibaba_audio3.recognition_preset", "standard") === "custom" || root.controller.errorFor("asr.alibaba_audio3.max_sentence_silence_ms").length > 0
                     theme: root.theme
                     label: "Maximum sentence silence"
                     value: root.controller.value("asr.alibaba_audio3.max_sentence_silence_ms", 800)
@@ -504,6 +519,7 @@ SettingsPage {
                 }
 
                 SettingSwitch {
+                    visible: root.controller.value("asr.alibaba_audio3.recognition_preset", "standard") === "custom" || root.controller.errorFor("asr.alibaba_audio3.semantic_punctuation_enabled").length > 0 || root.controller.errorFor("asr.alibaba_audio3.multi_threshold_mode_enabled").length > 0
                     theme: root.theme
                     label: "Enable semantic punctuation"
                     checked: root.controller.value("asr.alibaba_audio3.semantic_punctuation_enabled", false)
@@ -512,6 +528,51 @@ SettingsPage {
                     enabled: !root.controller.busy
                     onToggled: (checked) => {
                         return root.controller.setValue("asr.alibaba_audio3.semantic_punctuation_enabled", checked);
+                    }
+                }
+
+                SettingSwitch {
+                    visible: root.controller.value("asr.alibaba_audio3.recognition_preset", "standard") === "custom" || root.controller.errorFor("asr.alibaba_audio3.multi_threshold_mode_enabled").length > 0
+                    theme: root.theme
+                    label: "Enable multi-threshold mode"
+                    checked: root.controller.value("asr.alibaba_audio3.multi_threshold_mode_enabled", false)
+                    help: "Use the documented adaptive VAD threshold mode. It cannot be combined with semantic punctuation."
+                    error: root.controller.errorFor("asr.alibaba_audio3.multi_threshold_mode_enabled")
+                    enabled: !root.controller.busy
+                    onToggled: (checked) => {
+                        return root.controller.setValue("asr.alibaba_audio3.multi_threshold_mode_enabled", checked);
+                    }
+                }
+
+                SettingSwitch {
+                    visible: root.controller.value("asr.alibaba_audio3.recognition_preset", "standard") === "custom" || root.controller.errorFor("asr.alibaba_audio3.speech_noise_threshold").length > 0
+                    theme: root.theme
+                    label: "Override speech/noise threshold"
+                    checked: root.controller.value("asr.alibaba_audio3.speech_noise_threshold", null) !== null
+                    help: "Send an optional threshold from -1 to 1. Lower values classify more noise as speech; Alibaba publishes no default."
+                    error: root.controller.errorFor("asr.alibaba_audio3.speech_noise_threshold")
+                    enabled: !root.controller.busy
+                    onToggled: (checked) => {
+                        if (checked && root.controller.value("asr.alibaba_audio3.speech_noise_threshold", null) === null)
+                            return root.controller.setValue("asr.alibaba_audio3.speech_noise_threshold", 0);
+
+                        if (!checked)
+                            return root.controller.setValue("asr.alibaba_audio3.speech_noise_threshold", null);
+
+                        return true;
+                    }
+                }
+
+                SettingTextField {
+                    visible: (root.controller.value("asr.alibaba_audio3.recognition_preset", "standard") === "custom" && root.controller.value("asr.alibaba_audio3.speech_noise_threshold", null) !== null) || root.controller.errorFor("asr.alibaba_audio3.speech_noise_threshold").length > 0
+                    theme: root.theme
+                    label: "Speech/noise threshold"
+                    value: root.controller.value("asr.alibaba_audio3.speech_noise_threshold", "")
+                    help: "Finite value from -1 to 1. This value is sent remotely only while the override is enabled."
+                    error: root.controller.errorFor("asr.alibaba_audio3.speech_noise_threshold")
+                    enabled: !root.controller.busy && root.controller.value("asr.alibaba_audio3.speech_noise_threshold", null) !== null
+                    onEdited: (value) => {
+                        return root.controller.setValue("asr.alibaba_audio3.speech_noise_threshold", value);
                     }
                 }
 

@@ -794,6 +794,7 @@ impl SafeConfigSummary {
                     != NativeFinalPassMode::StreamingOnly
             }
         };
+        let recognition = config.asr.alibaba_audio3.effective_recognition_controls();
         Self {
             provider: config.asr.provider.into(),
             final_pass_enabled,
@@ -801,11 +802,8 @@ impl SafeConfigSummary {
             audio3_native_final_pass_mode: config.asr.alibaba_audio3.native_final_pass_mode,
             audio3_language_hints_enabled: config.asr.alibaba_audio3.language_hints_enabled,
             audio3_heartbeat_enabled: config.asr.alibaba_audio3.heartbeat_enabled,
-            audio3_max_sentence_silence_ms: config.asr.alibaba_audio3.max_sentence_silence_ms,
-            audio3_semantic_punctuation_enabled: config
-                .asr
-                .alibaba_audio3
-                .semantic_punctuation_enabled,
+            audio3_max_sentence_silence_ms: recognition.max_sentence_silence_ms,
+            audio3_semantic_punctuation_enabled: recognition.semantic_punctuation_enabled,
             audio3_vocabulary_count: config.asr.alibaba_audio3.vocabulary.len(),
         }
     }
@@ -1249,6 +1247,12 @@ mod tests {
         config.asr.alibaba_audio3.native_final_pass_mode = NativeFinalPassMode::Adaptive;
         config.asr.alibaba_audio3.language_hints_enabled = true;
         config.asr.alibaba_audio3.heartbeat_enabled = true;
+        config.asr.alibaba_audio3.recognition_preset =
+            crate::config::Audio3RecognitionPreset::LongForm;
+        config.asr.alibaba_audio3.max_sentence_silence_ms = 333;
+        config.asr.alibaba_audio3.semantic_punctuation_enabled = false;
+        config.asr.alibaba_audio3.multi_threshold_mode_enabled = true;
+        config.asr.alibaba_audio3.speech_noise_threshold = Some(0.75);
         config.asr.alibaba_audio3.vocabulary = vec![crate::config::Audio3VocabularyTerm {
             term: TERM.into(),
             weight: 50,
@@ -1260,10 +1264,12 @@ mod tests {
         assert_eq!(json["config"]["audio3_native_final_pass_mode"], "adaptive");
         assert_eq!(json["config"]["audio3_language_hints_enabled"], true);
         assert_eq!(json["config"]["audio3_heartbeat_enabled"], true);
-        assert_eq!(json["config"]["audio3_max_sentence_silence_ms"], 800);
-        assert_eq!(json["config"]["audio3_semantic_punctuation_enabled"], false);
+        assert_eq!(json["config"]["audio3_max_sentence_silence_ms"], 1_300);
+        assert_eq!(json["config"]["audio3_semantic_punctuation_enabled"], true);
         assert_eq!(json["config"]["audio3_vocabulary_count"], 1);
         assert!(!json.to_string().contains(TERM));
+        assert!(!json.to_string().contains("speech_noise_threshold"));
+        assert_eq!(json["config"].as_object().unwrap().len(), 9);
 
         let mut diagnostics = Diagnostics::inactive();
         diagnostics.start_session(
