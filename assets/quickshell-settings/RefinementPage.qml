@@ -72,7 +72,7 @@ SettingsPage {
                 theme: root.theme
                 label: "Use agent context"
                 checked: root.controller.value("llm.agent_context_enabled", false)
-                help: "Send a redacted excerpt from the Pi or Codex session focused when dictation ends."
+                help: "Locally segment a redacted Pi or Codex excerpt and send only bounded, deduplicated terminology."
                 enabled: !root.controller.busy
                 onToggled: (checked) => {
                     return root.controller.setValue("llm.agent_context_enabled", checked);
@@ -154,7 +154,7 @@ SettingsPage {
                     theme: root.theme
                     label: "Context limit"
                     value: root.controller.value("llm.agent_context_max_chars", 6000)
-                    help: "Maximum characters sent from a redacted agent-session excerpt."
+                    help: "Maximum redacted agent-session characters (500–12000)."
                     error: root.controller.errorFor("llm.agent_context_max_chars")
                     enabled: !root.controller.busy
                     onEdited: (value) => {

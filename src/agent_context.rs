@@ -1,20 +1,30 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs::{self, File},
     io::{Read, Seek, SeekFrom},
     os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
     process::{Command, Stdio},
+    sync::OnceLock,
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, anyhow};
+use jieba_rs::Jieba;
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::focused_window::FocusedWindowSnapshot;
+use crate::{
+    config::{MAX_AGENT_CONTEXT_CHARS, MIN_AGENT_CONTEXT_CHARS},
+    focused_window::FocusedWindowSnapshot,
+};
 
 const MAX_SESSION_SCAN_BYTES: u64 = 8 * 1024 * 1024;
 const KITTY_QUERY_TIMEOUT_SECS: &str = "1";
+const MAX_TERMINOLOGY_COUNT: usize = 96;
+const MAX_TERMINOLOGY_CHARS: usize = 1_500;
+const MAX_TERM_CHARS: usize = 96;
+static JIEBA: OnceLock<Jieba> = OnceLock::new();
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentKind {
@@ -46,7 +56,10 @@ pub struct AgentSessionLocator {
 #[derive(Debug, Clone)]
 pub struct AgentReference {
     pub agent: AgentKind,
-    pub text: String,
+    pub terminology: Vec<String>,
+    pub source_char_count: usize,
+    pub terminology_char_count: usize,
+    pub extraction_elapsed: Duration,
 }
 
 pub struct FocusedAgentSnapshot {
@@ -84,6 +97,15 @@ pub fn resolve_focused_session(
     }
 }
 
+pub fn warm_terminology_segmenter() -> Option<Duration> {
+    if JIEBA.get().is_some() {
+        return None;
+    }
+    let started = Instant::now();
+    JIEBA.get_or_init(Jieba::new);
+    Some(started.elapsed())
+}
+
 pub fn load_reference(
     locator: &AgentSessionLocator,
     max_chars: usize,
@@ -117,14 +139,28 @@ pub fn load_reference(
     let Some(text) = text else {
         return Ok(None);
     };
-    let text = sanitize_reference(&text, max_chars.clamp(500, 12_000));
+    let text = sanitize_reference(
+        &text,
+        max_chars.clamp(MIN_AGENT_CONTEXT_CHARS, MAX_AGENT_CONTEXT_CHARS),
+    );
     if text.trim().is_empty() {
         return Ok(None);
     }
 
+    let started = Instant::now();
+    let terminology = extract_terminology(&text);
+    let extraction_elapsed = started.elapsed();
+    if terminology.is_empty() {
+        return Ok(None);
+    }
+    let terminology_char_count = terminology.iter().map(|term| term.chars().count()).sum();
+
     Ok(Some(AgentReference {
         agent: locator.kind,
-        text,
+        terminology,
+        source_char_count: text.chars().count(),
+        terminology_char_count,
+        extraction_elapsed,
     }))
 }
 
@@ -499,6 +535,10 @@ fn tail_json_lines(path: &Path, max_bytes: u64) -> Result<Vec<Value>> {
 }
 
 fn sanitize_reference(value: &str, max_chars: usize) -> String {
+    // Cap first so a very large session message cannot force unbounded local
+    // redaction or segmentation work. Redact the complete bounded text before
+    // any token is extracted or included in a provider request.
+    let value = cap_text(value, max_chars);
     let mut redacted = Vec::new();
     for line in value.lines() {
         let lower = line.to_ascii_lowercase();
@@ -524,7 +564,7 @@ fn sanitize_reference(value: &str, max_chars: usize) -> String {
             redacted.push(redact_token_like_words(line));
         }
     }
-    cap_text(&redacted.join("\n"), max_chars)
+    redacted.join("\n")
 }
 
 fn redact_token_like_words(line: &str) -> String {
@@ -566,6 +606,175 @@ fn cap_text(value: &str, max_chars: usize) -> String {
     format!("{head}\n…\n{tail}")
 }
 
+fn extract_terminology(value: &str) -> Vec<String> {
+    let jieba = JIEBA.get_or_init(Jieba::new);
+    let mut seen = HashSet::new();
+    let mut terminology = Vec::new();
+    let mut total_chars = 0_usize;
+
+    // Jieba intentionally separates punctuation, which would split model IDs,
+    // paths, flags, and code identifiers. Preserve those high-value technical
+    // forms first, then add ordinary segmented words below.
+    for term in value.split(|character: char| !is_technical_character(character)) {
+        let structured = term
+            .chars()
+            .any(|character| matches!(character, '-' | '_' | '/' | '.' | ':' | '+' | '#' | '@'));
+        let mixed_case = term.chars().any(|character| character.is_ascii_uppercase())
+            && term
+                .chars()
+                .skip(1)
+                .any(|character| character.is_ascii_lowercase());
+        let has_digit = term.chars().any(|character| character.is_ascii_digit());
+        if structured || mixed_case || has_digit {
+            push_term(term, &mut seen, &mut terminology, &mut total_chars);
+        }
+    }
+
+    for token in jieba.cut(value, true) {
+        let term = token.word.trim_matches(|character: char| {
+            character.is_whitespace() || is_term_boundary(character)
+        });
+        push_term(term, &mut seen, &mut terminology, &mut total_chars);
+        if terminology.len() >= MAX_TERMINOLOGY_COUNT || total_chars >= MAX_TERMINOLOGY_CHARS {
+            break;
+        }
+    }
+    terminology
+}
+
+fn push_term(
+    term: &str,
+    seen: &mut HashSet<String>,
+    terminology: &mut Vec<String>,
+    total_chars: &mut usize,
+) {
+    let char_count = term.chars().count();
+    if !term_is_useful(term, char_count)
+        || terminology.len() >= MAX_TERMINOLOGY_COUNT
+        || total_chars.saturating_add(char_count) > MAX_TERMINOLOGY_CHARS
+    {
+        return;
+    }
+    let deduplication_key = term.to_lowercase();
+    if seen.insert(deduplication_key) {
+        *total_chars += char_count;
+        terminology.push(term.to_string());
+    }
+}
+
+fn is_technical_character(character: char) -> bool {
+    character.is_ascii_alphanumeric()
+        || matches!(character, '-' | '_' | '/' | '.' | ':' | '+' | '#' | '@')
+}
+
+fn is_term_boundary(character: char) -> bool {
+    matches!(
+        character,
+        '`' | '"'
+            | '\''
+            | '('
+            | ')'
+            | '['
+            | ']'
+            | '{'
+            | '}'
+            | '<'
+            | '>'
+            | ','
+            | '，'
+            | ';'
+            | '；'
+            | ':'
+            | '：'
+            | '!'
+            | '！'
+            | '?'
+            | '？'
+            | '。'
+            | '、'
+            | '…'
+            | '“'
+            | '”'
+            | '‘'
+            | '’'
+    )
+}
+
+fn term_is_useful(term: &str, char_count: usize) -> bool {
+    if char_count == 0
+        || char_count > MAX_TERM_CHARS
+        || term.to_ascii_uppercase().contains("REDACTED")
+        || term_looks_sensitive(term)
+    {
+        return false;
+    }
+    let has_cjk = term.chars().any(is_cjk);
+    let has_ascii_alphanumeric = term
+        .chars()
+        .any(|character| character.is_ascii_alphanumeric());
+    if !has_cjk && !has_ascii_alphanumeric {
+        return false;
+    }
+    if has_cjk {
+        return char_count >= 2 && !is_stopword(term);
+    }
+    if char_count < 2 || is_stopword(term) {
+        return false;
+    }
+    let lower = term.to_ascii_lowercase();
+    if lower.starts_with("http://") || lower.starts_with("https://") {
+        return false;
+    }
+    // Long unstructured ASCII values are more likely to be identifiers,
+    // hashes, or credentials than useful spoken terminology. Structured
+    // commands, paths, model IDs, and code identifiers remain eligible.
+    let structured = term
+        .chars()
+        .any(|character| matches!(character, '-' | '_' | '/' | '.' | ':' | '+' | '#' | '@'));
+    char_count <= 48 || structured
+}
+
+fn term_looks_sensitive(term: &str) -> bool {
+    let lower = term.to_ascii_lowercase();
+    let jwt_like = term.len() > 80 && term.matches('.').count() == 2;
+    let known_secret = term.len() > 20
+        && ["sk-", "sk_", "ghp_", "github_pat_", "xoxb-", "xoxp-"]
+            .iter()
+            .any(|prefix| lower.starts_with(prefix));
+    let long_unstructured_ascii = term.len() > 48
+        && term.is_ascii()
+        && term
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric());
+    jwt_like || known_secret || long_unstructured_ascii
+}
+
+fn is_cjk(character: char) -> bool {
+    matches!(
+        character,
+        '\u{3400}'..='\u{4dbf}'
+            | '\u{4e00}'..='\u{9fff}'
+            | '\u{f900}'..='\u{faff}'
+            | '\u{3040}'..='\u{30ff}'
+            | '\u{ac00}'..='\u{d7af}'
+    )
+}
+
+fn is_stopword(term: &str) -> bool {
+    const STOPWORDS: &[&str] = &[
+        "the", "and", "for", "with", "from", "this", "that", "into", "only", "when", "then", "use",
+        "using", "used", "should", "must", "will", "can", "could", "would", "also", "not", "are",
+        "was", "were", "have", "has", "had", "its", "you", "your", "user", "message", "text",
+        "current", "existing", "new", "one", "two", "first", "second", "all", "any", "如果",
+        "可以", "需要", "使用", "进行", "实现", "当前", "这个", "那个", "以及", "然后", "同时",
+        "一个", "一些", "已经", "没有", "不会", "应该", "必须", "我们", "你们", "他们", "用户",
+        "文本", "消息", "内容", "相关", "通过", "对于", "因为", "所以", "但是", "或者",
+    ];
+    STOPWORDS
+        .iter()
+        .any(|stopword| term.eq_ignore_ascii_case(stopword))
+}
+
 fn process_start_ticks(pid: u32) -> Result<u64> {
     let stat = fs::read_to_string(format!("/proc/{pid}/stat"))?;
     let end = stat
@@ -603,8 +812,9 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        AgentKind, AgentSessionLocator, PiRegistry, cap_text, current_pi_published_reference,
-        latest_codex_assistant, latest_pi_assistant, latest_pi_reference, sanitize_reference,
+        AgentKind, AgentSessionLocator, MAX_TERMINOLOGY_CHARS, MAX_TERMINOLOGY_COUNT, PiRegistry,
+        cap_text, current_pi_published_reference, extract_terminology, latest_codex_assistant,
+        latest_pi_assistant, latest_pi_reference, sanitize_reference,
     };
 
     #[test]
@@ -709,13 +919,16 @@ mod tests {
     #[test]
     fn redacts_and_caps_reference() {
         let value = format!(
-            "safe\nAPI_KEY=secret\n{}",
+            "safe\nAPI_KEY=secret\n{}\nsecret: private-tail-value",
             "test-token-shaped-placeholder".repeat(20)
         );
         let output = sanitize_reference(&value, 120);
         assert!(output.contains("safe"));
-        assert!(!output.contains("secret"));
-        assert!(output.chars().count() <= 122);
+        assert!(!output.contains("API_KEY=secret"));
+        assert!(!output.contains("private-tail-value"));
+        assert!(output.contains("[REDACTED SENSITIVE LINE]"));
+        // Redaction markers can expand the already bounded source slightly.
+        assert!(output.chars().count() <= 160);
     }
 
     #[test]
@@ -723,5 +936,73 @@ mod tests {
         let output = cap_text(&"a".repeat(200), 60);
         assert!(output.starts_with(&"a".repeat(40)));
         assert!(output.ends_with(&"a".repeat(17)));
+    }
+
+    #[test]
+    fn terminology_uses_local_segmentation_and_stable_deduplication() {
+        let source = "实现 Qwen-Audio-3 Streaming reconnect 和语音识别。再次检查 qwen-audio-3、\
+             AgentReference、src/backend/qwen_audio3/streaming.rs 与 cargo test --locked。";
+        let benchmark_source = source.repeat(40);
+        let cold_started = std::time::Instant::now();
+        let cold_terms = extract_terminology(&benchmark_source);
+        let cold_elapsed = cold_started.elapsed();
+        let warm_started = std::time::Instant::now();
+        let warm_terms = extract_terminology(&benchmark_source);
+        eprintln!(
+            "terminology benchmark source_chars={} cold_us={} warm_us={} terms={} term_chars={}",
+            benchmark_source.chars().count(),
+            cold_elapsed.as_micros(),
+            warm_started.elapsed().as_micros(),
+            cold_terms.len(),
+            cold_terms
+                .iter()
+                .map(|term| term.chars().count())
+                .sum::<usize>()
+        );
+        assert_eq!(cold_terms, warm_terms);
+        let terminology = extract_terminology(source);
+
+        assert!(terminology.iter().any(|term| term == "语音"));
+        assert!(terminology.iter().any(|term| term == "识别"));
+        assert!(terminology.iter().any(|term| term == "AgentReference"));
+        assert!(terminology.iter().any(|term| term == "Streaming"));
+        assert_eq!(
+            terminology
+                .iter()
+                .filter(|term| term.eq_ignore_ascii_case("qwen"))
+                .count(),
+            1
+        );
+        assert!(!terminology.iter().any(|term| term == "实现"));
+    }
+
+    #[test]
+    fn terminology_is_bounded_and_excludes_redacted_secrets() {
+        let source = format!(
+            "API_KEY=private-secret\n{} {}",
+            "a".repeat(64),
+            (0..300)
+                .map(|index| format!("uniqueTerm{index}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        );
+        let sanitized = sanitize_reference(&source, 12_000);
+        let terminology = extract_terminology(&sanitized);
+
+        assert!(terminology.len() <= MAX_TERMINOLOGY_COUNT);
+        assert!(
+            terminology
+                .iter()
+                .map(|term| term.chars().count())
+                .sum::<usize>()
+                <= MAX_TERMINOLOGY_CHARS
+        );
+        assert!(
+            terminology
+                .iter()
+                .all(|term| !term.contains("private-secret"))
+        );
+        assert!(terminology.iter().all(|term| !term.contains("REDACTED")));
+        assert!(terminology.iter().all(|term| term != &"a".repeat(64)));
     }
 }

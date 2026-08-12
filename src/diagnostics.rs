@@ -252,6 +252,37 @@ impl SessionDiagnostics {
                 self.streaming.segment_final_event_count
             );
         }
+        if self.streaming.reconnect_attempted_count > 0 {
+            let _ = write!(
+                output,
+                ", reconnect-attempted={}",
+                self.streaming.reconnect_attempted_count
+            );
+        }
+        if self.streaming.reconnect_succeeded_count > 0 {
+            let _ = write!(
+                output,
+                ", reconnect-succeeded={}",
+                self.streaming.reconnect_succeeded_count
+            );
+        }
+        if self.streaming.replay_packet_count > 0 {
+            let _ = write!(
+                output,
+                ", replay-packets={}",
+                self.streaming.replay_packet_count
+            );
+        }
+        if self.streaming.replay_sample_count > 0 {
+            let _ = write!(
+                output,
+                ", replay-samples={}",
+                self.streaming.replay_sample_count
+            );
+        }
+        if let Some(failure) = self.streaming.reconnect_terminal_failure_kind {
+            let _ = write!(output, ", reconnect-terminal-failure={}", failure.as_str());
+        }
         if self.streaming.timestamp_bearing_result_count > 0 {
             let _ = write!(
                 output,
@@ -395,6 +426,11 @@ pub struct StreamingStage {
     pub partial_event_count: u64,
     pub nonempty_partial_event_count: u64,
     pub segment_final_event_count: u64,
+    pub reconnect_attempted_count: u64,
+    pub reconnect_succeeded_count: u64,
+    pub replay_packet_count: u64,
+    pub replay_sample_count: u64,
+    pub reconnect_terminal_failure_kind: Option<FailureKind>,
     pub timestamp_bearing_result_count: u64,
     pub accepted_timed_unit_count: u64,
     /// Number of normal results whose timestamp metadata block contained at
@@ -1009,6 +1045,11 @@ mod tests {
         session.streaming.partial_event_count = 3;
         session.streaming.nonempty_partial_event_count = 2;
         session.streaming.segment_final_event_count = 1;
+        session.streaming.reconnect_attempted_count = 1;
+        session.streaming.reconnect_succeeded_count = 1;
+        session.streaming.replay_packet_count = 7;
+        session.streaming.replay_sample_count = 11_200;
+        session.streaming.reconnect_terminal_failure_kind = Some(FailureKind::Connection);
         session.streaming.timestamp_bearing_result_count = 4;
         session.streaming.accepted_timed_unit_count = 12;
         session
@@ -1031,6 +1072,11 @@ mod tests {
         let json = serde_json::to_value(&session).unwrap();
         assert!(text.contains("first-partial-latency-ms=900"));
         assert!(text.contains("nonempty-partial-events=2"));
+        assert!(text.contains("reconnect-attempted=1"));
+        assert!(text.contains("reconnect-succeeded=1"));
+        assert!(text.contains("replay-packets=7"));
+        assert!(text.contains("replay-samples=11200"));
+        assert!(text.contains("reconnect-terminal-failure=connection"));
         assert!(text.contains("timestamp-bearing-results=4"));
         assert!(text.contains("accepted-timed-units=12"));
         assert!(text.contains("results-with-rejected-timestamp-metadata=2"));
@@ -1040,6 +1086,14 @@ mod tests {
         assert_eq!(
             json["streaming"]["first_nonempty_partial_latency_ms"],
             1_200
+        );
+        assert_eq!(json["streaming"]["reconnect_attempted_count"], 1);
+        assert_eq!(json["streaming"]["reconnect_succeeded_count"], 1);
+        assert_eq!(json["streaming"]["replay_packet_count"], 7);
+        assert_eq!(json["streaming"]["replay_sample_count"], 11_200);
+        assert_eq!(
+            json["streaming"]["reconnect_terminal_failure_kind"],
+            "connection"
         );
         assert_eq!(json["streaming"]["timestamp_bearing_result_count"], 4);
         assert_eq!(json["streaming"]["accepted_timed_unit_count"], 12);
@@ -1081,13 +1135,18 @@ mod tests {
     }
 
     #[test]
-    fn schema_three_snapshot_defaults_new_timestamp_aggregates() {
+    fn schema_three_snapshot_defaults_new_streaming_aggregates() {
         let mut diagnostics = Diagnostics::inactive();
         diagnostics.start_session(31, Provider::AlibabaQwenAudio3, FinalPassKind::None, false);
         let mut persisted = serde_json::to_value(&diagnostics).unwrap();
         persisted["schema_version"] = json!(3);
         let streaming = persisted["session"]["streaming"].as_object_mut().unwrap();
         for field in [
+            "reconnect_attempted_count",
+            "reconnect_succeeded_count",
+            "replay_packet_count",
+            "replay_sample_count",
+            "reconnect_terminal_failure_kind",
             "timestamp_bearing_result_count",
             "accepted_timed_unit_count",
             "result_with_rejected_timestamp_metadata_count",
@@ -1101,6 +1160,11 @@ mod tests {
             serde_json::from_value(persisted).expect("schema 3 diagnostics remain readable");
         assert_eq!(restored.schema_version, 3);
         let streaming = &restored.session.as_ref().unwrap().streaming;
+        assert_eq!(streaming.reconnect_attempted_count, 0);
+        assert_eq!(streaming.reconnect_succeeded_count, 0);
+        assert_eq!(streaming.replay_packet_count, 0);
+        assert_eq!(streaming.replay_sample_count, 0);
+        assert_eq!(streaming.reconnect_terminal_failure_kind, None);
         assert_eq!(streaming.timestamp_bearing_result_count, 0);
         assert_eq!(streaming.accepted_timed_unit_count, 0);
         assert_eq!(streaming.result_with_rejected_timestamp_metadata_count, 0);

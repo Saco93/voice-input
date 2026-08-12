@@ -1,5 +1,6 @@
 use std::{
     borrow::Cow,
+    collections::VecDeque,
     fmt,
     net::{TcpStream, ToSocketAddrs},
     sync::{
@@ -87,6 +88,10 @@ impl DeadlineClock for ProductionClock {
 }
 
 const MAX_CONTROLS_PER_TICK: usize = 8;
+const MAX_AUDIO_SENDS_PER_TICK: usize = 8;
+const REPLAY_SPEED_MULTIPLIER: f64 = 4.0;
+const MAX_REPLAY_SECONDS: u64 = 300;
+const MAX_REPLAY_PCM_BYTES: u64 = 10 * 1024 * 1024;
 // Complete messages beyond this transport cap are protocol errors. Within the
 // cap, timestamp overflow is handled semantically and never drops transcript
 // text, so oversized timing arrays can be received and counted as truncated.
@@ -128,29 +133,649 @@ fn run_session(
         bail!("experimental Qwen-Audio-3 ASR requires an API key");
     }
 
-    let task_id = new_task_id();
-    let connect_timeout = Duration::from_millis(config.asr.connect_timeout_ms);
-    let clock = ProductionClock;
-    // Preserve the existing startup budget: connection establishment consumes
-    // time from the same deadline as the task-started wait.
-    let connect_deadline = clock.deadline_after(connect_timeout);
-    let mut socket = open_socket(audio3, &audio3.api_key, connect_timeout)?;
-    configure_socket(socket.get_mut())?;
-    run_established_socket(
-        &mut socket,
-        &clock,
-        EstablishedSession {
-            config: &config,
-            spec,
-            task_id: &task_id,
-            startup_deadline: connect_deadline,
-            control_rx,
-            abort_flag: &abort_flag,
-            event_tx: &event_tx,
-        },
+    run_reconnect_driver(
+        &config,
+        spec,
+        control_rx,
+        &abort_flag,
+        &event_tx,
+        &ProductionClock,
+        &mut ProductionSocketFactory,
+        &mut ProductionTaskIds,
+        &mut ProductionReplayPacer,
     )
 }
 
+trait SocketFactory {
+    type Socket: SocketIo;
+
+    fn open(
+        &mut self,
+        audio3: &AlibabaAudio3Config,
+        api_key: &str,
+        timeout: Duration,
+    ) -> Result<Self::Socket>;
+}
+
+struct ProductionSocketFactory;
+
+impl SocketFactory for ProductionSocketFactory {
+    type Socket = Audio3Socket;
+
+    fn open(
+        &mut self,
+        audio3: &AlibabaAudio3Config,
+        api_key: &str,
+        timeout: Duration,
+    ) -> Result<Self::Socket> {
+        let mut socket = open_socket(audio3, api_key, timeout)?;
+        configure_socket(socket.get_mut())?;
+        Ok(socket)
+    }
+}
+
+trait TaskIdSource {
+    fn next_task_id(&mut self) -> String;
+}
+
+struct ProductionTaskIds;
+
+impl TaskIdSource for ProductionTaskIds {
+    fn next_task_id(&mut self) -> String {
+        new_task_id()
+    }
+}
+
+trait ReplayPacer {
+    /// Returns false when cancellation was observed while pacing.
+    fn pace(&mut self, sample_count: usize, sample_rate_hz: u32, abort_flag: &AtomicBool) -> bool;
+}
+
+struct ProductionReplayPacer;
+
+impl ReplayPacer for ProductionReplayPacer {
+    fn pace(&mut self, sample_count: usize, sample_rate_hz: u32, abort_flag: &AtomicBool) -> bool {
+        if sample_count == 0 || sample_rate_hz == 0 {
+            return !abort_flag.load(Ordering::SeqCst);
+        }
+        let mut remaining = Duration::from_secs_f64(
+            sample_count as f64 / f64::from(sample_rate_hz) / REPLAY_SPEED_MULTIPLIER,
+        );
+        while !remaining.is_zero() {
+            if abort_flag.load(Ordering::SeqCst) {
+                return false;
+            }
+            let slice = remaining.min(Duration::from_millis(10));
+            thread::sleep(slice);
+            remaining = remaining.saturating_sub(slice);
+        }
+        !abort_flag.load(Ordering::SeqCst)
+    }
+}
+
+#[derive(Clone, Debug)]
+struct PendingPacket {
+    samples: Arc<[i16]>,
+    enqueued_at: Instant,
+}
+
+#[derive(Debug)]
+struct RetainedAudio {
+    packets: Vec<PendingPacket>,
+    sample_count: usize,
+    sample_limit: usize,
+    replay_enabled: bool,
+}
+
+impl RetainedAudio {
+    fn new(config: &Config, spec: AudioSpec) -> Self {
+        let duration_limit = u64::from(spec.sample_rate_hz)
+            .saturating_mul(config.audio.max_duration_secs.min(MAX_REPLAY_SECONDS));
+        let byte_limit = MAX_REPLAY_PCM_BYTES / u64::try_from(size_of::<i16>()).unwrap_or(2);
+        Self {
+            packets: Vec::new(),
+            sample_count: 0,
+            sample_limit: usize::try_from(duration_limit.min(byte_limit)).unwrap_or(usize::MAX),
+            replay_enabled: true,
+        }
+    }
+
+    fn retain(&mut self, packet: PendingPacket) {
+        if !self.replay_enabled {
+            return;
+        }
+        let Some(next_count) = self.sample_count.checked_add(packet.samples.len()) else {
+            self.disable();
+            return;
+        };
+        if next_count > self.sample_limit {
+            self.disable();
+            return;
+        }
+        self.sample_count = next_count;
+        self.packets.push(packet);
+    }
+
+    fn disable(&mut self) {
+        self.replay_enabled = false;
+        self.sample_count = 0;
+        self.packets.clear();
+    }
+
+    fn take_replay_queue(&mut self) -> Option<VecDeque<PendingPacket>> {
+        self.replay_enabled.then(|| {
+            self.sample_count = 0;
+            std::mem::take(&mut self.packets).into()
+        })
+    }
+}
+
+#[derive(Default)]
+struct ReconnectAggregate {
+    attempted: u64,
+    succeeded: u64,
+    replay_packet_count: u64,
+    replay_sample_count: u64,
+    terminal_failure_kind: Option<FailureKind>,
+}
+
+impl ReconnectAggregate {
+    fn emit(&self, event_tx: &mpsc::Sender<AsrEvent>) {
+        let _ = event_tx.send(AsrEvent::StreamingReconnect {
+            attempted: self.attempted,
+            succeeded: self.succeeded,
+            replay_packet_count: self.replay_packet_count,
+            replay_sample_count: self.replay_sample_count,
+            terminal_failure_kind: self.terminal_failure_kind,
+        });
+    }
+
+    fn fail(&mut self, event_tx: &mpsc::Sender<AsrEvent>) {
+        self.terminal_failure_kind = Some(FailureKind::Connection);
+        self.emit(event_tx);
+        let _ = event_tx.send(AsrEvent::Error {
+            kind: FailureKind::Connection,
+        });
+    }
+}
+
+enum ActiveAttemptOutcome {
+    Completed,
+    Cancelled,
+    Disconnected { reconnect_allowed: bool },
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_reconnect_driver<F, I, P, C>(
+    config: &Config,
+    spec: AudioSpec,
+    control_rx: mpsc::Receiver<AsrControl>,
+    abort_flag: &AtomicBool,
+    event_tx: &mpsc::Sender<AsrEvent>,
+    clock: &C,
+    factory: &mut F,
+    task_ids: &mut I,
+    pacer: &mut P,
+) -> Result<()>
+where
+    F: SocketFactory,
+    I: TaskIdSource,
+    P: ReplayPacer,
+    C: DeadlineClock,
+{
+    if abort_flag.load(Ordering::SeqCst) {
+        return Ok(());
+    }
+    let audio3 = &config.asr.alibaba_audio3;
+    let connect_timeout = Duration::from_millis(config.asr.connect_timeout_ms);
+    // The bounded capture queue holds roughly 16 seconds. Keep replacement
+    // establishment below that window so live capture cannot overflow while
+    // the synchronous TCP/TLS handshake is in progress.
+    let replacement_connect_timeout = connect_timeout.min(Duration::from_secs(5));
+    let startup_deadline = clock.deadline_after(connect_timeout);
+    let initial_task_id = task_ids.next_task_id();
+    let mut socket = factory.open(audio3, &audio3.api_key, connect_timeout)?;
+    if abort_flag.load(Ordering::SeqCst) {
+        let _ = socket.close_socket();
+        return Ok(());
+    }
+    if !start_task(
+        &mut socket,
+        clock,
+        config,
+        spec,
+        &initial_task_id,
+        startup_deadline,
+        abort_flag,
+        event_tx,
+        None,
+    )? {
+        return Ok(());
+    }
+    let _ = event_tx.send(AsrEvent::Ready);
+
+    let mut retained = RetainedAudio::new(config, spec);
+    let mut pending = VecDeque::new();
+    let mut finish_requested = false;
+    let mut reconnect = ReconnectAggregate::default();
+    let mut task_id = initial_task_id;
+    let mut replacement = false;
+
+    loop {
+        match run_active_attempt(
+            &mut socket,
+            clock,
+            config,
+            spec,
+            &task_id,
+            &control_rx,
+            abort_flag,
+            event_tx,
+            &mut pending,
+            &mut finish_requested,
+            (!replacement).then_some(&mut retained),
+            replacement,
+            pacer,
+            &mut reconnect,
+        )? {
+            ActiveAttemptOutcome::Completed => {
+                if reconnect.attempted > 0 {
+                    reconnect.emit(event_tx);
+                }
+                return Ok(());
+            }
+            ActiveAttemptOutcome::Cancelled => return Ok(()),
+            ActiveAttemptOutcome::Disconnected { reconnect_allowed } => {
+                if !reconnect_allowed {
+                    let _ = socket.close_socket();
+                    if replacement {
+                        reconnect.fail(event_tx);
+                    } else {
+                        let _ = event_tx.send(AsrEvent::Error {
+                            kind: FailureKind::Connection,
+                        });
+                    }
+                    bail!("Qwen-Audio-3 connection interrupted after finish-task");
+                }
+            }
+        }
+
+        let _ = socket.close_socket();
+        if replacement {
+            reconnect.fail(event_tx);
+            bail!("Qwen-Audio-3 replacement connection interrupted");
+        }
+        let Some(replay_queue) = retained.take_replay_queue() else {
+            let _ = event_tx.send(AsrEvent::Error {
+                kind: FailureKind::Connection,
+            });
+            bail!("Qwen-Audio-3 connection interrupted after replay retention was disabled");
+        };
+
+        reconnect.attempted = 1;
+        reconnect.emit(event_tx);
+        let _ = event_tx.send(AsrEvent::TranscriptReset);
+        let _ = event_tx.send(AsrEvent::RealtimeRestarting);
+        if abort_flag.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+
+        pending = replay_queue;
+        drain_controls(&control_rx, &mut pending, &mut finish_requested, None)?;
+        let replacement_deadline = clock.deadline_after(replacement_connect_timeout);
+        let opened = factory.open(audio3, &audio3.api_key, replacement_connect_timeout);
+        if abort_flag.load(Ordering::SeqCst) {
+            if let Ok(mut socket) = opened {
+                let _ = socket.close_socket();
+            }
+            return Ok(());
+        }
+        let mut replacement_socket = match opened {
+            Ok(socket) => socket,
+            Err(_) => {
+                reconnect.fail(event_tx);
+                bail!("Qwen-Audio-3 replacement connection failed");
+            }
+        };
+        drain_controls(&control_rx, &mut pending, &mut finish_requested, None)?;
+        let replacement_task_id = task_ids.next_task_id();
+        if replacement_task_id == task_id {
+            let _ = replacement_socket.close_socket();
+            reconnect.fail(event_tx);
+            bail!("Qwen-Audio-3 replacement task ID was not distinct");
+        }
+        let started = start_task(
+            &mut replacement_socket,
+            clock,
+            config,
+            spec,
+            &replacement_task_id,
+            replacement_deadline,
+            abort_flag,
+            event_tx,
+            Some((&control_rx, &mut pending, &mut finish_requested)),
+        );
+        match started {
+            Ok(true) => {}
+            Ok(false) => return Ok(()),
+            Err(error) => {
+                let _ = replacement_socket.close_socket();
+                // start_task reports provider task failures itself. Preserve
+                // that classification instead of emitting a second, false
+                // connection error.
+                if !error
+                    .to_string()
+                    .starts_with("Qwen-Audio-3 streaming ASR failed")
+                {
+                    reconnect.fail(event_tx);
+                }
+                return Err(error).context("Qwen-Audio-3 replacement startup failed");
+            }
+        }
+        reconnect.succeeded = 1;
+        reconnect.emit(event_tx);
+        let _ = event_tx.send(AsrEvent::RealtimeRestarted);
+        socket = replacement_socket;
+        task_id = replacement_task_id;
+        replacement = true;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn start_task<S: SocketIo, C: DeadlineClock>(
+    socket: &mut S,
+    clock: &C,
+    config: &Config,
+    spec: AudioSpec,
+    task_id: &str,
+    startup_deadline: C::Deadline,
+    abort_flag: &AtomicBool,
+    event_tx: &mpsc::Sender<AsrEvent>,
+    mut replacement_controls: Option<(
+        &mpsc::Receiver<AsrControl>,
+        &mut VecDeque<PendingPacket>,
+        &mut bool,
+    )>,
+) -> Result<bool> {
+    if abort_flag.load(Ordering::SeqCst) {
+        let _ = socket.close_socket();
+        return Ok(false);
+    }
+    if let Some((control_rx, pending, finish_requested)) = replacement_controls.as_mut() {
+        drain_controls(control_rx, pending, finish_requested, None)?;
+    }
+    if abort_flag.load(Ordering::SeqCst) {
+        let _ = socket.close_socket();
+        return Ok(false);
+    }
+    let audio3 = &config.asr.alibaba_audio3;
+    let recognition = audio3.effective_recognition_controls();
+    socket
+        .send_message(Message::Text(
+            run_task_envelope(
+                task_id,
+                &audio3.model,
+                spec,
+                Audio3RequestControls {
+                    language: config.asr.language,
+                    language_hints_enabled: audio3.language_hints_enabled,
+                    heartbeat_enabled: audio3.heartbeat_enabled,
+                    recognition,
+                    vocabulary: &audio3.vocabulary,
+                },
+            )
+            .to_string(),
+        ))
+        .context("failed to send Qwen-Audio-3 run-task")?;
+
+    loop {
+        if abort_flag.load(Ordering::SeqCst) {
+            let _ = socket.close_socket();
+            return Ok(false);
+        }
+        if let Some((control_rx, pending, finish_requested)) = replacement_controls.as_mut() {
+            drain_controls(control_rx, pending, finish_requested, None)?;
+        }
+        if clock.is_expired(startup_deadline) {
+            let _ = socket.close_socket();
+            bail!("Qwen-Audio-3 task-started timed out");
+        }
+        match socket.read_message() {
+            Ok(Message::Close(_)) => bail!("Qwen-Audio-3 websocket closed before task-started"),
+            Ok(message) => match parse_server_event(message, task_id)? {
+                Some(ServerEvent::TaskStarted) => return Ok(true),
+                Some(ServerEvent::TaskFailed {
+                    kind,
+                    provider_error_code,
+                }) => {
+                    return report_task_failure(event_tx, kind, provider_error_code).map(|_| false);
+                }
+                Some(_) => bail!("Qwen-Audio-3 server event arrived before task-started"),
+                None => {}
+            },
+            Err(error) if socket_error_is_polling(&error) => {}
+            Err(error) => return Err(error).context("failed to read Qwen-Audio-3 websocket"),
+        }
+    }
+}
+
+fn drain_controls(
+    control_rx: &mpsc::Receiver<AsrControl>,
+    pending: &mut VecDeque<PendingPacket>,
+    finish_requested: &mut bool,
+    mut retained: Option<&mut RetainedAudio>,
+) -> Result<()> {
+    if *finish_requested {
+        return Ok(());
+    }
+    for _ in 0..MAX_CONTROLS_PER_TICK {
+        match control_rx.try_recv() {
+            Ok(AsrControl::AppendPcm16 {
+                samples,
+                enqueued_at,
+            }) => {
+                let packet = PendingPacket {
+                    samples: Arc::from(samples),
+                    enqueued_at,
+                };
+                if let Some(retained) = retained.as_deref_mut() {
+                    retained.retain(packet.clone());
+                }
+                pending.push_back(packet);
+            }
+            Ok(AsrControl::Finish) => {
+                *finish_requested = true;
+                break;
+            }
+            Err(mpsc::TryRecvError::Empty) => break,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                bail!("Qwen-Audio-3 control channel disconnected before finish")
+            }
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_active_attempt<S: SocketIo, C: DeadlineClock, P: ReplayPacer>(
+    socket: &mut S,
+    clock: &C,
+    config: &Config,
+    spec: AudioSpec,
+    task_id: &str,
+    control_rx: &mpsc::Receiver<AsrControl>,
+    abort_flag: &AtomicBool,
+    event_tx: &mpsc::Sender<AsrEvent>,
+    pending: &mut VecDeque<PendingPacket>,
+    finish_requested: &mut bool,
+    mut retained: Option<&mut RetainedAudio>,
+    replacement: bool,
+    pacer: &mut P,
+    reconnect: &mut ReconnectAggregate,
+) -> Result<ActiveAttemptOutcome> {
+    let mut finish_sent = false;
+    let mut finalize_deadline = None;
+    let mut assembler = TranscriptAssembler::default();
+    let mut audio_packet_count = 0_u64;
+    let mut audio_sample_count = 0_u64;
+    let mut max_audio_queue_delay_ms = 0_u64;
+    let mut last_audio_queue_delay_ms = 0_u64;
+    let mut replaying = replacement;
+
+    loop {
+        if abort_flag.load(Ordering::SeqCst) {
+            let _ = socket.close_socket();
+            return Ok(ActiveAttemptOutcome::Cancelled);
+        }
+        if !finish_sent {
+            drain_controls(
+                control_rx,
+                pending,
+                finish_requested,
+                retained.as_deref_mut(),
+            )?;
+        }
+
+        for _ in 0..MAX_AUDIO_SENDS_PER_TICK {
+            let Some(packet) = pending.front() else {
+                if replaying {
+                    replaying = false;
+                    reconnect.emit(event_tx);
+                }
+                break;
+            };
+            match socket.send_message(Message::Binary(pcm16_le_bytes(&packet.samples))) {
+                Ok(()) => {
+                    let packet = pending.pop_front().expect("pending packet disappeared");
+                    let queue_delay_ms = duration_ms(packet.enqueued_at.elapsed());
+                    audio_packet_count = audio_packet_count.saturating_add(1);
+                    audio_sample_count = audio_sample_count
+                        .saturating_add(u64::try_from(packet.samples.len()).unwrap_or(u64::MAX));
+                    max_audio_queue_delay_ms = max_audio_queue_delay_ms.max(queue_delay_ms);
+                    last_audio_queue_delay_ms = queue_delay_ms;
+                    if replaying {
+                        reconnect.replay_packet_count =
+                            reconnect.replay_packet_count.saturating_add(1);
+                        reconnect.replay_sample_count =
+                            reconnect.replay_sample_count.saturating_add(
+                                u64::try_from(packet.samples.len()).unwrap_or(u64::MAX),
+                            );
+                        if !pacer.pace(packet.samples.len(), spec.sample_rate_hz, abort_flag) {
+                            let _ = socket.close_socket();
+                            return Ok(ActiveAttemptOutcome::Cancelled);
+                        }
+                    }
+                }
+                Err(error) if socket_error_is_polling(&error) => break,
+                Err(error) if socket_error_is_disconnect(&error) && !finish_sent => {
+                    return Ok(ActiveAttemptOutcome::Disconnected {
+                        reconnect_allowed: true,
+                    });
+                }
+                Err(error) => return Err(error).context("failed to send Qwen-Audio-3 PCM"),
+            }
+        }
+
+        if *finish_requested && pending.is_empty() && !finish_sent {
+            match socket.send_message(Message::Text(finish_task_envelope(task_id).to_string())) {
+                Ok(()) => {
+                    let _ = event_tx.send(AsrEvent::AudioDeliveryCompleted {
+                        packet_count: audio_packet_count,
+                        sample_count: audio_sample_count,
+                        max_queue_delay_ms: max_audio_queue_delay_ms,
+                        last_queue_delay_ms: last_audio_queue_delay_ms,
+                    });
+                    finish_sent = true;
+                    finalize_deadline = Some(
+                        clock.deadline_after(Duration::from_millis(config.asr.finalize_timeout_ms)),
+                    );
+                }
+                Err(error) if socket_error_is_polling(&error) => {}
+                Err(error) if socket_error_is_disconnect(&error) => {
+                    return Ok(ActiveAttemptOutcome::Disconnected {
+                        reconnect_allowed: true,
+                    });
+                }
+                Err(error) => {
+                    return Err(error).context("failed to send Qwen-Audio-3 finish-task");
+                }
+            }
+        }
+
+        match socket.read_message() {
+            Ok(Message::Close(_)) => {
+                return Ok(ActiveAttemptOutcome::Disconnected {
+                    reconnect_allowed: !finish_sent,
+                });
+            }
+            Ok(message) => {
+                let parsed = parse_server_event(message, task_id).inspect_err(|_| {
+                    let _ = event_tx.send(AsrEvent::Error {
+                        kind: FailureKind::Protocol,
+                    });
+                })?;
+                if let Some(event) = parsed {
+                    match event {
+                        ServerEvent::TaskStarted => {
+                            bail!("Qwen-Audio-3 server sent duplicate task-started event")
+                        }
+                        ServerEvent::ResultGenerated {
+                            text,
+                            sentence_final,
+                            timestamp_summary,
+                        } => {
+                            let _ = event_tx.send(AsrEvent::TimestampDiagnostics {
+                                delta: timestamp_summary.into(),
+                            });
+                            if sentence_final {
+                                let text = assembler.apply_segment_final(text);
+                                if !text.is_empty() {
+                                    let _ = event_tx.send(AsrEvent::SegmentFinal { text });
+                                }
+                            } else {
+                                let (committed, unstable) = assembler.apply_partial(text);
+                                let _ = event_tx.send(AsrEvent::Partial {
+                                    committed,
+                                    unstable,
+                                });
+                            }
+                        }
+                        ServerEvent::TaskFinished { text } => {
+                            let final_text = assembler.finish(text);
+                            if !final_text.is_empty() {
+                                let _ = event_tx.send(AsrEvent::Final { text: final_text });
+                            }
+                            let _ = event_tx.send(AsrEvent::Finished);
+                            let _ = socket.close_socket();
+                            return Ok(ActiveAttemptOutcome::Completed);
+                        }
+                        ServerEvent::TaskFailed {
+                            kind,
+                            provider_error_code,
+                        } => {
+                            return report_task_failure(event_tx, kind, provider_error_code)
+                                .map(|_| ActiveAttemptOutcome::Completed);
+                        }
+                    }
+                }
+            }
+            Err(error) if socket_error_is_polling(&error) => {}
+            Err(error) if socket_error_is_disconnect(&error) => {
+                return Ok(ActiveAttemptOutcome::Disconnected {
+                    reconnect_allowed: !finish_sent,
+                });
+            }
+            Err(error) => return Err(error).context("failed to read Qwen-Audio-3 websocket"),
+        }
+
+        if finalize_deadline.is_some_and(|deadline| clock.is_expired(deadline)) {
+            let _ = socket.close_socket();
+            bail!("Qwen-Audio-3 finalization timed out");
+        }
+    }
+}
+
+#[cfg(test)]
 struct EstablishedSession<'a, D> {
     config: &'a Config,
     spec: AudioSpec,
@@ -161,6 +786,7 @@ struct EstablishedSession<'a, D> {
     event_tx: &'a mpsc::Sender<AsrEvent>,
 }
 
+#[cfg(test)]
 fn run_established_socket<S: SocketIo, C: DeadlineClock>(
     socket: &mut S,
     clock: &C,
@@ -329,6 +955,7 @@ fn run_established_socket<S: SocketIo, C: DeadlineClock>(
     }
 }
 
+#[cfg(test)]
 fn await_task_started<S: SocketIo, C: DeadlineClock>(
     socket: &mut S,
     clock: &C,
@@ -376,13 +1003,36 @@ fn await_task_started<S: SocketIo, C: DeadlineClock>(
     }
 }
 
-fn socket_error_is_retryable(error: &tungstenite::Error) -> bool {
+fn socket_error_is_polling(error: &tungstenite::Error) -> bool {
     matches!(
         error,
         tungstenite::Error::Io(error)
             if error.kind() == std::io::ErrorKind::WouldBlock
                 || error.kind() == std::io::ErrorKind::TimedOut
     )
+}
+
+fn socket_error_is_disconnect(error: &tungstenite::Error) -> bool {
+    matches!(
+        error,
+        tungstenite::Error::ConnectionClosed | tungstenite::Error::AlreadyClosed
+    ) || matches!(
+        error,
+        tungstenite::Error::Io(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::UnexpectedEof
+                    | std::io::ErrorKind::NotConnected
+            )
+    )
+}
+
+#[cfg(test)]
+fn socket_error_is_retryable(error: &tungstenite::Error) -> bool {
+    socket_error_is_polling(error)
 }
 
 fn report_task_failure(
@@ -501,6 +1151,7 @@ fn configure_socket(stream: &mut MaybeTlsStream<TcpStream>) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 fn send_json(socket: &mut impl SocketIo, payload: Value) -> Result<()> {
     socket
         .send_message(Message::Text(payload.to_string()))
@@ -1517,6 +2168,7 @@ mod tests {
 
     use std::{
         borrow::Cow,
+        collections::VecDeque,
         io,
         sync::{
             Arc,
@@ -1539,10 +2191,11 @@ mod tests {
     use super::{
         Audio3RequestControls, Audio3TimestampSummary, AudioSpec, BorrowedResultEnvelope,
         DeadlineClock, EstablishedSession, MAX_SERVER_MESSAGE_BYTES, MAX_TIMED_UNITS_PER_RESULT,
-        ServerEvent, SocketIo, SocketResult, TimestampDiagnosticsDelta, TranscriptAssembler,
-        finish_task_envelope, new_task_id, parse_server_event, pcm16_le_bytes, report_task_failure,
-        run_established_socket, run_task_envelope, sanitize_websocket_handshake_failure,
-        websocket_request, websocket_request_for_config,
+        ReplayPacer, RetainedAudio, ServerEvent, SocketFactory, SocketIo, SocketResult,
+        TaskIdSource, TimestampDiagnosticsDelta, TranscriptAssembler, finish_task_envelope,
+        new_task_id, parse_server_event, pcm16_le_bytes, report_task_failure,
+        run_established_socket, run_reconnect_driver, run_task_envelope,
+        sanitize_websocket_handshake_failure, websocket_request, websocket_request_for_config,
     };
 
     const TASK_ID: &str = "0123456789abcdef0123456789abcdef";
@@ -1581,6 +2234,7 @@ mod tests {
     enum ScriptRead {
         Message(Message),
         WouldBlock,
+        Disconnect(io::ErrorKind),
     }
 
     #[derive(Debug)]
@@ -1612,6 +2266,9 @@ mod tests {
                 ScriptRead::WouldBlock => Err(Box::new(tungstenite::Error::Io(io::Error::from(
                     io::ErrorKind::WouldBlock,
                 )))),
+                ScriptRead::Disconnect(kind) => {
+                    Err(Box::new(tungstenite::Error::Io(io::Error::from(kind))))
+                }
             }
         }
 
@@ -1767,6 +2424,770 @@ mod tests {
             )
         });
         (control_tx, read_tx, checkpoint_rx, event_rx, join)
+    }
+
+    struct FactorySocket {
+        script: mpsc::Receiver<ScriptRead>,
+        sent: mpsc::Sender<Message>,
+        closed: mpsc::Sender<usize>,
+        index: usize,
+    }
+
+    impl SocketIo for FactorySocket {
+        fn send_message(&mut self, message: Message) -> SocketResult<()> {
+            self.sent.send(message).unwrap();
+            Ok(())
+        }
+
+        fn read_message(&mut self) -> SocketResult<Message> {
+            match self.script.recv().unwrap() {
+                ScriptRead::Message(message) => Ok(message),
+                ScriptRead::WouldBlock => Err(Box::new(tungstenite::Error::Io(io::Error::from(
+                    io::ErrorKind::WouldBlock,
+                )))),
+                ScriptRead::Disconnect(kind) => {
+                    Err(Box::new(tungstenite::Error::Io(io::Error::from(kind))))
+                }
+            }
+        }
+
+        fn close_socket(&mut self) -> SocketResult<()> {
+            self.closed.send(self.index).unwrap();
+            Ok(())
+        }
+    }
+
+    struct ScriptedFactory {
+        scripts: VecDeque<mpsc::Receiver<ScriptRead>>,
+        sent: mpsc::Sender<Message>,
+        closed: mpsc::Sender<usize>,
+        open_count: Arc<AtomicU64>,
+    }
+
+    impl SocketFactory for ScriptedFactory {
+        type Socket = FactorySocket;
+
+        fn open(
+            &mut self,
+            _audio3: &AlibabaAudio3Config,
+            _api_key: &str,
+            _timeout: Duration,
+        ) -> anyhow::Result<Self::Socket> {
+            let index = usize::try_from(self.open_count.fetch_add(1, Ordering::SeqCst)).unwrap();
+            let script = self
+                .scripts
+                .pop_front()
+                .ok_or_else(|| anyhow::anyhow!("unexpected socket open"))?;
+            Ok(FactorySocket {
+                script,
+                sent: self.sent.clone(),
+                closed: self.closed.clone(),
+                index,
+            })
+        }
+    }
+
+    struct FixedTaskIds(VecDeque<String>);
+
+    impl TaskIdSource for FixedTaskIds {
+        fn next_task_id(&mut self) -> String {
+            self.0.pop_front().expect("missing task ID")
+        }
+    }
+
+    #[derive(Default)]
+    struct NoopPacer;
+
+    impl ReplayPacer for NoopPacer {
+        fn pace(
+            &mut self,
+            _sample_count: usize,
+            _sample_rate_hz: u32,
+            abort_flag: &AtomicBool,
+        ) -> bool {
+            !abort_flag.load(Ordering::SeqCst)
+        }
+    }
+
+    struct CancellingPacer;
+
+    impl ReplayPacer for CancellingPacer {
+        fn pace(
+            &mut self,
+            _sample_count: usize,
+            _sample_rate_hz: u32,
+            abort_flag: &AtomicBool,
+        ) -> bool {
+            abort_flag.store(true, Ordering::SeqCst);
+            false
+        }
+    }
+
+    fn task_event(task_id: &str, event: &str, payload: serde_json::Value) -> Message {
+        Message::Text(
+            json!({
+                "header": {"event": event, "task_id": task_id},
+                "payload": payload,
+            })
+            .to_string(),
+        )
+    }
+
+    fn sent_json(sent_rx: &mpsc::Receiver<Message>) -> serde_json::Value {
+        let Message::Text(text) = sent_rx.recv_timeout(Duration::from_secs(1)).unwrap() else {
+            panic!("expected JSON message");
+        };
+        serde_json::from_str(&text).unwrap()
+    }
+
+    #[test]
+    fn reconnect_replays_exact_prefix_to_distinct_task_and_only_replacement_final_survives() {
+        let mut config = crate::config::Config::default();
+        config.asr.alibaba_audio3.experimental_enabled = true;
+        config.asr.alibaba_audio3.api_key = "test".into();
+        let first_id = "11111111-1111-1111-1111-111111111111";
+        let second_id = "22222222-2222-2222-2222-222222222222";
+        let (first_tx, first_rx) = mpsc::channel();
+        let (second_tx, second_rx) = mpsc::channel();
+        let (sent_tx, sent_rx) = mpsc::channel();
+        let (closed_tx, _closed_rx) = mpsc::channel();
+        let open_count = Arc::new(AtomicU64::new(0));
+        let mut factory = ScriptedFactory {
+            scripts: VecDeque::from([first_rx, second_rx]),
+            sent: sent_tx,
+            closed: closed_tx,
+            open_count: open_count.clone(),
+        };
+        let mut ids = FixedTaskIds(VecDeque::from([first_id.into(), second_id.into()]));
+        let mut pacer = NoopPacer;
+        let clock = ManualClock::default();
+        let abort = AtomicBool::new(false);
+        let (control_tx, control_rx) = mpsc::channel();
+        let (event_tx, event_rx) = mpsc::channel();
+        let join = thread::spawn(move || {
+            run_reconnect_driver(
+                &config,
+                AudioSpec {
+                    sample_rate_hz: 16_000,
+                },
+                control_rx,
+                &abort,
+                &event_tx,
+                &clock,
+                &mut factory,
+                &mut ids,
+                &mut pacer,
+            )
+        });
+
+        assert_eq!(sent_json(&sent_rx)["header"]["task_id"], first_id);
+        first_tx
+            .send(ScriptRead::Message(task_event(
+                first_id,
+                "task-started",
+                json!({}),
+            )))
+            .unwrap();
+        assert!(matches!(event_rx.recv().unwrap(), AsrEvent::Ready));
+        control_tx
+            .send(crate::backend::AsrControl::append_pcm16(vec![1, -2, 3]))
+            .unwrap();
+        first_tx.send(ScriptRead::WouldBlock).unwrap();
+        assert_eq!(
+            sent_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            Message::Binary(pcm16_le_bytes(&[1, -2, 3]))
+        );
+        first_tx
+            .send(ScriptRead::Message(task_event(
+                first_id,
+                "result-generated",
+                json!({"output": {"sentence": {"text": "old", "sentence_end": false}}}),
+            )))
+            .unwrap();
+        assert!(matches!(
+            event_rx.recv().unwrap(),
+            AsrEvent::TimestampDiagnostics { .. }
+        ));
+        assert!(
+            matches!(event_rx.recv().unwrap(), AsrEvent::Partial { unstable, .. } if unstable == "old")
+        );
+        first_tx
+            .send(ScriptRead::Disconnect(io::ErrorKind::ConnectionReset))
+            .unwrap();
+        assert!(matches!(
+            event_rx.recv().unwrap(),
+            AsrEvent::StreamingReconnect { attempted: 1, .. }
+        ));
+        assert!(matches!(
+            event_rx.recv().unwrap(),
+            AsrEvent::TranscriptReset
+        ));
+        assert!(matches!(
+            event_rx.recv().unwrap(),
+            AsrEvent::RealtimeRestarting
+        ));
+        assert_eq!(sent_json(&sent_rx)["header"]["task_id"], second_id);
+        second_tx
+            .send(ScriptRead::Message(task_event(
+                second_id,
+                "task-started",
+                json!({}),
+            )))
+            .unwrap();
+        assert!(matches!(
+            event_rx.recv().unwrap(),
+            AsrEvent::StreamingReconnect { succeeded: 1, .. }
+        ));
+        assert!(matches!(
+            event_rx.recv().unwrap(),
+            AsrEvent::RealtimeRestarted
+        ));
+        assert_eq!(
+            sent_rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            Message::Binary(pcm16_le_bytes(&[1, -2, 3]))
+        );
+        second_tx.send(ScriptRead::WouldBlock).unwrap();
+        control_tx.send(crate::backend::AsrControl::Finish).unwrap();
+        second_tx.send(ScriptRead::WouldBlock).unwrap();
+        assert_eq!(sent_json(&sent_rx)["header"]["action"], "finish-task");
+        loop {
+            match event_rx.recv().unwrap() {
+                AsrEvent::AudioDeliveryCompleted {
+                    sample_count: 3, ..
+                } => break,
+                AsrEvent::StreamingReconnect { .. } => {}
+                event => panic!("unexpected event before audio completion: {event:?}"),
+            }
+        }
+        second_tx
+            .send(ScriptRead::Message(task_event(
+                second_id,
+                "task-finished",
+                json!({"output": {"text": "replacement"}}),
+            )))
+            .unwrap();
+        assert!(
+            matches!(event_rx.recv().unwrap(), AsrEvent::Final { text } if text == "replacement")
+        );
+        assert!(matches!(event_rx.recv().unwrap(), AsrEvent::Finished));
+        join.join().unwrap().unwrap();
+        assert_eq!(open_count.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn finish_during_replacement_startup_waits_for_full_replay() {
+        let mut config = crate::config::Config::default();
+        config.asr.alibaba_audio3.experimental_enabled = true;
+        config.asr.alibaba_audio3.api_key = "test".into();
+        let first_id = "11111111-1111-1111-1111-111111111111";
+        let second_id = "22222222-2222-2222-2222-222222222222";
+        let (first_tx, first_rx) = mpsc::channel();
+        let (second_tx, second_rx) = mpsc::channel();
+        let (sent_tx, sent_rx) = mpsc::channel();
+        let (closed_tx, _closed_rx) = mpsc::channel();
+        let mut factory = ScriptedFactory {
+            scripts: VecDeque::from([first_rx, second_rx]),
+            sent: sent_tx,
+            closed: closed_tx,
+            open_count: Arc::new(AtomicU64::new(0)),
+        };
+        let mut ids = FixedTaskIds(VecDeque::from([first_id.into(), second_id.into()]));
+        let abort = AtomicBool::new(false);
+        let (control_tx, control_rx) = mpsc::channel();
+        let (event_tx, event_rx) = mpsc::channel();
+        let join = thread::spawn(move || {
+            run_reconnect_driver(
+                &config,
+                AudioSpec {
+                    sample_rate_hz: 16_000,
+                },
+                control_rx,
+                &abort,
+                &event_tx,
+                &ManualClock::default(),
+                &mut factory,
+                &mut ids,
+                &mut NoopPacer,
+            )
+        });
+        let _ = sent_json(&sent_rx);
+        first_tx
+            .send(ScriptRead::Message(task_event(
+                first_id,
+                "task-started",
+                json!({}),
+            )))
+            .unwrap();
+        assert!(matches!(event_rx.recv().unwrap(), AsrEvent::Ready));
+        control_tx
+            .send(crate::backend::AsrControl::append_pcm16(vec![4, 5]))
+            .unwrap();
+        first_tx.send(ScriptRead::WouldBlock).unwrap();
+        assert_eq!(
+            sent_rx.recv().unwrap(),
+            Message::Binary(pcm16_le_bytes(&[4, 5]))
+        );
+        first_tx
+            .send(ScriptRead::Disconnect(io::ErrorKind::ConnectionAborted))
+            .unwrap();
+        assert!(matches!(
+            event_rx.recv().unwrap(),
+            AsrEvent::StreamingReconnect { .. }
+        ));
+        assert!(matches!(
+            event_rx.recv().unwrap(),
+            AsrEvent::TranscriptReset
+        ));
+        assert!(matches!(
+            event_rx.recv().unwrap(),
+            AsrEvent::RealtimeRestarting
+        ));
+        let _ = sent_json(&sent_rx);
+        control_tx.send(crate::backend::AsrControl::Finish).unwrap();
+        second_tx.send(ScriptRead::WouldBlock).unwrap();
+        second_tx
+            .send(ScriptRead::Message(task_event(
+                second_id,
+                "task-started",
+                json!({}),
+            )))
+            .unwrap();
+        assert!(matches!(
+            event_rx.recv().unwrap(),
+            AsrEvent::StreamingReconnect { succeeded: 1, .. }
+        ));
+        assert!(matches!(
+            event_rx.recv().unwrap(),
+            AsrEvent::RealtimeRestarted
+        ));
+        assert_eq!(
+            sent_rx.recv().unwrap(),
+            Message::Binary(pcm16_le_bytes(&[4, 5]))
+        );
+        second_tx.send(ScriptRead::WouldBlock).unwrap();
+        assert_eq!(sent_json(&sent_rx)["header"]["action"], "finish-task");
+        loop {
+            match event_rx.recv().unwrap() {
+                AsrEvent::AudioDeliveryCompleted { .. } => break,
+                AsrEvent::StreamingReconnect { .. } => {}
+                event => panic!("unexpected event: {event:?}"),
+            }
+        }
+        second_tx
+            .send(ScriptRead::Message(task_event(
+                second_id,
+                "task-finished",
+                json!({}),
+            )))
+            .unwrap();
+        assert!(matches!(event_rx.recv().unwrap(), AsrEvent::Finished));
+        join.join().unwrap().unwrap();
+    }
+
+    #[test]
+    fn cancellation_during_replay_closes_replacement_without_terminal_events() {
+        let mut config = crate::config::Config::default();
+        config.asr.alibaba_audio3.experimental_enabled = true;
+        config.asr.alibaba_audio3.api_key = "test".into();
+        let first_id = "11111111-1111-1111-1111-111111111111";
+        let second_id = "22222222-2222-2222-2222-222222222222";
+        let (first_tx, first_rx) = mpsc::channel();
+        let (second_tx, second_rx) = mpsc::channel();
+        let (sent_tx, sent_rx) = mpsc::channel();
+        let (closed_tx, closed_rx) = mpsc::channel();
+        let mut factory = ScriptedFactory {
+            scripts: VecDeque::from([first_rx, second_rx]),
+            sent: sent_tx,
+            closed: closed_tx,
+            open_count: Arc::new(AtomicU64::new(0)),
+        };
+        let mut ids = FixedTaskIds(VecDeque::from([first_id.into(), second_id.into()]));
+        let abort = Arc::new(AtomicBool::new(false));
+        let worker_abort = abort.clone();
+        let (control_tx, control_rx) = mpsc::channel();
+        let (event_tx, event_rx) = mpsc::channel();
+        let join = thread::spawn(move || {
+            run_reconnect_driver(
+                &config,
+                AudioSpec {
+                    sample_rate_hz: 16_000,
+                },
+                control_rx,
+                &worker_abort,
+                &event_tx,
+                &ManualClock::default(),
+                &mut factory,
+                &mut ids,
+                &mut CancellingPacer,
+            )
+        });
+        let _ = sent_json(&sent_rx);
+        first_tx
+            .send(ScriptRead::Message(task_event(
+                first_id,
+                "task-started",
+                json!({}),
+            )))
+            .unwrap();
+        assert!(matches!(event_rx.recv().unwrap(), AsrEvent::Ready));
+        control_tx
+            .send(crate::backend::AsrControl::append_pcm16(vec![8, 9]))
+            .unwrap();
+        first_tx.send(ScriptRead::WouldBlock).unwrap();
+        let _ = sent_rx.recv().unwrap();
+        first_tx
+            .send(ScriptRead::Disconnect(io::ErrorKind::NotConnected))
+            .unwrap();
+        assert!(matches!(
+            event_rx.recv().unwrap(),
+            AsrEvent::StreamingReconnect { .. }
+        ));
+        assert!(matches!(
+            event_rx.recv().unwrap(),
+            AsrEvent::TranscriptReset
+        ));
+        assert!(matches!(
+            event_rx.recv().unwrap(),
+            AsrEvent::RealtimeRestarting
+        ));
+        let _ = sent_json(&sent_rx);
+        second_tx
+            .send(ScriptRead::Message(task_event(
+                second_id,
+                "task-started",
+                json!({}),
+            )))
+            .unwrap();
+        assert!(matches!(
+            event_rx.recv().unwrap(),
+            AsrEvent::StreamingReconnect { succeeded: 1, .. }
+        ));
+        assert!(matches!(
+            event_rx.recv().unwrap(),
+            AsrEvent::RealtimeRestarted
+        ));
+        assert_eq!(
+            sent_rx.recv().unwrap(),
+            Message::Binary(pcm16_le_bytes(&[8, 9]))
+        );
+        join.join().unwrap().unwrap();
+        assert!(abort.load(Ordering::SeqCst));
+        assert_eq!(closed_rx.recv_timeout(Duration::from_secs(1)).unwrap(), 0);
+        assert_eq!(closed_rx.recv_timeout(Duration::from_secs(1)).unwrap(), 1);
+        assert!(event_rx.try_iter().all(|event| !matches!(
+            event,
+            AsrEvent::Final { .. }
+                | AsrEvent::Finished
+                | AsrEvent::Error { .. }
+                | AsrEvent::TaskFailed { .. }
+        )));
+    }
+
+    #[test]
+    fn second_disconnect_is_terminal_and_never_opens_a_third_socket() {
+        let mut config = crate::config::Config::default();
+        config.asr.alibaba_audio3.experimental_enabled = true;
+        config.asr.alibaba_audio3.api_key = "test".into();
+        let first_id = "11111111-1111-1111-1111-111111111111";
+        let second_id = "22222222-2222-2222-2222-222222222222";
+        let (first_tx, first_rx) = mpsc::channel();
+        let (second_tx, second_rx) = mpsc::channel();
+        let (sent_tx, sent_rx) = mpsc::channel();
+        let (closed_tx, _closed_rx) = mpsc::channel();
+        let open_count = Arc::new(AtomicU64::new(0));
+        let mut factory = ScriptedFactory {
+            scripts: VecDeque::from([first_rx, second_rx]),
+            sent: sent_tx,
+            closed: closed_tx,
+            open_count: open_count.clone(),
+        };
+        let mut ids = FixedTaskIds(VecDeque::from([first_id.into(), second_id.into()]));
+        let clock = ManualClock::default();
+        let abort = AtomicBool::new(false);
+        let (_control_tx, control_rx) = mpsc::channel();
+        let (event_tx, event_rx) = mpsc::channel();
+        let join = thread::spawn(move || {
+            run_reconnect_driver(
+                &config,
+                AudioSpec {
+                    sample_rate_hz: 16_000,
+                },
+                control_rx,
+                &abort,
+                &event_tx,
+                &clock,
+                &mut factory,
+                &mut ids,
+                &mut NoopPacer,
+            )
+        });
+
+        let _ = sent_json(&sent_rx);
+        first_tx
+            .send(ScriptRead::Message(task_event(
+                first_id,
+                "task-started",
+                json!({}),
+            )))
+            .unwrap();
+        assert!(matches!(event_rx.recv().unwrap(), AsrEvent::Ready));
+        first_tx
+            .send(ScriptRead::Disconnect(io::ErrorKind::UnexpectedEof))
+            .unwrap();
+        assert!(matches!(
+            event_rx.recv().unwrap(),
+            AsrEvent::StreamingReconnect { attempted: 1, .. }
+        ));
+        assert!(matches!(
+            event_rx.recv().unwrap(),
+            AsrEvent::TranscriptReset
+        ));
+        assert!(matches!(
+            event_rx.recv().unwrap(),
+            AsrEvent::RealtimeRestarting
+        ));
+        let _ = sent_json(&sent_rx);
+        second_tx
+            .send(ScriptRead::Message(task_event(
+                second_id,
+                "task-started",
+                json!({}),
+            )))
+            .unwrap();
+        assert!(matches!(
+            event_rx.recv().unwrap(),
+            AsrEvent::StreamingReconnect { succeeded: 1, .. }
+        ));
+        assert!(matches!(
+            event_rx.recv().unwrap(),
+            AsrEvent::RealtimeRestarted
+        ));
+        second_tx
+            .send(ScriptRead::Disconnect(io::ErrorKind::BrokenPipe))
+            .unwrap();
+        loop {
+            match event_rx.recv().unwrap() {
+                AsrEvent::Error {
+                    kind: FailureKind::Connection,
+                } => break,
+                AsrEvent::StreamingReconnect { .. } => {}
+                event => panic!("unexpected terminal reconnect event: {event:?}"),
+            }
+        }
+        assert!(join.join().unwrap().is_err());
+        assert_eq!(open_count.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn protocol_error_is_terminal_without_reconnect() {
+        let mut config = crate::config::Config::default();
+        config.asr.alibaba_audio3.experimental_enabled = true;
+        config.asr.alibaba_audio3.api_key = "test".into();
+        let (script_tx, script_rx) = mpsc::channel();
+        let (sent_tx, sent_rx) = mpsc::channel();
+        let (closed_tx, _closed_rx) = mpsc::channel();
+        let open_count = Arc::new(AtomicU64::new(0));
+        let mut factory = ScriptedFactory {
+            scripts: VecDeque::from([script_rx]),
+            sent: sent_tx,
+            closed: closed_tx,
+            open_count: open_count.clone(),
+        };
+        let mut ids = FixedTaskIds(VecDeque::from([TASK_ID.into()]));
+        let abort = AtomicBool::new(false);
+        let (_control_tx, control_rx) = mpsc::channel();
+        let (event_tx, event_rx) = mpsc::channel();
+        let join = thread::spawn(move || {
+            run_reconnect_driver(
+                &config,
+                AudioSpec {
+                    sample_rate_hz: 16_000,
+                },
+                control_rx,
+                &abort,
+                &event_tx,
+                &ManualClock::default(),
+                &mut factory,
+                &mut ids,
+                &mut NoopPacer,
+            )
+        });
+        let _ = sent_json(&sent_rx);
+        script_tx
+            .send(ScriptRead::Message(provider_event(
+                "task-started",
+                json!({}),
+            )))
+            .unwrap();
+        assert!(matches!(event_rx.recv().unwrap(), AsrEvent::Ready));
+        script_tx
+            .send(ScriptRead::Message(Message::Text("not-json".into())))
+            .unwrap();
+        assert!(matches!(
+            event_rx.recv().unwrap(),
+            AsrEvent::Error {
+                kind: FailureKind::Protocol
+            }
+        ));
+        assert!(join.join().unwrap().is_err());
+        assert_eq!(open_count.load(Ordering::SeqCst), 1);
+        assert!(
+            event_rx
+                .try_iter()
+                .all(|event| !matches!(event, AsrEvent::TranscriptReset))
+        );
+    }
+
+    #[test]
+    fn disconnect_after_finish_is_terminal_without_reconnect() {
+        let mut config = crate::config::Config::default();
+        config.asr.alibaba_audio3.experimental_enabled = true;
+        config.asr.alibaba_audio3.api_key = "test".into();
+        let (script_tx, script_rx) = mpsc::channel();
+        let (sent_tx, sent_rx) = mpsc::channel();
+        let (closed_tx, _closed_rx) = mpsc::channel();
+        let open_count = Arc::new(AtomicU64::new(0));
+        let mut factory = ScriptedFactory {
+            scripts: VecDeque::from([script_rx]),
+            sent: sent_tx,
+            closed: closed_tx,
+            open_count: open_count.clone(),
+        };
+        let mut ids = FixedTaskIds(VecDeque::from([TASK_ID.into()]));
+        let abort = AtomicBool::new(false);
+        let (control_tx, control_rx) = mpsc::channel();
+        let (event_tx, event_rx) = mpsc::channel();
+        let join = thread::spawn(move || {
+            run_reconnect_driver(
+                &config,
+                AudioSpec {
+                    sample_rate_hz: 16_000,
+                },
+                control_rx,
+                &abort,
+                &event_tx,
+                &ManualClock::default(),
+                &mut factory,
+                &mut ids,
+                &mut NoopPacer,
+            )
+        });
+        let _ = sent_json(&sent_rx);
+        script_tx
+            .send(ScriptRead::Message(provider_event(
+                "task-started",
+                json!({}),
+            )))
+            .unwrap();
+        assert!(matches!(event_rx.recv().unwrap(), AsrEvent::Ready));
+        control_tx.send(crate::backend::AsrControl::Finish).unwrap();
+        script_tx.send(ScriptRead::WouldBlock).unwrap();
+        assert_eq!(sent_json(&sent_rx)["header"]["action"], "finish-task");
+        assert!(matches!(
+            event_rx.recv().unwrap(),
+            AsrEvent::AudioDeliveryCompleted { .. }
+        ));
+        script_tx
+            .send(ScriptRead::Disconnect(io::ErrorKind::ConnectionReset))
+            .unwrap();
+        assert!(matches!(
+            event_rx.recv().unwrap(),
+            AsrEvent::Error {
+                kind: FailureKind::Connection
+            }
+        ));
+        assert!(join.join().unwrap().is_err());
+        assert_eq!(open_count.load(Ordering::SeqCst), 1);
+        assert!(
+            event_rx
+                .try_iter()
+                .all(|event| !matches!(event, AsrEvent::TranscriptReset))
+        );
+    }
+
+    #[test]
+    fn task_failed_is_terminal_without_reconnect() {
+        let mut config = crate::config::Config::default();
+        config.asr.alibaba_audio3.experimental_enabled = true;
+        config.asr.alibaba_audio3.api_key = "test".into();
+        let (script_tx, script_rx) = mpsc::channel();
+        let (sent_tx, sent_rx) = mpsc::channel();
+        let (closed_tx, _closed_rx) = mpsc::channel();
+        let open_count = Arc::new(AtomicU64::new(0));
+        let mut factory = ScriptedFactory {
+            scripts: VecDeque::from([script_rx]),
+            sent: sent_tx,
+            closed: closed_tx,
+            open_count: open_count.clone(),
+        };
+        let mut ids = FixedTaskIds(VecDeque::from([TASK_ID.into()]));
+        let abort = AtomicBool::new(false);
+        let (_control_tx, control_rx) = mpsc::channel();
+        let (event_tx, event_rx) = mpsc::channel();
+        let join = thread::spawn(move || {
+            run_reconnect_driver(
+                &config,
+                AudioSpec {
+                    sample_rate_hz: 16_000,
+                },
+                control_rx,
+                &abort,
+                &event_tx,
+                &ManualClock::default(),
+                &mut factory,
+                &mut ids,
+                &mut NoopPacer,
+            )
+        });
+        let _ = sent_json(&sent_rx);
+        script_tx
+            .send(ScriptRead::Message(provider_event(
+                "task-started",
+                json!({}),
+            )))
+            .unwrap();
+        assert!(matches!(event_rx.recv().unwrap(), AsrEvent::Ready));
+        script_tx
+            .send(ScriptRead::Message(provider_event(
+                "task-failed",
+                json!({}),
+            )))
+            .unwrap();
+        assert!(matches!(
+            event_rx.recv().unwrap(),
+            AsrEvent::TaskFailed { .. }
+        ));
+        assert!(join.join().unwrap().is_err());
+        assert_eq!(open_count.load(Ordering::SeqCst), 1);
+        assert!(
+            event_rx
+                .try_iter()
+                .all(|event| !matches!(event, AsrEvent::TranscriptReset))
+        );
+    }
+
+    #[test]
+    fn retained_audio_disables_without_evicting_prefix() {
+        let mut config = crate::config::Config::default();
+        config.audio.max_duration_secs = 1;
+        let mut retained = RetainedAudio::new(&config, AudioSpec { sample_rate_hz: 4 });
+        let packet = |values: &[i16]| super::PendingPacket {
+            samples: Arc::from(values),
+            enqueued_at: std::time::Instant::now(),
+        };
+        retained.retain(packet(&[1, 2]));
+        retained.retain(packet(&[3, 4]));
+        assert_eq!(
+            retained
+                .packets
+                .iter()
+                .flat_map(|packet| packet.samples.iter().copied().collect::<Vec<_>>())
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3, 4]
+        );
+        retained.retain(packet(&[5]));
+        assert!(retained.take_replay_queue().is_none());
+        assert!(retained.packets.is_empty());
     }
 
     fn start_scripted_lifecycle(

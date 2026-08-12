@@ -95,7 +95,7 @@ Qwen-Audio-3 目前作为需要明确启用的实验性提供商使用。该选�
 
 Alibaba API key 受区域范围约束。更改区域后，用户可能需要替换加密的 Alibaba 凭据。Voice Input 绝不会探测其他区域，也不会自动迁移 key。支持选择新加坡区域并不表示已经实现完整功能一致性；每个模型、控制项组合以及语言或词汇表场景仍需完成经过授权的在线验证。
 
-流式模型负责提供实时文本。**语言提示**和**流式 heartbeat** 是两个相互独立的选用设置，默认均为关闭。启用语言提示后，程序会把现有语言选项发送给 Audio3：英语使用 `en`；简体中文和繁体中文使用 `zh,en`；日语使用 `ja,en`；韩语使用 `ko,en`。中文、日语和韩语的额外英语提示用于保留英语混合识别；关闭该开关会保留服务商的自动检测行为。启用流式 heartbeat 后，只要程序继续发送格式正确的音频帧，它就能使长时间静音的按键说话 session 保持连接。
+流式模型负责提供实时文本。如果在发送 `finish-task` 前发生一次可恢复的传输中断，Voice Input 会创建新的 Audio3 task，使旧 task 的 transcript 失效，并且以 4 倍实时速度从头重放保留的 PCM，同时继续录音。保留的 PCM 必须包含完整前缀，其上限取配置的最大录音时长、300 秒和 10 MiB PCM 三者中的最小值；超过上限会停用重连，同时不会丢弃前缀后继续重放。第二次中断或发送 `finish-task` 后的中断会使用现有的 Native 或本地完整音频恢复。**语言提示**和**流式 heartbeat** 是两个相互独立的选用设置，默认均为关闭。启用语言提示后，程序会把现有语言选项发送给 Audio3：英语使用 `en`；简体中文和繁体中文使用 `zh,en`；日语使用 `ja,en`；韩语使用 `ko,en`。中文、日语和韩语的额外英语提示用于保留英语混合识别；关闭该开关会保留服务商的自动检测行为。启用流式 heartbeat 后，只要程序继续发送格式正确的音频帧，它就能使长时间静音的按键说话 session 保持连接。
 
 **识别预设**默认使用**标准**。该预设保留现有行为：最大句末静音时长为 `800` 毫秒，语义标点和多阈值模式均关闭，并且不发送语音/噪声阈值。**低延迟听写**使用 `400` 毫秒并启用多阈值模式；**长篇语音**使用 `1300` 毫秒并启用语义标点。经过授权的单说话人评估确认服务端接受这两个映射；在插入了 250–2200 毫秒数字静音的测试矩阵中，两者都保留了静音前后的内容。声学语音边界仍取决于本地 RMS 裁剪。有限样本无法形成通用的准确率或延迟建议，因此标准预设仍为默认值。详见 [`docs/qwen-audio3-milestone2-evaluation.md`](docs/qwen-audio3-milestone2-evaluation.md)。**自定义**会显示全部原始控制项；语义标点与多阈值模式不能同时启用。可选的语音/噪声阈值必须是 `-1` 到 `1` 之间的有限数值；Alibaba 未公布默认值，因此省略该字段可以保留服务商行为。Settings 会显示自定义请求可能发送的每一个值。
 
@@ -143,7 +143,7 @@ Wiki 还包含 Agent context、桌面集成、安全隐私和开发说明。
 
 ## 隐私
 
-远程 Qwen 模式会把音频发送到所选的区域路由或完全按原值使用的自定义 Alibaba 端点。LLM refinement 会把 transcript 和粗粒度的目标风格（coding agent 结构化 Markdown、`instant-messaging` 或默认风格）通过 system prompt 发送到配置的 provider；只有在用户明确启用 Agent context 时，才会额外发送经过截断与脱敏的会话片段。LLM 请求不会包含窗口标题、进程 ID 或原始桌面元数据。公开示例配置默认关闭远程 refinement 和 Agent context。Voice Input 不收集遥测或分析数据。
+远程 Qwen 模式会把音频发送到所选的区域路由或完全按原值使用的自定义 Alibaba 端点。LLM refinement 会把 transcript 和粗粒度的目标风格（coding agent 结构化 Markdown、`instant-messaging` 或默认风格）通过 system prompt 发送到配置的 provider。只有在用户明确启用 Agent context 时，Voice Input 才会在本地对最近一条已完成的 Pi 或 Codex assistant message 进行脱敏和截断，使用 Jieba 分词并去重，然后只发送数量受限的术语列表。LLM 请求不会包含 Agent source message、窗口标题、进程 ID 或原始桌面元数据。公开示例配置默认关闭远程 refinement 和 Agent context。Voice Input 不收集遥测或分析数据。
 
 ## 项目状态
 

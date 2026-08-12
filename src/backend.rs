@@ -69,6 +69,9 @@ pub enum AsrEvent {
     SpeechStopped,
     RealtimeRestarting,
     RealtimeRestarted,
+    /// Atomically invalidates every transcript derived from the previous
+    /// authoritative streaming attempt.
+    TranscriptReset,
     RealtimeTranscriptDelayed,
     AudioDeliveryCompleted {
         packet_count: u64,
@@ -78,6 +81,13 @@ pub enum AsrEvent {
     },
     TimestampDiagnostics {
         delta: TimestampDiagnosticsDelta,
+    },
+    StreamingReconnect {
+        attempted: u64,
+        succeeded: u64,
+        replay_packet_count: u64,
+        replay_sample_count: u64,
+        terminal_failure_kind: Option<FailureKind>,
     },
     Partial {
         committed: String,
