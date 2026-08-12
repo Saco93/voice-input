@@ -767,13 +767,12 @@ impl SupportPayload {
         }
         let _ = writeln!(
             output,
-            "Configuration: provider={}, final-pass={}, fallback={}, audio3-endpoint-mode={}, audio3-region={}, audio3-workspace-configured={}, audio3-native-mode={}, audio3-language-hints={}, audio3-heartbeat={}, audio3-max-sentence-silence-ms={}, audio3-semantic-punctuation={}, audio3-vocabulary-count={}",
+            "Configuration: provider={}, final-pass={}, fallback={}, audio3-endpoint-mode={}, audio3-region={}, audio3-native-mode={}, audio3-language-hints={}, audio3-heartbeat={}, audio3-max-sentence-silence-ms={}, audio3-semantic-punctuation={}, audio3-vocabulary-count={}",
             self.config.provider.as_str(),
             enabled_name(self.config.final_pass_enabled),
             enabled_name(self.config.fallback_enabled),
             self.config.endpoint_mode.as_str(),
             self.config.region.as_str(),
-            enabled_name(self.config.workspace_configured),
             self.config.audio3_native_final_pass_mode.as_str(),
             enabled_name(self.config.audio3_language_hints_enabled),
             enabled_name(self.config.audio3_heartbeat_enabled),
@@ -823,7 +822,6 @@ pub struct SafeConfigSummary {
     pub fallback_enabled: bool,
     pub endpoint_mode: Audio3EndpointMode,
     pub region: Audio3Region,
-    pub workspace_configured: bool,
     pub audio3_native_final_pass_mode: NativeFinalPassMode,
     pub audio3_language_hints_enabled: bool,
     pub audio3_heartbeat_enabled: bool,
@@ -849,7 +847,6 @@ impl SafeConfigSummary {
             fallback_enabled: config.asr.fallback_to_local,
             endpoint_mode: config.asr.alibaba_audio3.endpoint_mode,
             region: config.asr.alibaba_audio3.region,
-            workspace_configured: !config.asr.alibaba_audio3.workspace_id.is_empty(),
             audio3_native_final_pass_mode: config.asr.alibaba_audio3.native_final_pass_mode,
             audio3_language_hints_enabled: config.asr.alibaba_audio3.language_hints_enabled,
             audio3_heartbeat_enabled: config.asr.alibaba_audio3.heartbeat_enabled,
@@ -1367,14 +1364,12 @@ mod tests {
     #[test]
     fn audio3_mode_and_safe_controls_are_serialized_without_private_values() {
         const TERM: &str = "private-diagnostics-vocabulary-sentinel";
-        const WORKSPACE: &str = "private-workspace-diagnostics-sentinel";
         const STREAMING_ENDPOINT: &str = "wss://private-streaming-host.invalid/private-path";
         const NATIVE_ENDPOINT: &str = "https://private-native-host.invalid/private-path";
         let mut config = Config::default();
         config.asr.provider = AsrProvider::AlibabaQwenAudio3;
         config.asr.alibaba_audio3.endpoint_mode = Audio3EndpointMode::Custom;
         config.asr.alibaba_audio3.region = Audio3Region::Singapore;
-        config.asr.alibaba_audio3.workspace_id = WORKSPACE.into();
         config.asr.alibaba_audio3.endpoint = STREAMING_ENDPOINT.into();
         config.asr.alibaba_audio3.native_endpoint = NATIVE_ENDPOINT.into();
         config.asr.alibaba_audio3.native_final_pass_mode = NativeFinalPassMode::Adaptive;
@@ -1396,7 +1391,6 @@ mod tests {
         assert_eq!(json["schema_version"], 4);
         assert_eq!(json["config"]["endpoint_mode"], "custom");
         assert_eq!(json["config"]["region"], "singapore");
-        assert_eq!(json["config"]["workspace_configured"], true);
         assert_eq!(json["config"]["audio3_native_final_pass_mode"], "adaptive");
         assert_eq!(json["config"]["audio3_language_hints_enabled"], true);
         assert_eq!(json["config"]["audio3_heartbeat_enabled"], true);
@@ -1406,7 +1400,6 @@ mod tests {
         let encoded = json.to_string();
         for forbidden in [
             TERM,
-            WORKSPACE,
             STREAMING_ENDPOINT,
             NATIVE_ENDPOINT,
             "private-streaming-host",
@@ -1416,9 +1409,8 @@ mod tests {
             assert!(!payload.format_text().contains(forbidden));
         }
         assert!(!encoded.contains("speech_noise_threshold"));
-        assert!(!encoded.contains("workspace_id"));
         assert!(!encoded.contains("endpoint\""));
-        assert_eq!(json["config"].as_object().unwrap().len(), 12);
+        assert_eq!(json["config"].as_object().unwrap().len(), 11);
 
         let mut diagnostics = Diagnostics::inactive();
         diagnostics.start_session(
@@ -1445,11 +1437,12 @@ mod tests {
     }
 
     #[test]
-    fn older_safe_config_summaries_default_new_routing_fields() {
+    fn older_safe_config_summaries_default_new_routing_fields_and_ignore_removed_fields() {
         let summary: SafeConfigSummary = serde_json::from_value(json!({
             "provider": "alibaba-qwen-audio3",
             "final_pass_enabled": false,
             "fallback_enabled": true,
+            "workspace_configured": true,
             "audio3_native_final_pass_mode": "streaming-only",
             "audio3_language_hints_enabled": false,
             "audio3_heartbeat_enabled": false,
@@ -1460,7 +1453,11 @@ mod tests {
         .expect("older schema 4/3 safe summaries remain readable");
         assert_eq!(summary.endpoint_mode, Audio3EndpointMode::Regional);
         assert_eq!(summary.region, Audio3Region::Beijing);
-        assert!(!summary.workspace_configured);
+        assert!(
+            !serde_json::to_string(&summary)
+                .unwrap()
+                .contains("workspace_configured")
+        );
     }
 
     #[test]

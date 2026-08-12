@@ -416,9 +416,7 @@ fn websocket_request_for_config(
     audio3: &AlibabaAudio3Config,
     api_key: &str,
 ) -> Result<tungstenite::http::Request<()>> {
-    let endpoints = audio3
-        .resolve_endpoints()
-        .map_err(|_| anyhow!("failed to resolve Qwen-Audio-3 routing"))?;
+    let endpoints = audio3.resolve_endpoints();
     websocket_request(endpoints.streaming(), api_key)
 }
 
@@ -2047,32 +2045,27 @@ mod tests {
             request.headers()[tungstenite::http::header::AUTHORIZATION],
             "Bearer test-key"
         );
-        assert!(request.headers().get("X-DashScope-WorkSpace").is_none());
     }
 
     #[test]
-    fn production_websocket_request_seam_uses_resolved_target_without_workspace_header() {
+    fn production_websocket_request_seam_uses_resolved_target() {
         let mut audio3 = AlibabaAudio3Config {
             region: Audio3Region::Singapore,
-            workspace_id: "workspace-7".into(),
             ..AlibabaAudio3Config::default()
         };
         let request = websocket_request_for_config(&audio3, "test-key").unwrap();
         assert_eq!(
             request.uri().to_string(),
-            "wss://workspace-7.ap-southeast-1.maas.aliyuncs.com/api-ws/v1/inference"
+            crate::config::AUDIO3_SINGAPORE_STREAMING_ENDPOINT
         );
-        assert!(request.headers().get("X-DashScope-WorkSpace").is_none());
 
         audio3.endpoint_mode = Audio3EndpointMode::Custom;
-        audio3.workspace_id = "dormant-invalid-workspace".into();
         audio3.endpoint = "ws://127.0.0.1:1234/custom?opaque=a%2Fb&x=1".into();
         let custom = websocket_request_for_config(&audio3, "test-key").unwrap();
         assert_eq!(
             custom.uri().to_string(),
             "ws://127.0.0.1:1234/custom?opaque=a%2Fb&x=1"
         );
-        assert!(custom.headers().get("X-DashScope-WorkSpace").is_none());
 
         const ENDPOINT_SENTINEL: &str = "private endpoint construction sentinel";
         audio3.endpoint = ENDPOINT_SENTINEL.into();
@@ -2087,7 +2080,7 @@ mod tests {
 
     #[test]
     fn websocket_handshake_failure_discards_raw_error_and_source_chain() {
-        const SENTINEL: &str = "private TLS certificate host and workspace sentinel";
+        const SENTINEL: &str = "private TLS certificate host and route sentinel";
         let error = sanitize_websocket_handshake_failure(io::Error::other(SENTINEL));
 
         assert_eq!(error.to_string(), "Qwen-Audio-3 websocket handshake failed");

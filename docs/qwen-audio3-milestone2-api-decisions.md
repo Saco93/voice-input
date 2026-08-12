@@ -10,7 +10,7 @@ Milestone 2 is limited to:
 
 1. Audio3 streaming VAD and sentence-boundary controls with named presets;
 2. bounded timestamp parsing and timestamp-aware assembly foundations;
-3. Beijing/Singapore regional and workspace endpoint routing.
+3. Beijing/Singapore regional and custom endpoint routing.
 
 It does not add reconnect/replay, `continue-task` context, application/window collection, Filetrans, diarization, or new credential-discovery behavior.
 
@@ -89,51 +89,44 @@ The parser borrows transcript text only long enough to apply the existing 16 KiB
 
 Duplicate-final suppression and correction replacement remain blocked unless Alibaba publishes a stable revision-identity contract or an implementation is proven correct even when IDs and ranges are reused or revised. A finite live capture can validate parser compatibility and reveal counterexamples, but it cannot establish an undocumented identity guarantee. Reconnect and replay remain Milestone 3 and will not be implemented here.
 
-## Regional and workspace endpoints
+## Regional and custom endpoints
 
-Both Audio3 model variants are officially available in Beijing and Singapore with unchanged model IDs.
+Both Audio3 model variants are available in Beijing and Singapore with unchanged model IDs. Voice Input intentionally exposes only two routing modes: Regional and Custom.
 
-### Canonical endpoint matrix
+### Fixed reviewed endpoint matrix
 
-| API | Region | Legacy endpoint | Current workspace endpoint template |
-| --- | --- | --- | --- |
-| Streaming WebSocket | Beijing | `wss://dashscope.aliyuncs.com/api-ws/v1/inference` | `wss://{WorkspaceId}.cn-beijing.maas.aliyuncs.com/api-ws/v1/inference` |
-| Streaming WebSocket | Singapore | `wss://dashscope-intl.aliyuncs.com/api-ws/v1/inference` | `wss://{WorkspaceId}.ap-southeast-1.maas.aliyuncs.com/api-ws/v1/inference` |
-| Native HTTP | Beijing | `https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation` | `https://{WorkspaceId}.cn-beijing.maas.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation` |
-| Native HTTP | Singapore | `https://dashscope-intl.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation` | `https://{WorkspaceId}.ap-southeast-1.maas.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation` |
-
-Alibaba recommends workspace-specific hosts and states that legacy hosts remain usable. Current workspace routing places Workspace ID in the hostname's leftmost label. It is not a query parameter, path component, or request-body field.
-
-The legacy WebSocket documentation also describes an optional `X-DashScope-WorkSpace` header. The Native HTTP reference does not describe that header and instead documents workspace-specific hosts. Voice Input will use one consistent hostname-derived mechanism for both APIs rather than inventing Native header behavior.
+| API | Beijing | Singapore |
+| --- | --- | --- |
+| Streaming WebSocket | `wss://dashscope.aliyuncs.com/api-ws/v1/inference` | `wss://dashscope-intl.aliyuncs.com/api-ws/v1/inference` |
+| Native HTTP | `https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation` | `https://dashscope-intl.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation` |
 
 ### Configuration and migration decisions
 
-- Add `regional` and `custom` endpoint modes.
-- Add explicit `beijing` and `singapore` regions.
-- In regional mode, an empty Workspace ID uses the official legacy endpoint; a configured Workspace ID derives the reviewed workspace hostname.
-- Existing exact Beijing legacy endpoint pairs migrate to regional Beijing with an empty Workspace ID.
-- Existing exact Singapore legacy endpoint pairs migrate to regional Singapore with an empty Workspace ID.
-- Any noncanonical, mixed, proxied, loopback, query-bearing, or otherwise overridden pair migrates to custom and remains byte-for-byte preserved.
-- Regional hosts are selected from constants. Region input is never concatenated into a host.
-- Workspace ID has no published provider grammar or length. Voice Input treats it as opaque and applies only the RFC-compatible DNS-label constraints required to place it safely in a hostname. These constraints are transport validation, not a claim about Alibaba's business identifier format.
+- Regional selects only the fixed reviewed Streaming and Native pair for Beijing or Singapore.
+- Custom uses the configured Streaming and Native URL strings exactly.
+- Existing exact Beijing pairs migrate to Regional Beijing.
+- Existing exact Singapore pairs migrate to Regional Singapore.
+- Any mixed pair, noncanonical host, loopback endpoint, proxy, custom path, port, query, or otherwise changed pair migrates to Custom and remains byte-for-byte preserved.
+- Region input is matched to constants and is never concatenated into a host.
+- Explicit endpoint mode and region values take precedence over inferred migration values.
+- Dormant custom URLs remain preserved in Regional mode.
 
-API keys are region-specific and workspace-scoped. A key cannot be assumed to work across regions or workspaces. Voice Input will retain one encrypted Alibaba credential, warn that changing region/workspace may require replacing it, and never probe another region automatically.
+API keys are region-scoped. Voice Input retains one encrypted Alibaba credential, warns that changing region may require replacing it, and never probes another region or migrates a key automatically.
 
 ### Deterministic implementation state
 
 Milestone 2 item 7 is implemented and validated locally without network access:
 
 - kebab-case `regional`/`custom` endpoint modes and `beijing`/`singapore` regions use Regional Beijing for new configurations;
-- presence-aware migration recognizes only the two exact canonical legacy pairs and preserves any explicitly configured Workspace ID exactly (absent or empty stays empty); all mixed, workspace-host, loopback, proxy, custom path/port/query, and otherwise changed pairs remain Custom byte-for-byte, without inferring a Workspace ID;
-- one pure typed resolver selects reviewed constants for both Streaming and Native, uses legacy hosts for empty workspaces, and constructs the reviewed regional workspace host only after value-free DNS-label transport validation;
-- Custom mode ignores its dormant Workspace ID, while Regional mode ignores and preserves dormant custom URLs; neither mode sends a workspace header, query field, or request-body field;
+- presence-aware migration recognizes only the two exact canonical pairs; all other pairs remain Custom byte-for-byte;
+- one pure, infallible typed resolver selects the fixed reviewed constants for both APIs or returns the exact Custom values;
 - production WebSocket and Native requests use the resolved target, while authorization, request bodies, response sanitization, redirect behavior, models, and controls remain unchanged;
-- normal Settings displays mode, region, optional Workspace ID, and the credential-scope warning without displaying a derived URL; raw URLs are shown only for Custom routing or a routed validation error;
-- schema 4 diagnostics add only endpoint mode, region, and a Workspace-ID-configured boolean. They never include the Workspace ID, endpoint/host, model, or key, and schema-3/schema-4 compatibility defaults remain readable.
+- normal Settings displays endpoint mode and region; raw URLs are shown only for Custom routing or a routed validation error;
+- diagnostics schema 4 retains endpoint mode and region while excluding endpoint values, model, key, and route identifiers. Older schema 4 snapshots with removed fields remain readable through unknown-field tolerance.
 
-Authorized live canaries subsequently succeeded for the Beijing Regional empty-workspace Streaming and Native routes. Singapore and workspace-specific routes remain untested because no matching scoped credential is configured. The implementation and Beijing canaries do not establish Singapore feature parity or workspace-route success.
+Authorized live canaries succeeded for the Beijing Regional Streaming and Native routes. Singapore remains untested because no matching region credential is configured. The implementation and Beijing canaries do not establish Singapore feature parity.
 
-Official pages do not provide a complete per-region matrix for language hints, heartbeat, vocabulary, sentence controls, thresholds, and timestamp behavior. The shared API reference documents these controls without a regional exclusion. Each model, field combination, and scenario used in Singapore still requires its own authorized live validation; the result will not be presented as complete feature parity.
+Official pages do not provide a complete per-region matrix for language hints, heartbeat, vocabulary, sentence controls, thresholds, and timestamp behavior. Each model, field combination, and scenario used in Singapore still requires its own authorized live validation; the result will not be presented as complete feature parity.
 
 ## Implementation and live-test gates
 
@@ -143,7 +136,6 @@ Official pages do not provide a complete per-region matrix for language hints, h
 - exact request-envelope fields for confirmed VAD controls;
 - bounded timestamp parsing and aggregate-only diagnostics;
 - regional/custom endpoint migration and pure endpoint resolution;
-- hostname-based workspace routing;
 - safe settings controls and privacy regression tests.
 
 ### Block pending evidence
@@ -151,7 +143,6 @@ Official pages do not provide a complete per-region matrix for language hints, h
 - separate speech/noise threshold fields;
 - guaranteed character-level timing;
 - identity-dependent timestamp duplicate suppression or correction replacement without an official contract or an algorithm that remains correct under revisions;
-- inferred Workspace ID business grammar;
 - automatic credential-region probing;
 - claims of complete regional feature parity.
 
@@ -161,12 +152,11 @@ Completed within the bounded scope documented in [`qwen-audio3-milestone2-evalua
 
 - Low-latency and Long-form field combinations and observable segmentation effects across a private pause/noise corpus;
 - aggregate-only parser compatibility observation for live partial/final timestamp metadata, without retaining sentence IDs or inferring a revision identity contract;
-- Beijing Regional empty-workspace Streaming and Native canaries.
+- Beijing Regional Streaming and Native canaries.
 
 Still requires a matching scoped credential and separate authorization:
 
 - Singapore model/control scenarios, including dynamic vocabulary;
-- workspace-specific Streaming and Native routing;
 - any broader regional feature-parity claim.
 
 ## Official sources
@@ -179,6 +169,4 @@ Still requires a matching scoped credential and separate authorization:
 - [Native recognition guide](https://help.aliyun.com/zh/model-studio/non-realtime-speech-recognition-user-guide)
 - [ASR model specifications](https://help.aliyun.com/zh/model-studio/asr-model/)
 - [Model Studio regional Base URLs](https://help.aliyun.com/zh/model-studio/base-url)
-- [Obtain Workspace ID](https://help.aliyun.com/zh/model-studio/obtain-the-app-id-and-workspace-id)
 - [API key acquisition](https://help.aliyun.com/zh/model-studio/get-api-key)
-- [Workspace permission management](https://help.aliyun.com/zh/model-studio/permission-management-overview)

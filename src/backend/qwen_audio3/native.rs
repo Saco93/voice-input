@@ -20,9 +20,7 @@ pub(crate) fn transcribe_full_audio(config: &Config, wav_path: &Path) -> Result<
         bail!("Qwen-Audio-3 native ASR requires a configured credential");
     }
 
-    let endpoints = audio3
-        .resolve_endpoints()
-        .context("failed to resolve Qwen-Audio-3 routing")?;
+    let endpoints = audio3.resolve_endpoints();
     let wav_bytes = read_bounded_wav(wav_path)?;
     let body = request_body(
         &audio3.native_model,
@@ -386,7 +384,6 @@ mod tests {
             weight: 5,
         }];
         config.asr.alibaba_audio3.endpoint_mode = Audio3EndpointMode::Custom;
-        config.asr.alibaba_audio3.workspace_id = "dormant-workspace".into();
         config.asr.alibaba_audio3.native_endpoint = endpoint;
         config.asr.alibaba_audio3.native_model = "test-native-model".into();
 
@@ -404,12 +401,6 @@ mod tests {
                 .lines()
                 .any(|line| line.eq_ignore_ascii_case("authorization: Bearer test-bearer-token"))
         );
-        assert!(
-            !headers
-                .to_ascii_lowercase()
-                .contains("x-dashscope-workspace")
-        );
-        assert!(!headers.contains("dormant-workspace"));
         let body: Value = serde_json::from_str(body).unwrap();
         assert_eq!(body["parameters"]["language_hints"], json!(["ko", "en"]));
         assert_eq!(body["parameters"]["vocabulary"], json!({"Voice Input": 5}));

@@ -106,7 +106,7 @@ QtObject {
         "Realtime recognition behavior.": "设置实时识别行为。",
         "Replace Alibaba API key": "替换 Alibaba API key",
         "Enter a new credential": "输入新凭据",
-        "API keys are region- and workspace-scoped; Voice Input never probes another route or migrates a key automatically.": "API key 受区域和工作空间范围约束；语音输入绝不会探测其他路由，也不会自动迁移 key。",
+        "API keys are region-scoped; Voice Input never probes another region or migrates a key automatically.": "API key 受区域范围约束；语音输入绝不会探测其他区域，也不会自动迁移 key。",
         "Realtime model": "实时模型",
         "Turn mode": "分段模式",
         "Server VAD": "服务端 VAD",
@@ -116,14 +116,11 @@ QtObject {
         "Selecting the provider does not enable this acknowledgement.": "仅选择此提供商不会自动确认并启用实验功能。",
         "Endpoint mode": "端点模式",
         "Regional": "区域路由",
-        "Regional routing uses reviewed Alibaba hosts. Custom keeps the raw streaming and native endpoints in Advanced settings.": "区域路由使用经过审核的 Alibaba 主机。自定义模式会在高级设置中保留原始流式端点和原生端点。",
+        "Regional routing uses the fixed reviewed Alibaba host for the selected region. Custom keeps the exact streaming and native endpoints in Advanced settings.": "区域路由使用所选区域固定且经过审核的 Alibaba 主机。自定义模式会在高级设置中保留原样的流式端点和原生端点。",
         "Region": "区域",
         "Beijing": "北京",
         "Singapore": "新加坡",
         "Select the region that owns the configured Alibaba API key. Singapore controls still require scenario-specific live validation.": "请选择当前 Alibaba API key 所属的区域。新加坡区域的各项控制仍需按具体场景完成在线验证。",
-        "Workspace ID": "工作空间 ID",
-        "Optional": "可选",
-        "Optional. Empty uses the regional legacy route. A nonempty value must satisfy the DNS-label transport constraint (1–63 ASCII letters, digits, or hyphens; no leading or trailing hyphen). This is not provider business-ID validation. API keys are region- and workspace-scoped; Voice Input never probes or migrates them.": "可选。留空时使用对应区域的旧版路由。非空值必须满足 DNS label 传输约束：包含 1–63 个 ASCII 字母、数字或连字符，且首尾不能是连字符。这不是对提供商业务 ID 规则的验证。API key 受区域和工作空间范围约束；语音输入绝不会探测或迁移 key。",
         "Enable language hints": "启用语言提示",
         "Opt in to sending the selected language as an Audio3 recognition hint.": "选择将所选语言作为 Audio3 识别提示发送。",
         "Enable streaming heartbeat": "启用流式 heartbeat",
@@ -375,9 +372,9 @@ QtObject {
         if (match)
             return "已通过 " + match[1] + " 配置";
 
-        match = source.match(/^(.*)\. Blank keeps it unchanged\. API keys are region- and workspace-scoped; Voice Input never probes another route or migrates a key automatically\.$/);
+        match = source.match(/^(.*)\. Blank keeps it unchanged\. API keys are region-scoped; Voice Input never probes another region or migrates a key automatically\.$/);
         if (match)
-            return root.tr(match[1]) + "。留空将保持不变。API key 受区域和工作空间范围约束；语音输入绝不会探测其他路由，也不会自动迁移 key。";
+            return root.tr(match[1]) + "。留空将保持不变。API key 受区域范围约束；语音输入绝不会探测其他区域，也不会自动迁移 key。";
 
         match = source.match(/^(.*)\. Blank keeps it unchanged\.$/);
         if (match)

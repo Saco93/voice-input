@@ -153,7 +153,7 @@ SettingsPage {
                 theme: root.theme
                 label: "Replace Alibaba API key"
                 value: root.controller.alibabaCredential
-                help: root.controller.credentialLabel("alibaba-api-key") + ". Blank keeps it unchanged. API keys are region- and workspace-scoped; Voice Input never probes another route or migrates a key automatically."
+                help: root.controller.credentialLabel("alibaba-api-key") + ". Blank keeps it unchanged. API keys are region-scoped; Voice Input never probes another region or migrates a key automatically."
                 password: true
                 placeholderText: "Enter a new credential"
                 error: root.controller.errorFor("credentials.alibaba-api-key")
@@ -223,7 +223,7 @@ SettingsPage {
                 value: root.controller.value("asr.alibaba_audio3.endpoint_mode", "regional")
                 labels: ["Regional", "Custom"]
                 values: ["regional", "custom"]
-                help: "Regional routing uses reviewed Alibaba hosts. Custom keeps the raw streaming and native endpoints in Advanced settings."
+                help: "Regional routing uses the fixed reviewed Alibaba host for the selected region. Custom keeps the exact streaming and native endpoints in Advanced settings."
                 error: root.controller.errorFor("asr.alibaba_audio3.endpoint_mode")
                 enabled: !root.controller.busy
                 onSelected: (value) => {
@@ -243,20 +243,6 @@ SettingsPage {
                 enabled: !root.controller.busy
                 onSelected: (value) => {
                     return root.controller.setValue("asr.alibaba_audio3.region", value);
-                }
-            }
-
-            SettingTextField {
-                visible: root.controller.value("asr.alibaba_audio3.endpoint_mode", "regional") === "regional" || root.controller.errorFor("asr.alibaba_audio3.workspace_id").length > 0
-                theme: root.theme
-                label: "Workspace ID"
-                value: root.controller.value("asr.alibaba_audio3.workspace_id", "")
-                placeholderText: "Optional"
-                help: "Optional. Empty uses the regional legacy route. A nonempty value must satisfy the DNS-label transport constraint (1–63 ASCII letters, digits, or hyphens; no leading or trailing hyphen). This is not provider business-ID validation. API keys are region- and workspace-scoped; Voice Input never probes or migrates them."
-                error: root.controller.errorFor("asr.alibaba_audio3.workspace_id")
-                enabled: !root.controller.busy
-                onEdited: (value) => {
-                    return root.controller.setValue("asr.alibaba_audio3.workspace_id", value);
                 }
             }
 
