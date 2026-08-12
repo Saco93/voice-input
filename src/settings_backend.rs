@@ -834,7 +834,6 @@ mod tests {
                 "experimental_enabled": false,
                 "endpoint_mode": "regional",
                 "region": "beijing",
-                "workspace_id": "",
                 "endpoint": "wss://dashscope.aliyuncs.com/api-ws/v1/inference",
                 "model": "qwen-audio-3.0-asr-flash-streaming",
                 "language_hints_enabled": false,
@@ -854,76 +853,54 @@ mod tests {
     }
 
     #[test]
-    fn settings_get_applies_presence_aware_audio3_endpoint_migration() {
-        for (streaming, native, workspace_id, mode, region) in [
-            (
+    fn settings_get_migrates_exact_pairs_and_omits_removed_route_identifier() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = ConfigStore::new(temp.path().join("config.toml"));
+        let source = toml::to_string_pretty(&Config::default())
+            .unwrap()
+            .replace(
+                "endpoint_mode = \"regional\"\nregion = \"beijing\"\n",
+                "workspace_id = \"ignored-route-sentinel\"\n",
+            )
+            .replace(
+                "wss://dashscope.aliyuncs.com/api-ws/v1/inference",
                 "wss://dashscope-intl.aliyuncs.com/api-ws/v1/inference",
+            )
+            .replace(
+                "https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation",
                 "https://dashscope-intl.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation",
-                "legacy-regional-workspace",
-                "regional",
-                "singapore",
-            ),
-            (
-                "wss://proxy.example/custom?opaque=one",
-                "https://proxy.example/custom?opaque=two",
-                "dormant-custom-workspace",
-                "custom",
-                "beijing",
-            ),
-        ] {
-            let temp = tempfile::tempdir().unwrap();
-            let store = ConfigStore::new(temp.path().join("config.toml"));
-            let source = toml::to_string_pretty(&Config::default())
+            );
+        fs::write(store.path(), source).unwrap();
+
+        let get = json!({"version": 1, "id": 37, "method": "settings.get", "params": {}});
+        let response: Value =
+            serde_json::from_slice(&handle_line(get.to_string().as_bytes(), &store)).unwrap();
+        assert_eq!(response["ok"], true);
+        let audio3 = &response["result"]["config"]["asr"]["alibaba_audio3"];
+        assert_eq!(audio3["endpoint_mode"], "regional");
+        assert_eq!(audio3["region"], "singapore");
+        assert!(audio3.get("workspace_id").is_none());
+        assert!(!response.to_string().contains("ignored-route-sentinel"));
+
+        let save = json!({
+            "version": 1,
+            "id": 38,
+            "method": "settings.save",
+            "params": {
+                "revision": response["result"]["revision"],
+                "config": response["result"]["config"],
+                "credentials": {},
+                "restart": false
+            }
+        });
+        let saved: Value =
+            serde_json::from_slice(&handle_line(save.to_string().as_bytes(), &store)).unwrap();
+        assert_eq!(saved["ok"], true);
+        assert!(
+            !fs::read_to_string(store.path())
                 .unwrap()
-                .replace(
-                    "endpoint_mode = \"regional\"\nregion = \"beijing\"\n",
-                    "",
-                )
-                .replace("workspace_id = \"\"", &format!("workspace_id = \"{workspace_id}\""))
-                .replace(
-                    "wss://dashscope.aliyuncs.com/api-ws/v1/inference",
-                    streaming,
-                )
-                .replace(
-                    "https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation",
-                    native,
-                );
-            fs::write(store.path(), source).unwrap();
-
-            let get = json!({"version": 1, "id": 37, "method": "settings.get", "params": {}});
-            let response: Value =
-                serde_json::from_slice(&handle_line(get.to_string().as_bytes(), &store)).unwrap();
-            assert_eq!(response["ok"], true);
-            let audio3 = &response["result"]["config"]["asr"]["alibaba_audio3"];
-            assert_eq!(audio3["endpoint_mode"], mode);
-            assert_eq!(audio3["region"], region);
-            assert_eq!(audio3["workspace_id"], workspace_id);
-            assert_eq!(audio3["endpoint"], streaming);
-            assert_eq!(audio3["native_endpoint"], native);
-
-            let save = json!({
-                "version": 1,
-                "id": 38,
-                "method": "settings.save",
-                "params": {
-                    "revision": response["result"]["revision"],
-                    "config": response["result"]["config"],
-                    "credentials": {},
-                    "restart": false
-                }
-            });
-            let saved: Value =
-                serde_json::from_slice(&handle_line(save.to_string().as_bytes(), &store)).unwrap();
-            assert_eq!(saved["ok"], true);
-            assert_eq!(
-                saved["result"]["config"]["asr"]["alibaba_audio3"]["workspace_id"],
-                workspace_id
-            );
-            assert_eq!(
-                store.load().unwrap().config.asr.alibaba_audio3.workspace_id,
-                workspace_id
-            );
-        }
+                .contains("workspace_id")
+        );
     }
 
     #[test]
@@ -937,7 +914,6 @@ mod tests {
             "experimental_enabled": true,
             "endpoint_mode": "custom",
             "region": "singapore",
-            "workspace_id": "dormant-workspace",
             "endpoint": "wss://audio3.example.test/stream?opaque=one",
             "model": "audio3-stream-test",
             "language_hints_enabled": true,
@@ -993,23 +969,12 @@ mod tests {
             saved.asr.alibaba_audio3.region,
             crate::config::Audio3Region::Singapore
         );
-        assert_eq!(saved.asr.alibaba_audio3.workspace_id, "dormant-workspace");
         assert_eq!(
-            saved
-                .asr
-                .alibaba_audio3
-                .resolve_endpoints()
-                .unwrap()
-                .streaming(),
+            saved.asr.alibaba_audio3.resolve_endpoints().streaming(),
             "wss://audio3.example.test/stream?opaque=one"
         );
         assert_eq!(
-            saved
-                .asr
-                .alibaba_audio3
-                .resolve_endpoints()
-                .unwrap()
-                .native(),
+            saved.asr.alibaba_audio3.resolve_endpoints().native(),
             "https://audio3.example.test/native?opaque=two"
         );
         assert!(saved.asr.alibaba_audio3.language_hints_enabled);
@@ -1031,7 +996,7 @@ mod tests {
     }
 
     #[test]
-    fn regional_audio3_settings_round_trip_preserves_workspace_and_dormant_urls() {
+    fn regional_audio3_settings_round_trip_preserves_region_and_dormant_urls() {
         let temp = tempfile::tempdir().unwrap();
         let store = ConfigStore::new(temp.path().join("config.toml"));
         let loaded = store.load().unwrap();
@@ -1040,7 +1005,7 @@ mod tests {
         config["asr"]["alibaba_audio3"]["experimental_enabled"] = json!(true);
         config["asr"]["alibaba_audio3"]["endpoint_mode"] = json!("regional");
         config["asr"]["alibaba_audio3"]["region"] = json!("singapore");
-        config["asr"]["alibaba_audio3"]["workspace_id"] = json!("workspace-9");
+        config["asr"]["alibaba_audio3"]["workspace_id"] = json!("ignored-json-route-sentinel");
         config["asr"]["alibaba_audio3"]["endpoint"] = json!("dormant streaming bytes");
         config["asr"]["alibaba_audio3"]["native_endpoint"] = json!("dormant native bytes");
         let save = json!({
@@ -1062,26 +1027,25 @@ mod tests {
             "singapore"
         );
         assert_eq!(
-            saved["result"]["config"]["asr"]["alibaba_audio3"]["workspace_id"],
-            "workspace-9"
-        );
-        assert_eq!(
             saved["result"]["config"]["asr"]["alibaba_audio3"]["endpoint"],
             "dormant streaming bytes"
         );
-
-        let get = json!({"version": 1, "id": 36, "method": "settings.get", "params": {}});
-        let fetched: Value =
-            serde_json::from_slice(&handle_line(get.to_string().as_bytes(), &store)).unwrap();
-        assert_eq!(fetched["ok"], true);
-        assert_eq!(
-            fetched["result"]["config"]["asr"]["alibaba_audio3"],
+        assert!(
             saved["result"]["config"]["asr"]["alibaba_audio3"]
+                .get("workspace_id")
+                .is_none()
         );
+        assert!(!saved.to_string().contains("ignored-json-route-sentinel"));
+        assert!(
+            !fs::read_to_string(store.path())
+                .unwrap()
+                .contains("ignored-json-route-sentinel")
+        );
+
         let loaded = store.load().unwrap().config.asr.alibaba_audio3;
         assert_eq!(
-            loaded.resolve_endpoints().unwrap().native(),
-            "https://workspace-9.ap-southeast-1.maas.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation"
+            loaded.resolve_endpoints().native(),
+            crate::config::AUDIO3_SINGAPORE_NATIVE_ENDPOINT
         );
     }
 

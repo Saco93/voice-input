@@ -507,7 +507,6 @@ mod tests {
         config.asr.alibaba_audio3.endpoint = "https://SENTINEL_ENDPOINT.example".into();
         config.asr.alibaba_audio3.native_endpoint =
             "https://SENTINEL_NATIVE_ENDPOINT.example".into();
-        config.asr.alibaba_audio3.workspace_id = "SENTINEL_WORKSPACE".into();
         config.asr.alibaba_audio3.api_key = "SENTINEL_CREDENTIAL".into();
 
         let mut snapshot = Snapshot::idle(&config);
@@ -529,7 +528,6 @@ mod tests {
             "SENTINEL_NATIVE_MODEL",
             "SENTINEL_ENDPOINT",
             "SENTINEL_NATIVE_ENDPOINT",
-            "SENTINEL_WORKSPACE",
             "SENTINEL_CREDENTIAL",
             "SENTINEL_TOOLTIP",
             "SENTINEL_TRANSCRIPT",

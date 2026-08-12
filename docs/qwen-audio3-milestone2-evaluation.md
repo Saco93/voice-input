@@ -4,7 +4,7 @@ Evaluation date: 2026-08-05
 
 Candidate commit: `8c11b9e`
 
-This report contains aggregate results only. It does not include audio, reference text, normal or refined transcripts, provider messages, credentials, endpoints, Workspace IDs, model names, window/application data, or prompt context. Source recordings, generated WAV files, per-request transcripts, errors, detailed per-file construction metadata, and raw per-session diagnostics remain in a private local directory excluded from Git.
+This report contains aggregate results only. It does not include audio, reference text, normal or refined transcripts, provider messages, credentials, endpoints, route identifiers, model names, window/application data, or prompt context. Source recordings, generated WAV files, per-request transcripts, errors, detailed per-file construction metadata, and raw per-session diagnostics remain in a private local directory excluded from Git.
 
 ## Scope
 
@@ -15,9 +15,9 @@ The authorized evaluation covered:
 - one real microphone session per preset;
 - one live cancellation canary;
 - bounded timestamp parser compatibility;
-- Beijing Regional routing with an empty Workspace ID for Streaming and Native.
+- Beijing Regional routing through the fixed reviewed hosts for Streaming and Native.
 
-Singapore and workspace-specific routing were not attempted because no matching region/workspace credential was configured. Their live status remains unknown.
+Singapore routing was not attempted because no matching region credential was configured. Its live status remains unknown.
 
 ## Fixed private corpus
 
@@ -64,14 +64,14 @@ A live Long-form session was cancelled with F8 while toggle-mode recording was a
 
 ## Regional route canaries
 
-With Regional Beijing selected and Workspace ID empty, one private WAV completed successfully through each API:
+With Regional Beijing selected, one private WAV completed successfully through each fixed reviewed host:
 
 | Route | Result | Command elapsed |
 | --- | --- | ---: |
 | Beijing Streaming legacy host | Success | 1,364 ms |
 | Beijing Native legacy host | Success | 984 ms |
 
-The existing encrypted credential was not probed against Singapore or a workspace host. No automatic fallback or cross-region attempt was made.
+The existing encrypted credential was not probed against Singapore. No automatic fallback or cross-region attempt was made.
 
 ## Approximate request cost
 
@@ -84,4 +84,4 @@ Using the Beijing rates already recorded for Milestone 1—¥0.00033 per Streami
 3. **Keep Long-form as an explicit option.** Its field combination was accepted, semantic punctuation produced valid results, and it preserved all pause clauses. This corpus does not show a general accuracy advantage.
 4. **Keep Custom controls and validation unchanged.** The provider documentation still exposes one optional combined speech/noise threshold; separate threshold fields remain unsupported.
 5. **Retain bounded timestamp parsing without identity-based transcript changes.** Live events were parser-compatible, but finite captures cannot prove stable revision identity semantics.
-6. **Mark Beijing empty-workspace routing live-validated for the exercised Streaming and Native calls.** Singapore and workspace-specific routes remain pending a credential scoped to those routes; no feature-parity claim is made.
+6. **Mark Beijing fixed regional routing live-validated for the exercised Streaming and Native calls.** Singapore remains pending a credential scoped to that region; no feature-parity claim is made.
