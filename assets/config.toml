@@ -72,6 +72,7 @@ model = ""
 timeout_ms = 15000
 provider_sort = ""
 agent_context_enabled = false
+# Local redacted source budget before segmentation; only bounded terminology is sent.
 agent_context_max_chars = 6000
 
 [hud]

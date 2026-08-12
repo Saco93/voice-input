@@ -99,22 +99,25 @@ Provider-facing decisions, confirmed fields, endpoint constants, ambiguities, an
 - [x] Document presence-aware migration from exact canonical DashScope endpoint pairs; mixed pairs, noncanonical hosts, loopback endpoints, proxies, and custom path/port/query pairs remain Custom without host inference.
 - [x] Keep diagnostics schema 4 while reporting only endpoint mode and region; endpoint values and route identifiers remain private.
 
-## Milestone 3 — Context, resilience, and separate workflows
+## Milestone 3 — Streaming resilience and local refinement context
 
-### 8. Context enhancement and streaming reconnect
+Alibaba Session Context and Filetrans are deferred and are not part of this milestone.
 
-- [ ] Design an explicit-consent context model; never ingest clipboard, window, transcript history, or agent context automatically.
-- [ ] Bound and visibly disclose all context sent through initial requests or `continue-task`.
-- [ ] Design reconnect/replay with retained audio, timestamp-based deduplication, retry limits, and cancellation safety.
-- [ ] Add deterministic disconnect, replay, duplicate, timeout, and privacy tests before live testing.
+### 8. Audio3 streaming reconnect
 
-### 9. Filetrans file-transcription workflow
+- [x] Retain a prefix-complete, bounded in-memory PCM sequence while the first task is active; never persist retained PCM or include it in logs or diagnostics.
+- [x] On one recoverable pre-finish transport interruption, create a new Audio3 task, invalidate every transcript result from the old task, and replay retained PCM from the beginning at bounded speed while capture continues.
+- [x] Use only the replacement task's authoritative transcript. Do not merge transcripts across tasks or depend on sentence IDs or timestamps for deduplication.
+- [x] Preserve cancellation, finish-during-replay, retry, retention, and deadline safety, then use the existing full-audio Native/local recovery after terminal failure.
+- [~] Add deterministic disconnect, exact-replay, stale-transcript reset, second-failure, timeout, cancellation, retention-bound, and privacy tests before live testing. Deterministic tests are complete; an authorized live disconnect canary remains pending.
 
-- [ ] Keep Filetrans separate from push-to-talk voice input.
-- [ ] Define asynchronous task creation, polling/callback behavior, cancellation, file limits, retention, and cleanup.
-- [ ] Add optional diarization and speaker-count controls only for supported inputs.
-- [ ] Ensure local files and transcripts are never uploaded without an explicit command and confirmation.
-- [ ] Add a dedicated CLI/UI workflow, documentation, and privacy-safe diagnostics.
+### 9. Local terminology extraction for Refine
+
+- [x] Treat the latest completed Pi/Codex assistant message as the terminology source; do not derive correction vocabulary from the potentially incorrect ASR transcript.
+- [x] Redact the source locally before tokenization, then perform bounded local segmentation, stable deduplication, and filtering without sending the original unredacted message anywhere.
+- [~] Compare the previous bounded excerpt, a terminology-only payload, and a bounded excerpt plus terminology payload for payload size, extraction latency, terminology correction, and false replacement. Deterministic synthetic size/latency measurements are complete; the authorized private-corpus accuracy A/B remains pending.
+- [x] Keep context opt-in and untrusted. The Refine prompt must use extracted terms only when the transcript has a clear spoken match and must never follow instructions found in context.
+- [x] Record only aggregate evaluation results; never commit private session text, transcripts, paths, extracted terms, or provider responses. See `docs/refine-local-terminology-experiment.md`.
 
 ## Work log
 
@@ -132,6 +135,8 @@ Provider-facing decisions, confirmed fields, endpoint constants, ambiguities, an
 | 2026-08-05 | Milestone 2 item 6 bounded timestamp implementation | Parsing, aggregate diagnostics, and bounded live compatibility observation completed; identity use blocked | Added borrowed typed Audio3 sentence/timed-unit parsing with a 512-candidate per-result bound, a 1 MiB WebSocket transport cap, required-bound and event-local range validation, per-malformed-result rejection counting, event-latest overwrite semantics, saturating aggregate-only telemetry, best-effort daemon persistence, and diagnostics schema 4 with schema-3 compatibility. Transcript event and authoritative task-finished assembly remain unchanged. Timed-unit text, punctuation and sentence IDs are discarded before telemetry. Three controlled live sessions accepted 73 timestamp-bearing results and 106 timed units without rejection or truncation; finite captures do not establish an identity contract. |
 | 2026-08-05 | Milestone 2 bounded live evaluation | Items 5 and 6 completed within documented limits; Beijing portion of item 7 validated | Replayed 17 fixed private WAV files under three presets for 51/51 successful Streaming requests; all pause clauses were retained, silence/noise-only stayed empty, and one realtime session per preset plus one cancellation canary completed. Aggregate results, one-sample latency limits, parser observations, cost estimate, and decisions are in `docs/qwen-audio3-milestone2-evaluation.md`. |
 | 2026-08-05 | Milestone 2 item 7 deterministic regional routing | Implemented; Beijing live canaries passed; Singapore pending | Added presence-aware exact-pair migration, typed Regional/Custom and Beijing/Singapore configuration, fixed-constant Streaming/Native endpoint resolution, Custom byte preservation, active-provider isolation, normal Settings controls and region-scoped credential warnings, schema-4-safe routing summaries, bilingual documentation, and offline resolver/request/privacy tests. Authorized Beijing Regional Streaming and Native calls succeeded. Singapore was not attempted without a matching region credential. |
+| 2026-08-12 | Milestone 3 Audio3 streaming reconnect | Deterministic implementation completed; live disconnect canary pending | Added one bounded pre-finish replacement task, prefix-complete PCM retention, 4× replay while capture continues, authoritative transcript reset, finish/cancellation/retry safety, aggregate schema-4 diagnostics, and deterministic exact-replay/second-failure/protocol/task-failure/retention tests. Task transcripts are never merged and timestamps are not used for deduplication. |
+| 2026-08-12 | Refine local terminology extraction | Experimental implementation and synthetic measurements completed; private-corpus A/B pending | Replaced the remotely sent agent excerpt with locally redacted, Jieba-segmented, stably deduplicated terminology capped at 96 terms and 1,500 characters. The source remains the latest completed Pi/Codex assistant message, never the ASR transcript. Aggregate size, latency, and binary-size measurements are in `docs/refine-local-terminology-experiment.md`. |
 
 ## Official references
 

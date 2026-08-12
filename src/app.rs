@@ -340,12 +340,27 @@ enum StreamOutcome {
 }
 
 fn collect_stream_events(event_rx: &Receiver<AsrEvent>, timeout: Duration) -> StreamOutcome {
-    let deadline = Instant::now() + timeout;
+    // Replay can legitimately take much longer than provider finalization. Do
+    // not start the finalization budget until the backend confirms that every
+    // PCM packet and finish-task have reached the authoritative task.
+    let mut deadline: Option<Instant> = None;
     let mut transcript = None;
     loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        match event_rx.recv_timeout(remaining) {
+        let event = match deadline {
+            Some(deadline) => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                event_rx.recv_timeout(remaining)
+            }
+            None => event_rx
+                .recv()
+                .map_err(|_| mpsc::RecvTimeoutError::Disconnected),
+        };
+        match event {
             Ok(AsrEvent::Final { text }) if !text.trim().is_empty() => transcript = Some(text),
+            Ok(AsrEvent::TranscriptReset) => transcript = None,
+            Ok(AsrEvent::AudioDeliveryCompleted { .. }) => {
+                deadline = Some(Instant::now() + timeout);
+            }
             Ok(AsrEvent::Finished) => return StreamOutcome::Finished(transcript),
             Ok(AsrEvent::Error { .. } | AsrEvent::TaskFailed { .. }) => {
                 return StreamOutcome::Error;
@@ -588,6 +603,47 @@ mod tests {
         assert_eq!(parsed["session"]["asr_outcome"], "completed");
         assert!(parsed["session"].get("outcome").is_none());
         assert_eq!(parsed["session"]["selected_result"], "streaming");
+    }
+
+    #[test]
+    fn stream_event_collector_discards_final_invalidated_by_reset() {
+        let (event_tx, event_rx) = mpsc::channel();
+        event_tx
+            .send(AsrEvent::Final {
+                text: "stale final".into(),
+            })
+            .unwrap();
+        event_tx.send(AsrEvent::TranscriptReset).unwrap();
+        event_tx.send(AsrEvent::Finished).unwrap();
+
+        assert_eq!(
+            collect_stream_events(&event_rx, Duration::from_secs(1)),
+            StreamOutcome::Finished(None)
+        );
+    }
+
+    #[test]
+    fn stream_event_collector_starts_timeout_after_audio_delivery() {
+        let (event_tx, event_rx) = mpsc::channel();
+        let join = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(30));
+            event_tx
+                .send(AsrEvent::AudioDeliveryCompleted {
+                    packet_count: 1,
+                    sample_count: 1,
+                    max_queue_delay_ms: 0,
+                    last_queue_delay_ms: 0,
+                })
+                .unwrap();
+            thread::sleep(Duration::from_millis(5));
+            event_tx.send(AsrEvent::Finished).unwrap();
+        });
+
+        assert_eq!(
+            collect_stream_events(&event_rx, Duration::from_millis(10)),
+            StreamOutcome::Finished(None)
+        );
+        join.join().unwrap();
     }
 
     #[test]

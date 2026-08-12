@@ -791,8 +791,14 @@ fn capture_refinement_context_at_stop(
         };
     }
 
-    let agent_handle = Some(thread::spawn(
-        move || match agent_context::resolve_focused_session(snapshot) {
+    let agent_handle = Some(thread::spawn(move || {
+        if let Some(elapsed) = agent_context::warm_terminology_segmenter() {
+            eprintln!(
+                "voice-input agent context: initialized local segmenter in {} ms",
+                elapsed.as_millis()
+            );
+        }
+        match agent_context::resolve_focused_session(snapshot) {
             Ok(Some(locator)) => Some(locator),
             Ok(None) => {
                 eprintln!("voice-input agent context: captured process has no valid session");
@@ -802,8 +808,8 @@ fn capture_refinement_context_at_stop(
                 eprintln!("voice-input agent context: captured session discovery failed");
                 None
             }
-        },
-    ));
+        }
+    }));
     StopRefinementContext {
         category,
         agent: Some(agent),
@@ -1833,9 +1839,12 @@ impl Daemon {
         });
         if let Some(reference) = agent_reference.as_ref() {
             eprintln!(
-                "voice-input refinement: using {} agent context ({} chars)",
+                "voice-input refinement: using {} agent context (source_chars={} terminology_count={} terminology_chars={} extraction_us={})",
                 reference.agent.label(),
-                reference.text.chars().count()
+                reference.source_char_count,
+                reference.terminology.len(),
+                reference.terminology_char_count,
+                reference.extraction_elapsed.as_micros()
             );
         }
 
@@ -2494,6 +2503,39 @@ fn record_finished_telemetry(update_diagnostics: impl FnOnce() -> Result<()>) ->
     true
 }
 
+fn reset_authoritative_transcript(
+    final_transcript: &mut Option<String>,
+    partial_transcript: &Mutex<String>,
+    snapshot: &mut Snapshot,
+) {
+    *final_transcript = None;
+    partial_transcript
+        .lock()
+        .expect("partial transcript mutex poisoned")
+        .clear();
+    snapshot.transcript.clear();
+    snapshot.raw_transcript = None;
+    snapshot.refined_transcript = None;
+    snapshot.text.clear();
+
+    // These values describe one authoritative provider attempt. Preserve only
+    // session-scoped reconnect/audio-delivery fields across reconstruction.
+    if let Some(session) = snapshot.diagnostics.session.as_mut() {
+        let streaming = &mut session.streaming;
+        streaming.first_partial_latency_ms = None;
+        streaming.first_nonempty_partial_latency_ms = None;
+        streaming.last_result_latency_ms = None;
+        streaming.partial_event_count = 0;
+        streaming.nonempty_partial_event_count = 0;
+        streaming.segment_final_event_count = 0;
+        streaming.timestamp_bearing_result_count = 0;
+        streaming.accepted_timed_unit_count = 0;
+        streaming.result_with_rejected_timestamp_metadata_count = 0;
+        streaming.truncated_timed_unit_count = 0;
+        streaming.latest_valid_audio_end_ms = None;
+    }
+}
+
 fn finalize_realtime_events(
     saw_finished: bool,
     final_transcript: Option<String>,
@@ -2619,6 +2661,27 @@ fn spawn_realtime_event_thread(
                         }
                     })?;
                 }
+                backend::AsrEvent::TranscriptReset => {
+                    realtime_reconstructing = true;
+                    state.update(|snapshot| {
+                        if !snapshot_matches_session(snapshot, session_id) {
+                            return;
+                        }
+                        reset_authoritative_transcript(
+                            &mut final_transcript,
+                            &partial_transcript,
+                            snapshot,
+                        );
+                        logged_first_partial = false;
+                        logged_first_nonempty_partial = false;
+                        if matches!(
+                            snapshot.phase,
+                            Phase::Arming | Phase::Recording | Phase::Transcribing
+                        ) {
+                            snapshot.tooltip = "Realtime reconnecting — recording continues".into();
+                        }
+                    })?;
+                }
                 backend::AsrEvent::RealtimeTranscriptDelayed => {
                     speech_detected.store(true, Ordering::SeqCst);
                     realtime_overloaded.store(true, Ordering::SeqCst);
@@ -2660,6 +2723,26 @@ fn spawn_realtime_event_thread(
                                 session.streaming.last_audio_queue_delay_ms =
                                     Some(last_queue_delay_ms);
                                 session.streaming.finish_sent_latency_ms = Some(latency_ms);
+                            });
+                        }
+                    });
+                }
+                backend::AsrEvent::StreamingReconnect {
+                    attempted,
+                    succeeded,
+                    replay_packet_count,
+                    replay_sample_count,
+                    terminal_failure_kind,
+                } => {
+                    let _ = state.update(|snapshot| {
+                        if snapshot_matches_session(snapshot, session_id) {
+                            snapshot.diagnostics.update_session(session_id, |session| {
+                                session.streaming.reconnect_attempted_count = attempted;
+                                session.streaming.reconnect_succeeded_count = succeeded;
+                                session.streaming.replay_packet_count = replay_packet_count;
+                                session.streaming.replay_sample_count = replay_sample_count;
+                                session.streaming.reconnect_terminal_failure_kind =
+                                    terminal_failure_kind;
                             });
                         }
                     });
@@ -3339,6 +3422,44 @@ mod tests {
             ))
         });
         assert_eq!(transcript_outcome, "unchanged transcript");
+    }
+
+    #[test]
+    fn transcript_reset_clears_daemon_final_partial_and_hud_state() {
+        let config = Config::default();
+        let partial = Mutex::new("stale partial".to_string());
+        let mut final_transcript = Some("stale final".to_string());
+        let mut snapshot = Snapshot::idle(&config);
+        snapshot.diagnostics = diagnostics_for_session(&config, 1);
+        let streaming = &mut snapshot.diagnostics.session.as_mut().unwrap().streaming;
+        streaming.first_partial_latency_ms = Some(10);
+        streaming.last_result_latency_ms = Some(20);
+        streaming.partial_event_count = 3;
+        streaming.segment_final_event_count = 2;
+        streaming.timestamp_bearing_result_count = 4;
+        streaming.latest_valid_audio_end_ms = Some(500);
+        streaming.reconnect_attempted_count = 1;
+        snapshot.transcript = "stale HUD transcript".into();
+        snapshot.raw_transcript = Some("stale raw".into());
+        snapshot.refined_transcript = Some("stale refined".into());
+        snapshot.text = "stale display text".into();
+
+        reset_authoritative_transcript(&mut final_transcript, &partial, &mut snapshot);
+
+        assert!(final_transcript.is_none());
+        assert!(partial.lock().unwrap().is_empty());
+        assert!(snapshot.transcript.is_empty());
+        assert!(snapshot.raw_transcript.is_none());
+        assert!(snapshot.refined_transcript.is_none());
+        assert!(snapshot.text.is_empty());
+        let streaming = &snapshot.diagnostics.session.as_ref().unwrap().streaming;
+        assert_eq!(streaming.first_partial_latency_ms, None);
+        assert_eq!(streaming.last_result_latency_ms, None);
+        assert_eq!(streaming.partial_event_count, 0);
+        assert_eq!(streaming.segment_final_event_count, 0);
+        assert_eq!(streaming.timestamp_bearing_result_count, 0);
+        assert_eq!(streaming.latest_valid_audio_end_ms, None);
+        assert_eq!(streaming.reconnect_attempted_count, 1);
     }
 
     #[test]

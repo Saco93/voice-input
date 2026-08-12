@@ -13,6 +13,9 @@ use url::{Host, Url};
 
 use crate::paths;
 
+pub const MIN_AGENT_CONTEXT_CHARS: usize = 500;
+pub const MAX_AGENT_CONTEXT_CHARS: usize = 12_000;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     pub state_file: String,
@@ -983,8 +986,8 @@ impl Config {
             &mut fields,
             "llm.agent_context_max_chars",
             self.llm.agent_context_max_chars,
-            128,
-            100_000,
+            MIN_AGENT_CONTEXT_CHARS,
+            MAX_AGENT_CONTEXT_CHARS,
         );
 
         range(
@@ -1502,7 +1505,8 @@ mod tests {
         AUDIO3_SINGAPORE_NATIVE_ENDPOINT, AUDIO3_SINGAPORE_STREAMING_ENDPOINT, AsrProvider,
         Audio3EndpointMode, Audio3RecognitionPreset, Audio3Region, Audio3VocabularyTerm, Config,
         ConfigStore, EffectiveAudio3RecognitionControls, HudPosition, Language,
-        MAX_AUDIO3_VOCABULARY_BYTES, NativeFinalPassMode, RevisionConflict,
+        MAX_AGENT_CONTEXT_CHARS, MAX_AUDIO3_VOCABULARY_BYTES, MIN_AGENT_CONTEXT_CHARS,
+        NativeFinalPassMode, RevisionConflict,
     };
 
     #[test]
@@ -1518,6 +1522,33 @@ mod tests {
         assert!(error.fields.contains_key("asr.alibaba.vad_threshold"));
         assert!(error.fields.contains_key("llm.api_base_url"));
         assert!(error.fields.contains_key("llm.model"));
+    }
+
+    #[test]
+    fn agent_context_limit_matches_runtime_bounds() {
+        let mut config = Config::default();
+        config.llm.agent_context_max_chars = MIN_AGENT_CONTEXT_CHARS - 1;
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .fields
+                .contains_key("llm.agent_context_max_chars")
+        );
+
+        config.llm.agent_context_max_chars = MIN_AGENT_CONTEXT_CHARS;
+        config.validate().expect("minimum context limit is valid");
+        config.llm.agent_context_max_chars = MAX_AGENT_CONTEXT_CHARS;
+        config.validate().expect("maximum context limit is valid");
+
+        config.llm.agent_context_max_chars = MAX_AGENT_CONTEXT_CHARS + 1;
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .fields
+                .contains_key("llm.agent_context_max_chars")
+        );
     }
 
     #[test]
