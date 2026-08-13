@@ -11,7 +11,9 @@ use std::{
 use anyhow::{Context, Result, anyhow, bail};
 
 use crate::{
-    backend::{ASR_CONTROL_QUEUE_CAPACITY, AsrBackend, AsrEvent, AsrSessionHandle, AudioSpec},
+    backend::{
+        ASR_CONTROL_QUEUE_CAPACITY, AsrBackend, AsrEvent, AsrSessionHandle, AsrSessionOptions,
+    },
     config::Config,
 };
 
@@ -40,7 +42,11 @@ impl LocalCliBackend {
 }
 
 impl AsrBackend for LocalCliBackend {
-    fn spawn_session(&self, _config: &Config, _spec: AudioSpec) -> Result<AsrSessionHandle> {
+    fn spawn_session(
+        &self,
+        _config: &Config,
+        _options: AsrSessionOptions,
+    ) -> Result<AsrSessionHandle> {
         let (control_tx, control_rx) = mpsc::sync_channel(ASR_CONTROL_QUEUE_CAPACITY);
         let (event_tx, event_rx) = mpsc::channel();
 

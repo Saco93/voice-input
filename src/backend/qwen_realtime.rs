@@ -24,7 +24,8 @@ use url::Url;
 
 use crate::{
     backend::{
-        ASR_CONTROL_QUEUE_CAPACITY, AsrBackend, AsrControl, AsrEvent, AsrSessionHandle, AudioSpec,
+        ASR_CONTROL_QUEUE_CAPACITY, AsrBackend, AsrControl, AsrEvent, AsrSessionHandle,
+        AsrSessionOptions, AudioSpec,
     },
     config::{AlibabaTurnMode, Config},
     diagnostics::FailureKind,
@@ -51,7 +52,12 @@ impl QwenRealtimeBackend {
 }
 
 impl AsrBackend for QwenRealtimeBackend {
-    fn spawn_session(&self, config: &Config, spec: AudioSpec) -> Result<AsrSessionHandle> {
+    fn spawn_session(
+        &self,
+        config: &Config,
+        options: AsrSessionOptions,
+    ) -> Result<AsrSessionHandle> {
+        let spec = options.audio;
         let (control_tx, control_rx) = mpsc::sync_channel(ASR_CONTROL_QUEUE_CAPACITY);
         let (event_tx, event_rx) = mpsc::channel();
         let abort_flag = Arc::new(AtomicBool::new(false));

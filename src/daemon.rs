@@ -106,6 +106,7 @@ struct NativeFinalPassPolicyInput {
     worker_interrupted: bool,
     overloaded: bool,
     saw_finished: bool,
+    session_context_sent: bool,
     captured_duration_ms: u64,
 }
 
@@ -123,6 +124,7 @@ struct FullAudioPassPlanInput {
     worker_interrupted: bool,
     overloaded: bool,
     saw_finished: bool,
+    session_context_sent: bool,
     captured_duration_ms: u64,
 }
 
@@ -173,7 +175,9 @@ fn decide_native_final_pass(input: NativeFinalPassPolicyInput) -> NativeFinalPas
         invoke(FinalPassReason::Degraded)
     } else if !input.saw_finished {
         invoke(FinalPassReason::MissingCompletion)
-    } else if input.captured_duration_ms >= ADAPTIVE_NATIVE_DURATION_MS {
+    } else if input.captured_duration_ms >= ADAPTIVE_NATIVE_DURATION_MS
+        && !input.session_context_sent
+    {
         invoke(FinalPassReason::Duration)
     } else {
         skip(FinalPassReason::HealthyStream)
@@ -190,6 +194,7 @@ fn plan_full_audio_pass(config: &Config, input: FullAudioPassPlanInput) -> FullA
             worker_interrupted: input.worker_interrupted,
             overloaded: input.overloaded,
             saw_finished: input.saw_finished,
+            session_context_sent: input.session_context_sent,
             captured_duration_ms: input.captured_duration_ms,
         });
         return FullAudioPassPlan {
@@ -524,7 +529,10 @@ fn handle_control(
     let mut completed_session = false;
     let result = match head {
         "start" => daemon
-            .start_recording(parse_output_target_hint_args(&parts[1..])?)
+            .start_recording(
+                parse_output_target_hint_args(&parts[1..])?,
+                focused_window_hint,
+            )
             .map(|_| "ok\n".to_string()),
         "stop" => {
             completed_session = daemon.has_session();
@@ -537,7 +545,7 @@ fn handle_control(
             daemon.finish_recording(false, focused_window_hint)
         } else {
             parse_output_target_hint_args(&parts[1..])
-                .and_then(|target_hint| daemon.start_recording(target_hint))
+                .and_then(|target_hint| daemon.start_recording(target_hint, focused_window_hint))
         }
         .map(|_| "ok\n".to_string()),
         "cancel" => {
@@ -550,7 +558,7 @@ fn handle_control(
             completed_session = true;
             parse_output_target_hint_args(&parts[1..]).and_then(|target_hint| {
                 daemon.finish_recording(true, None)?;
-                daemon.start_recording(target_hint)
+                daemon.start_recording(target_hint, focused_window_hint)
             })
         } else {
             return Ok("ignored idle restart\n".to_string());
@@ -719,19 +727,15 @@ fn should_capture_focused_window(cancel: bool, llm_enabled: bool) -> bool {
     !cancel && llm_enabled
 }
 
-fn should_capture_agent_context(
-    cancel: bool,
-    llm_enabled: bool,
-    agent_context_enabled: bool,
-) -> bool {
-    !cancel && llm_enabled && agent_context_enabled
+fn should_build_agent_terminology(config: &Config) -> bool {
+    config.llm.agent_context_enabled
+        && (config.llm.enabled || config.asr.provider == AsrProvider::AlibabaQwenAudio3)
 }
 
 #[derive(Default)]
 struct StopRefinementContext {
     category: RefinementCategory,
     agent: Option<agent_context::AgentKind>,
-    agent_handle: Option<thread::JoinHandle<Option<agent_context::AgentSessionLocator>>>,
 }
 
 fn capture_refinement_context_at_stop(
@@ -783,37 +787,9 @@ fn capture_refinement_context_at_stop(
         agent.label()
     );
 
-    if !should_capture_agent_context(cancel, config.llm.enabled, config.llm.agent_context_enabled) {
-        return StopRefinementContext {
-            category,
-            agent: Some(agent),
-            agent_handle: None,
-        };
-    }
-
-    let agent_handle = Some(thread::spawn(move || {
-        if let Some(elapsed) = agent_context::warm_terminology_segmenter() {
-            eprintln!(
-                "voice-input agent context: initialized local segmenter in {} ms",
-                elapsed.as_millis()
-            );
-        }
-        match agent_context::resolve_focused_session(snapshot) {
-            Ok(Some(locator)) => Some(locator),
-            Ok(None) => {
-                eprintln!("voice-input agent context: captured process has no valid session");
-                None
-            }
-            Err(_) => {
-                eprintln!("voice-input agent context: captured session discovery failed");
-                None
-            }
-        }
-    }));
     StopRefinementContext {
         category,
         agent: Some(agent),
-        agent_handle,
     }
 }
 
@@ -839,6 +815,7 @@ struct Session {
     capture_gate: Arc<Mutex<()>>,
     capture_mode: SessionCaptureMode,
     asr_runtime: SessionAsrRuntime,
+    agent_terminology: Option<agent_context::AgentTerminologyCapture>,
 }
 
 enum SessionCaptureMode {
@@ -997,6 +974,7 @@ impl Daemon {
     fn start_recording(
         &mut self,
         output_target_hint_override: Option<output::OutputTargetHint>,
+        focused_window_hint: Option<focused_window::FocusedWindowSnapshot>,
     ) -> Result<()> {
         if self.session.is_some() {
             return Ok(());
@@ -1011,10 +989,51 @@ impl Daemon {
         }
 
         let session_id = self.next_session_id.fetch_add(1, Ordering::SeqCst);
+        // Preserve the configured pre-roll first, then start a dedicated
+        // recorder before potentially slow session discovery. Its pipe buffers
+        // every post-keypress sample until the reader thread starts. Ordinary
+        // starts continue using the resident shared capture service.
+        let pre_roll_audio = self.capture.seed_audio();
+        let builds_agent_terminology = should_build_agent_terminology(&self.config);
+        let terminology_window = if builds_agent_terminology {
+            Some(
+                focused_window_hint
+                    .clone()
+                    .map(Ok)
+                    .unwrap_or_else(focused_window::capture),
+            )
+        } else {
+            None
+        };
+        let captures_agent_source = terminology_window.as_ref().is_some_and(|window| {
+            window
+                .as_ref()
+                .is_ok_and(|window| window.class().eq_ignore_ascii_case("kitty"))
+        });
+        let mut prepared_capture = (!self.capture.is_enabled() || captures_agent_source)
+            .then(|| PreparedPwRecord::spawn(&self.config))
+            .transpose()?;
+        let agent_terminology = if let Some(window) = terminology_window {
+            match window {
+                Ok(window) => agent_context::start_terminology_capture(
+                    window,
+                    self.config.llm.agent_context_max_chars,
+                )
+                .unwrap_or_else(|_| {
+                    eprintln!("voice-input agent context: start-time focus capture failed");
+                    None
+                }),
+                Err(_) => {
+                    eprintln!("voice-input agent context: focused-window capture failed at start");
+                    None
+                }
+            }
+        } else {
+            None
+        };
         let asr_started_at = Instant::now();
         let output_target_hint =
             output_target_hint_override.or_else(|| output::detect_output_target_hint().ok());
-        let pre_roll_audio = self.capture.seed_audio();
         let asr_packetizer = matches!(
             self.config.asr.provider,
             AsrProvider::AlibabaQwenRealtime | AsrProvider::AlibabaQwenAudio3
@@ -1095,8 +1114,14 @@ impl Daemon {
                 let asr = backend::build(&self.config);
                 let session = asr.spawn_session(
                     &self.config,
-                    backend::AudioSpec {
-                        sample_rate_hz: self.config.audio.sample_rate,
+                    backend::AsrSessionOptions {
+                        audio: backend::AudioSpec {
+                            sample_rate_hz: self.config.audio.sample_rate,
+                        },
+                        agent_terminology: (self.config.asr.provider
+                            == AsrProvider::AlibabaQwenAudio3)
+                            .then(|| agent_terminology.clone())
+                            .flatten(),
                     },
                 )?;
                 let control_tx = session.control_tx.clone();
@@ -1148,7 +1173,7 @@ impl Daemon {
             }
         }
 
-        let capture_mode = if self.capture.is_enabled() {
+        let capture_mode = if self.capture.is_enabled() && prepared_capture.is_none() {
             self.capture.attach_session(ActiveCaptureSession {
                 session_id,
                 stop_flag: stop_flag.clone(),
@@ -1173,7 +1198,10 @@ impl Daemon {
             )?;
             SessionCaptureMode::SharedPreRoll
         } else {
-            let (child, stdout) = spawn_pw_record(&self.config)?;
+            let (child, stdout) = prepared_capture
+                .take()
+                .expect("dedicated capture must be prepared")
+                .into_parts();
             let reader_handle = spawn_reader_thread(
                 stdout,
                 ReaderThreadContext {
@@ -1213,6 +1241,7 @@ impl Daemon {
             capture_gate,
             capture_mode,
             asr_runtime,
+            agent_terminology,
         });
         Ok(())
     }
@@ -1528,6 +1557,9 @@ impl Daemon {
                     });
                     (String::new(), SelectedResult::None)
                 } else {
+                    let session_context_sent = event_result
+                        .as_ref()
+                        .is_ok_and(|outcome| outcome.session_context_sent);
                     let (streaming_state, remote_transcript, stream_error) = if realtime_overloaded
                     {
                         let _ = self.state.update(|snapshot| {
@@ -1617,6 +1649,7 @@ impl Daemon {
                             worker_interrupted,
                             overloaded: realtime_overloaded,
                             saw_finished,
+                            session_context_sent,
                             captured_duration_ms: captured_audio_duration_ms(
                                 audio.len(),
                                 self.config.audio.sample_rate,
@@ -1808,45 +1841,36 @@ impl Daemon {
             snapshot.refinement_changed = None;
         })?;
 
-        let agent_locator =
-            refinement_context
-                .agent_handle
-                .and_then(|handle| match handle.join() {
-                    Ok(locator) => locator,
-                    Err(_) => {
-                        eprintln!("voice-input agent context: session discovery worker panicked");
-                        None
-                    }
-                });
-        let agent_reference = agent_locator.as_ref().and_then(|locator| {
-            match agent_context::load_reference(
-                locator,
-                self.config.llm.agent_context_max_chars,
-            ) {
-                Ok(reference) => {
-                    if reference.is_none() {
-                        eprintln!(
-                            "voice-input agent context: captured session has no usable completed assistant message"
-                        );
-                    }
-                    reference
-                }
-                Err(_) => {
-                    eprintln!("voice-input agent context: captured session could not be read");
-                    None
-                }
-            }
-        });
+        let agent_reference = self
+            .config
+            .llm
+            .enabled
+            .then(|| {
+                session.agent_terminology.as_ref().and_then(|capture| {
+                    capture.wait_with_abort(
+                        &session.cancel_flag,
+                        Duration::from_millis(self.config.llm.timeout_ms.min(5_000)),
+                    )
+                })
+            })
+            .flatten();
         if let Some(reference) = agent_reference.as_ref() {
+            let selected = reference.select_for_refinement();
             eprintln!(
-                "voice-input refinement: using {} agent context (source_chars={} terminology_count={} terminology_chars={} extraction_us={})",
+                "voice-input refinement: using {} start-time agent context (source_chars={} candidate_count={} terminology_count={} terminology_chars={} extraction_us={})",
                 reference.agent.label(),
                 reference.source_char_count,
-                reference.terminology.len(),
-                reference.terminology_char_count,
+                reference.candidate_count(),
+                selected.terms.len(),
+                selected.char_count,
                 reference.extraction_elapsed.as_micros()
             );
         }
+
+        let normalized_transcript = agent_reference
+            .as_ref()
+            .map(|reference| reference.normalize_technical_terms(&raw_transcript))
+            .unwrap_or_else(|| raw_transcript.clone());
 
         let (final_transcript, refinement_status, refinement_changed) = if self.config.llm.enabled {
             self.state.update(|snapshot| {
@@ -1859,10 +1883,10 @@ impl Daemon {
 
             match llm::maybe_refine(
                 &self.config,
-                &raw_transcript,
+                &normalized_transcript,
                 refinement_context.category,
                 refinement_context.agent,
-                agent_reference.as_ref(),
+                agent_reference.as_deref(),
             ) {
                 Ok(value) => {
                     let changed = value.trim() != raw_transcript.trim();
@@ -1871,11 +1895,17 @@ impl Daemon {
                 }
                 Err(error) => {
                     let message = format!("failed: {}", truncate_for_tooltip(&error.to_string()));
-                    (raw_transcript.clone(), message, Some(false))
+                    let changed = normalized_transcript.trim() != raw_transcript.trim();
+                    (normalized_transcript.clone(), message, Some(changed))
                 }
             }
         } else {
-            (raw_transcript.clone(), "disabled".into(), None)
+            let changed = normalized_transcript.trim() != raw_transcript.trim();
+            (
+                normalized_transcript.clone(),
+                "disabled".into(),
+                changed.then_some(true),
+            )
         };
 
         self.state.update(|snapshot| {
@@ -2004,6 +2034,37 @@ fn capture_warmup_samples(config: &Config) -> usize {
 
 fn pre_roll_samples(config: &Config) -> usize {
     ((config.audio.sample_rate as usize) * (config.audio.pre_roll_ms as usize)) / 1_000
+}
+
+struct PreparedPwRecord {
+    child: Option<Child>,
+    stdout: Option<std::process::ChildStdout>,
+}
+
+impl PreparedPwRecord {
+    fn spawn(config: &Config) -> Result<Self> {
+        let (child, stdout) = spawn_pw_record(config)?;
+        Ok(Self {
+            child: Some(child),
+            stdout: Some(stdout),
+        })
+    }
+
+    fn into_parts(mut self) -> (Child, std::process::ChildStdout) {
+        (
+            self.child.take().expect("prepared capture child missing"),
+            self.stdout.take().expect("prepared capture stdout missing"),
+        )
+    }
+}
+
+impl Drop for PreparedPwRecord {
+    fn drop(&mut self) {
+        if let Some(child) = self.child.as_mut() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
 }
 
 fn spawn_pw_record(config: &Config) -> Result<(Child, std::process::ChildStdout)> {
@@ -2424,6 +2485,7 @@ fn spawn_reader_thread(
 struct RealtimeEventOutcome {
     transcript: Option<String>,
     saw_finished: bool,
+    session_context_sent: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -2538,6 +2600,7 @@ fn reset_authoritative_transcript(
 
 fn finalize_realtime_events(
     saw_finished: bool,
+    session_context_sent: bool,
     final_transcript: Option<String>,
     update_diagnostics: impl FnOnce(StageStatus, Option<FailureKind>) -> Result<()>,
 ) -> RealtimeEventOutcome {
@@ -2554,6 +2617,7 @@ fn finalize_realtime_events(
     RealtimeEventOutcome {
         transcript: final_transcript,
         saw_finished,
+        session_context_sent,
     }
 }
 
@@ -2593,11 +2657,22 @@ fn spawn_realtime_event_thread(
         let mut final_transcript = None;
         let mut realtime_reconstructing = false;
         let mut saw_finished = false;
+        let mut session_context_sent = false;
         let mut logged_first_partial = false;
         let mut logged_first_nonempty_partial = false;
 
         while let Ok(event) = event_rx.recv() {
             match event {
+                backend::AsrEvent::SessionContextSent => {
+                    session_context_sent = true;
+                    let _ = state.update(|snapshot| {
+                        if snapshot_matches_session(snapshot, session_id) {
+                            snapshot.diagnostics.update_session(session_id, |session| {
+                                session.streaming.session_context_sent = true;
+                            });
+                        }
+                    });
+                }
                 backend::AsrEvent::Ready => {
                     asr_ready.store(true, Ordering::SeqCst);
                     let latency_ms = elapsed_ms(asr_started_at);
@@ -2960,6 +3035,7 @@ fn spawn_realtime_event_thread(
             .map(elapsed_ms);
         let outcome = finalize_realtime_events(
             saw_finished,
+            session_context_sent,
             final_transcript,
             |status, terminal_failure_kind| {
                 state.update(|snapshot| {
@@ -3148,6 +3224,7 @@ mod tests {
             worker_interrupted: false,
             overloaded: false,
             saw_finished: true,
+            session_context_sent: false,
             captured_duration_ms: ADAPTIVE_NATIVE_DURATION_MS - 1,
         }
     }
@@ -3278,10 +3355,16 @@ mod tests {
         assert!(!should_capture_focused_window(true, true));
         assert!(!should_capture_focused_window(false, false));
 
-        assert!(should_capture_agent_context(false, true, true));
-        assert!(!should_capture_agent_context(true, true, true));
-        assert!(!should_capture_agent_context(false, false, true));
-        assert!(!should_capture_agent_context(false, true, false));
+        let mut config = Config::default();
+        config.llm.agent_context_enabled = true;
+        config.llm.enabled = true;
+        assert!(should_build_agent_terminology(&config));
+        config.llm.enabled = false;
+        assert!(!should_build_agent_terminology(&config));
+        config.asr.provider = AsrProvider::AlibabaQwenAudio3;
+        assert!(should_build_agent_terminology(&config));
+        config.llm.agent_context_enabled = false;
+        assert!(!should_build_agent_terminology(&config));
     }
 
     #[test]
@@ -3467,6 +3550,7 @@ mod tests {
         let observed = std::cell::Cell::new(None);
         let transcript = finalize_realtime_events(
             false,
+            false,
             Some("usable final".into()),
             |status, failure_kind| {
                 observed.set(Some((status, failure_kind)));
@@ -3489,12 +3573,15 @@ mod tests {
                 "injected task-finished telemetry persistence failure"
             ))
         });
-        let outcome =
-            finalize_realtime_events(saw_finished, Some("successful final".into()), |_, _| {
-                Err(anyhow!("injected terminal telemetry persistence failure"))
-            });
+        let outcome = finalize_realtime_events(
+            saw_finished,
+            true,
+            Some("successful final".into()),
+            |_, _| Err(anyhow!("injected terminal telemetry persistence failure")),
+        );
 
         assert!(outcome.saw_finished);
+        assert!(outcome.session_context_sent);
         assert_eq!(outcome.transcript.as_deref(), Some("successful final"));
     }
 
@@ -3524,83 +3611,88 @@ mod tests {
                         for worker_interrupted in [false, true] {
                             for overloaded in [false, true] {
                                 for saw_finished in [false, true] {
-                                    for captured_duration_ms in durations {
-                                        let actual =
-                                            decide_native_final_pass(NativeFinalPassPolicyInput {
-                                                mode,
-                                                cancelled,
-                                                has_audio,
+                                    for session_context_sent in [false, true] {
+                                        for captured_duration_ms in durations {
+                                            let actual = decide_native_final_pass(
+                                                NativeFinalPassPolicyInput {
+                                                    mode,
+                                                    cancelled,
+                                                    has_audio,
+                                                    streaming,
+                                                    worker_interrupted,
+                                                    overloaded,
+                                                    saw_finished,
+                                                    session_context_sent,
+                                                    captured_duration_ms,
+                                                },
+                                            );
+                                            let expected = if cancelled {
+                                                NativeFinalPassPolicyDecision {
+                                                    invoke: false,
+                                                    reason: FinalPassReason::Cancelled,
+                                                }
+                                            } else if !has_audio {
+                                                NativeFinalPassPolicyDecision {
+                                                    invoke: false,
+                                                    reason: FinalPassReason::NoAudio,
+                                                }
+                                            } else if mode == NativeFinalPassMode::StreamingOnly {
+                                                NativeFinalPassPolicyDecision {
+                                                    invoke: false,
+                                                    reason: FinalPassReason::StreamingOnly,
+                                                }
+                                            } else if mode == NativeFinalPassMode::Always {
+                                                NativeFinalPassPolicyDecision {
+                                                    invoke: true,
+                                                    reason: FinalPassReason::Always,
+                                                }
+                                            } else if overloaded {
+                                                NativeFinalPassPolicyDecision {
+                                                    invoke: true,
+                                                    reason: FinalPassReason::Overloaded,
+                                                }
+                                            } else if worker_interrupted {
+                                                NativeFinalPassPolicyDecision {
+                                                    invoke: true,
+                                                    reason: FinalPassReason::Interrupted,
+                                                }
+                                            } else if streaming == CandidateState::Empty {
+                                                NativeFinalPassPolicyDecision {
+                                                    invoke: true,
+                                                    reason: FinalPassReason::Empty,
+                                                }
+                                            } else if matches!(
                                                 streaming,
-                                                worker_interrupted,
-                                                overloaded,
-                                                saw_finished,
-                                                captured_duration_ms,
-                                            });
-                                        let expected = if cancelled {
-                                            NativeFinalPassPolicyDecision {
-                                                invoke: false,
-                                                reason: FinalPassReason::Cancelled,
-                                            }
-                                        } else if !has_audio {
-                                            NativeFinalPassPolicyDecision {
-                                                invoke: false,
-                                                reason: FinalPassReason::NoAudio,
-                                            }
-                                        } else if mode == NativeFinalPassMode::StreamingOnly {
-                                            NativeFinalPassPolicyDecision {
-                                                invoke: false,
-                                                reason: FinalPassReason::StreamingOnly,
-                                            }
-                                        } else if mode == NativeFinalPassMode::Always {
-                                            NativeFinalPassPolicyDecision {
-                                                invoke: true,
-                                                reason: FinalPassReason::Always,
-                                            }
-                                        } else if overloaded {
-                                            NativeFinalPassPolicyDecision {
-                                                invoke: true,
-                                                reason: FinalPassReason::Overloaded,
-                                            }
-                                        } else if worker_interrupted {
-                                            NativeFinalPassPolicyDecision {
-                                                invoke: true,
-                                                reason: FinalPassReason::Interrupted,
-                                            }
-                                        } else if streaming == CandidateState::Empty {
-                                            NativeFinalPassPolicyDecision {
-                                                invoke: true,
-                                                reason: FinalPassReason::Empty,
-                                            }
-                                        } else if matches!(
-                                            streaming,
-                                            CandidateState::Failed | CandidateState::Degraded
-                                        ) {
-                                            NativeFinalPassPolicyDecision {
-                                                invoke: true,
-                                                reason: FinalPassReason::Degraded,
-                                            }
-                                        } else if !saw_finished {
-                                            NativeFinalPassPolicyDecision {
-                                                invoke: true,
-                                                reason: FinalPassReason::MissingCompletion,
-                                            }
-                                        } else if captured_duration_ms
-                                            >= ADAPTIVE_NATIVE_DURATION_MS
-                                        {
-                                            NativeFinalPassPolicyDecision {
-                                                invoke: true,
-                                                reason: FinalPassReason::Duration,
-                                            }
-                                        } else {
-                                            NativeFinalPassPolicyDecision {
-                                                invoke: false,
-                                                reason: FinalPassReason::HealthyStream,
-                                            }
-                                        };
-                                        assert_eq!(
-                                            actual, expected,
-                                            "input: mode={mode:?}, streaming={streaming:?}, cancelled={cancelled}, has_audio={has_audio}, worker_interrupted={worker_interrupted}, overloaded={overloaded}, saw_finished={saw_finished}, duration={captured_duration_ms}"
-                                        );
+                                                CandidateState::Failed | CandidateState::Degraded
+                                            ) {
+                                                NativeFinalPassPolicyDecision {
+                                                    invoke: true,
+                                                    reason: FinalPassReason::Degraded,
+                                                }
+                                            } else if !saw_finished {
+                                                NativeFinalPassPolicyDecision {
+                                                    invoke: true,
+                                                    reason: FinalPassReason::MissingCompletion,
+                                                }
+                                            } else if captured_duration_ms
+                                                >= ADAPTIVE_NATIVE_DURATION_MS
+                                                && !session_context_sent
+                                            {
+                                                NativeFinalPassPolicyDecision {
+                                                    invoke: true,
+                                                    reason: FinalPassReason::Duration,
+                                                }
+                                            } else {
+                                                NativeFinalPassPolicyDecision {
+                                                    invoke: false,
+                                                    reason: FinalPassReason::HealthyStream,
+                                                }
+                                            };
+                                            assert_eq!(
+                                                actual, expected,
+                                                "input: mode={mode:?}, streaming={streaming:?}, cancelled={cancelled}, has_audio={has_audio}, worker_interrupted={worker_interrupted}, overloaded={overloaded}, saw_finished={saw_finished}, session_context_sent={session_context_sent}, duration={captured_duration_ms}"
+                                            );
+                                        }
                                     }
                                 }
                             }
@@ -3646,6 +3738,17 @@ mod tests {
         empty.streaming = CandidateState::Empty;
         let mut duration_boundary = healthy_full_audio_plan_input();
         duration_boundary.captured_duration_ms = ADAPTIVE_NATIVE_DURATION_MS;
+        let mut contextual_duration = duration_boundary;
+        contextual_duration.session_context_sent = true;
+        let contextual_plan = plan_full_audio_pass(&config, contextual_duration);
+        assert_eq!(contextual_plan.pass, None);
+        assert_eq!(
+            contextual_plan.audio3_decision,
+            Some(NativeFinalPassPolicyDecision {
+                invoke: false,
+                reason: FinalPassReason::HealthyStream,
+            })
+        );
 
         for (input, expected_reason) in [
             (missing_completion, FinalPassReason::MissingCompletion),
@@ -3822,6 +3925,7 @@ mod tests {
             worker_interrupted: false,
             overloaded: false,
             saw_finished: true,
+            session_context_sent: false,
             captured_duration_ms: ADAPTIVE_NATIVE_DURATION_MS - 1,
         });
         diagnostics.update_session(61, |session| {
