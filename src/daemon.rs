@@ -9,7 +9,7 @@ use std::{
     process::{Child, Command, Stdio},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         mpsc,
     },
     thread,
@@ -38,7 +38,13 @@ const PROCESSING_WAVEFORM: [f32; WAVEFORM_BAR_COUNT] = [0.22; WAVEFORM_BAR_COUNT
 const SPEECH_EVENT_GRACE_MS: u64 = 350;
 const CAPTURE_STOP_DRAIN: Duration = Duration::from_millis(120);
 const CONTROL_COMMAND_MAX_BYTES: u64 = 4 * 1024;
-const CONTROL_READ_TIMEOUT: Duration = Duration::from_secs(2);
+const CONTROL_RESPONSE_MAX_BYTES: u64 = 64 * 1024;
+const MAX_CONTROL_CONNECTIONS: usize = 32;
+const CONTROL_IO_TIMEOUT: Duration = Duration::from_secs(2);
+// A local backend may consume the configured one-hour maximum once for an
+// in-flight partial pass and once for the final pass. Keep the client wait
+// bounded without rejecting that supported configuration.
+const CONTROL_RESPONSE_TIMEOUT: Duration = Duration::from_hours(3);
 pub(crate) const ADAPTIVE_NATIVE_DURATION_MS: u64 = 30_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -405,6 +411,7 @@ pub fn run(config: Config) -> Result<()> {
     let server = Arc::new(ControlServer {
         daemon: Mutex::new(Daemon::new(config, state, waveform)?),
         idle_generation: AtomicU64::new(0),
+        active_connections: AtomicUsize::new(0),
     });
     let listener = UnixListener::bind(&socket_path)
         .with_context(|| format!("failed to bind control socket at {}", socket_path.display()))?;
@@ -417,15 +424,23 @@ pub fn run(config: Config) -> Result<()> {
     println!("Voice Input daemon listening on {}", socket_path.display());
 
     loop {
-        let (stream, _) = listener
+        let (mut stream, _) = listener
             .accept()
             .context("failed to accept control socket")?;
+        if !try_acquire_control_slot(&server.active_connections) {
+            let _ = stream.set_write_timeout(Some(CONTROL_IO_TIMEOUT));
+            let _ = stream.write_all(b"error: daemon control queue is full\n");
+            continue;
+        }
         let receipt = ControlReceipt {
             idle_generation: server.idle_generation.load(Ordering::SeqCst),
             accepted_at: Instant::now(),
         };
         let server = server.clone();
         thread::spawn(move || {
+            let _slot = ControlConnectionSlot {
+                active: &server.active_connections,
+            };
             if let Err(error) = serve_control_connection(stream, &server, receipt) {
                 eprintln!("voice-input control connection failed: {error:#}");
             }
@@ -436,6 +451,25 @@ pub fn run(config: Config) -> Result<()> {
 struct ControlServer {
     daemon: Mutex<Daemon>,
     idle_generation: AtomicU64,
+    active_connections: AtomicUsize,
+}
+
+fn try_acquire_control_slot(active: &AtomicUsize) -> bool {
+    active
+        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
+            (count < MAX_CONTROL_CONNECTIONS).then_some(count + 1)
+        })
+        .is_ok()
+}
+
+struct ControlConnectionSlot<'a> {
+    active: &'a AtomicUsize,
+}
+
+impl Drop for ControlConnectionSlot<'_> {
+    fn drop(&mut self) {
+        self.active.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -450,8 +484,11 @@ fn serve_control_connection(
     receipt: ControlReceipt,
 ) -> Result<()> {
     stream
-        .set_read_timeout(Some(CONTROL_READ_TIMEOUT))
+        .set_read_timeout(Some(CONTROL_IO_TIMEOUT))
         .context("failed to set control socket read timeout")?;
+    stream
+        .set_write_timeout(Some(CONTROL_IO_TIMEOUT))
+        .context("failed to set control socket write timeout")?;
     let command = read_control_command(&mut stream)?;
     let response = match handle_control(server, receipt, command.trim()) {
         Ok(response) => response,
@@ -462,33 +499,51 @@ fn serve_control_connection(
         .context("failed to write control response")
 }
 
-fn read_control_command(reader: &mut impl Read) -> Result<String> {
+fn read_bounded_utf8(
+    reader: &mut impl Read,
+    maximum_bytes: u64,
+    description: &str,
+) -> Result<String> {
     let mut bytes = Vec::new();
     reader
-        .take(CONTROL_COMMAND_MAX_BYTES + 1)
+        .take(maximum_bytes + 1)
         .read_to_end(&mut bytes)
-        .context("failed to read control command")?;
-    if bytes.len() as u64 > CONTROL_COMMAND_MAX_BYTES {
-        bail!("control command exceeds {CONTROL_COMMAND_MAX_BYTES} bytes");
+        .with_context(|| format!("failed to read {description}"))?;
+    if bytes.len() as u64 > maximum_bytes {
+        bail!("{description} exceeds {maximum_bytes} bytes");
     }
-    String::from_utf8(bytes).context("control command is not valid UTF-8")
+    String::from_utf8(bytes).with_context(|| format!("{description} is not valid UTF-8"))
+}
+
+fn read_control_command(reader: &mut impl Read) -> Result<String> {
+    read_bounded_utf8(reader, CONTROL_COMMAND_MAX_BYTES, "control command")
+}
+
+fn read_control_response(reader: &mut impl Read) -> Result<String> {
+    read_bounded_utf8(reader, CONTROL_RESPONSE_MAX_BYTES, "control response")
 }
 
 pub fn send_control_command(command: &str) -> Result<String> {
+    if command.len() as u64 > CONTROL_COMMAND_MAX_BYTES {
+        bail!("control command exceeds {CONTROL_COMMAND_MAX_BYTES} bytes");
+    }
+
     let socket_path = paths::control_socket_path()?;
     let mut stream = UnixStream::connect(&socket_path)
         .with_context(|| format!("failed to connect to daemon at {}", socket_path.display()))?;
+    stream
+        .set_write_timeout(Some(CONTROL_IO_TIMEOUT))
+        .context("failed to set control socket write timeout")?;
+    stream
+        .set_read_timeout(Some(CONTROL_RESPONSE_TIMEOUT))
+        .context("failed to set control socket response timeout")?;
     stream
         .write_all(command.as_bytes())
         .context("failed to send command to daemon")?;
     stream
         .shutdown(std::net::Shutdown::Write)
         .context("failed to close control socket for writing")?;
-    let mut response = String::new();
-    stream
-        .read_to_string(&mut response)
-        .context("failed to read daemon response")?;
-    Ok(response)
+    read_control_response(&mut stream)
 }
 
 fn handle_control(
@@ -2096,6 +2151,35 @@ fn spawn_pw_record(config: &Config) -> Result<(Child, std::process::ChildStdout)
     Ok((child, stdout))
 }
 
+#[derive(Debug, Default)]
+struct Pcm16LeDecoder {
+    carry: Option<u8>,
+}
+
+impl Pcm16LeDecoder {
+    fn decode_into(&mut self, bytes: &[u8], samples: &mut Vec<i16>) {
+        samples.clear();
+        let mut bytes = bytes;
+
+        if let Some(low) = self.carry.take() {
+            let Some((&high, remaining)) = bytes.split_first() else {
+                self.carry = Some(low);
+                return;
+            };
+            samples.push(i16::from_le_bytes([low, high]));
+            bytes = remaining;
+        }
+
+        let mut pairs = bytes.chunks_exact(2);
+        samples.extend(
+            pairs
+                .by_ref()
+                .map(|pair| i16::from_le_bytes([pair[0], pair[1]])),
+        );
+        self.carry = pairs.remainder().first().copied();
+    }
+}
+
 fn run_capture_service(
     config: Config,
     state: StateHandle,
@@ -2106,6 +2190,9 @@ fn run_capture_service(
     let max_ring_samples = pre_roll_samples(&config).max(capture_warmup_samples(&config).max(1));
     let (mut child, mut stdout) = spawn_pw_record(&config)?;
     let mut bytes = [0u8; 512];
+    let mut decoder = Pcm16LeDecoder::default();
+    let mut chunk = Vec::with_capacity(bytes.len() / 2 + 1);
+    let mut frames = Vec::new();
 
     loop {
         let read = stdout
@@ -2115,9 +2202,9 @@ fn run_capture_service(
             break;
         }
 
-        let mut chunk = Vec::with_capacity(read / 2);
-        for pair in bytes[..read].chunks_exact(2) {
-            chunk.push(i16::from_le_bytes([pair[0], pair[1]]));
+        decoder.decode_into(&bytes[..read], &mut chunk);
+        if chunk.is_empty() {
+            continue;
         }
 
         {
@@ -2166,7 +2253,7 @@ fn run_capture_service(
                 );
                 continue;
             }
-            let chunk = &chunk[..accepted_samples];
+            let accepted_chunk = &chunk[..accepted_samples];
 
             if capture_hot.load(Ordering::SeqCst)
                 && !active.capture_ready.swap(true, Ordering::SeqCst)
@@ -2180,14 +2267,14 @@ fn run_capture_service(
                 )?;
             }
 
-            let frames = active
+            active
                 .waveform_analyzer
                 .lock()
                 .expect("waveform analyzer mutex poisoned")
                 // HUD analysis is local and must remain responsive even when
                 // realtime network delivery falls behind.
-                .push(chunk, true);
-            for frame in frames {
+                .push_into(accepted_chunk, true, &mut frames);
+            for frame in frames.iter().copied() {
                 active.waveform.try_publish(active.session_id, frame);
             }
 
@@ -2205,7 +2292,7 @@ fn run_capture_service(
                     if active.stop_flag.load(Ordering::SeqCst) {
                         Vec::new()
                     } else {
-                        packetizer.push(chunk)
+                        packetizer.push(accepted_chunk)
                     }
                 };
                 for packet in packets {
@@ -2223,7 +2310,7 @@ fn run_capture_service(
                 }
             }
 
-            if accepted_samples < bytes.len() / 2 || total_samples >= max_samples {
+            if accepted_samples < chunk.len() || total_samples >= max_samples {
                 active.stop_flag.store(true, Ordering::SeqCst);
                 request_automatic_finish(
                     &active.automatic_finish_requested,
@@ -2375,6 +2462,9 @@ fn spawn_reader_thread(
         } = context;
         let max_samples = max_recording_samples(&config);
         let mut bytes = [0u8; 512];
+        let mut decoder = Pcm16LeDecoder::default();
+        let mut chunk = Vec::with_capacity(bytes.len() / 2 + 1);
+        let mut frames = Vec::new();
 
         loop {
             if stop_flag.load(Ordering::SeqCst) || cancel_flag.load(Ordering::SeqCst) {
@@ -2402,9 +2492,9 @@ fn spawn_reader_thread(
                 }
             };
 
-            let mut chunk = Vec::with_capacity(read / 2);
-            for pair in bytes[..read].chunks_exact(2) {
-                chunk.push(i16::from_le_bytes([pair[0], pair[1]]));
+            decoder.decode_into(&bytes[..read], &mut chunk);
+            if chunk.is_empty() {
+                continue;
             }
 
             let (accepted_samples, total_samples) = {
@@ -2420,7 +2510,7 @@ fn spawn_reader_thread(
                 );
                 break;
             }
-            let chunk = &chunk[..accepted_samples];
+            let accepted_chunk = &chunk[..accepted_samples];
 
             if total_samples >= capture_warmup_samples(&config)
                 && !capture_ready.swap(true, Ordering::SeqCst)
@@ -2434,13 +2524,13 @@ fn spawn_reader_thread(
                 )?;
             }
 
-            let frames = waveform_analyzer
+            waveform_analyzer
                 .lock()
                 .expect("waveform analyzer mutex poisoned")
                 // Keep local capture and visualization independent of realtime
                 // network backpressure.
-                .push(chunk, true);
-            for frame in frames {
+                .push_into(accepted_chunk, true, &mut frames);
+            for frame in frames.iter().copied() {
                 waveform.try_publish(session_id, frame);
             }
 
@@ -2451,7 +2541,7 @@ fn spawn_reader_thread(
                 let packets = packetizer
                     .lock()
                     .expect("ASR packetizer mutex poisoned")
-                    .push(chunk);
+                    .push(accepted_chunk);
                 for packet in packets {
                     let result = try_enqueue_realtime_audio(tx, packet);
                     if result != RealtimeAudioEnqueue::Sent {
@@ -2467,7 +2557,7 @@ fn spawn_reader_thread(
                 }
             }
 
-            if accepted_samples < bytes.len() / 2 || total_samples >= max_samples {
+            if accepted_samples < chunk.len() || total_samples >= max_samples {
                 stop_flag.store(true, Ordering::SeqCst);
                 request_automatic_finish(
                     &automatic_finish_requested,
@@ -3275,11 +3365,79 @@ mod tests {
         let mut valid = Cursor::new(b"toggle".to_vec());
         assert_eq!(read_control_command(&mut valid).unwrap(), "toggle");
 
-        let mut oversized = Cursor::new(vec![b'x'; CONTROL_COMMAND_MAX_BYTES as usize + 1]);
+        let command_limit = usize::try_from(CONTROL_COMMAND_MAX_BYTES).unwrap();
+        let mut oversized = Cursor::new(vec![b'x'; command_limit + 1]);
         assert!(read_control_command(&mut oversized).is_err());
 
         let mut invalid_utf8 = Cursor::new(vec![0xff]);
         assert!(read_control_command(&mut invalid_utf8).is_err());
+
+        let mut valid_response = Cursor::new(b"ok\n".to_vec());
+        assert_eq!(read_control_response(&mut valid_response).unwrap(), "ok\n");
+
+        let response_limit = usize::try_from(CONTROL_RESPONSE_MAX_BYTES).unwrap();
+        let mut oversized_response = Cursor::new(vec![b'x'; response_limit + 1]);
+        assert!(read_control_response(&mut oversized_response).is_err());
+    }
+
+    #[test]
+    fn control_connection_slots_apply_bounded_backpressure() {
+        let active = AtomicUsize::new(0);
+        let mut slots = Vec::new();
+        for _ in 0..MAX_CONTROL_CONNECTIONS {
+            assert!(try_acquire_control_slot(&active));
+            slots.push(ControlConnectionSlot { active: &active });
+        }
+        assert!(!try_acquire_control_slot(&active));
+
+        slots.pop();
+        assert!(try_acquire_control_slot(&active));
+        slots.push(ControlConnectionSlot { active: &active });
+        assert_eq!(active.load(Ordering::SeqCst), MAX_CONTROL_CONNECTIONS);
+    }
+
+    #[test]
+    fn pcm16le_decoder_preserves_samples_across_odd_and_even_fragments() {
+        let expected = [i16::MIN, -12_345, -1, 0, 1, 12_345, i16::MAX];
+        let bytes = expected
+            .iter()
+            .flat_map(|sample| sample.to_le_bytes())
+            .collect::<Vec<_>>();
+
+        for fragment_size in 1..=bytes.len() {
+            let mut decoder = Pcm16LeDecoder::default();
+            let mut chunk = vec![999];
+            let mut actual = Vec::new();
+            for fragment in bytes.chunks(fragment_size) {
+                decoder.decode_into(fragment, &mut chunk);
+                actual.extend_from_slice(&chunk);
+            }
+
+            assert_eq!(actual, expected, "fragment size {fragment_size}");
+            assert_eq!(decoder.carry, None, "fragment size {fragment_size}");
+        }
+    }
+
+    #[test]
+    fn pcm16le_decoder_holds_a_trailing_byte_until_the_next_input() {
+        let mut decoder = Pcm16LeDecoder::default();
+        let mut chunk = vec![999];
+
+        decoder.decode_into(&[0x34], &mut chunk);
+        assert!(chunk.is_empty());
+        assert_eq!(decoder.carry, Some(0x34));
+
+        decoder.decode_into(&[], &mut chunk);
+        assert!(chunk.is_empty());
+        assert_eq!(decoder.carry, Some(0x34));
+
+        decoder.decode_into(&[0x12, 0x78], &mut chunk);
+        assert_eq!(chunk, [0x1234]);
+        assert_eq!(decoder.carry, Some(0x78));
+
+        decoder.decode_into(&[0x56], &mut chunk);
+        assert_eq!(chunk, [0x5678]);
+        assert_eq!(decoder.carry, None);
     }
 
     #[test]

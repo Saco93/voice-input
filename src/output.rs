@@ -1,12 +1,15 @@
 use std::sync::OnceLock;
 use std::{
     collections::HashMap,
-    env, fs,
-    io::{Read, Write},
+    env,
+    ffi::OsStr,
+    fs,
+    io::{self, Read, Write},
     net::Shutdown,
-    os::unix::net::UnixStream,
-    path::PathBuf,
+    os::unix::{fs::PermissionsExt, net::UnixStream, process::CommandExt},
+    path::{Path, PathBuf},
     process::{Child, Command, Output, Stdio},
+    sync::mpsc,
     thread,
     time::{Duration, Instant},
 };
@@ -25,6 +28,10 @@ const X11_CLIPBOARD_TIMEOUT_MS: u64 = 1_500;
 const SESSION_ENV_TIMEOUT_MS: u64 = 800;
 const OUTPUT_TARGET_RETRIES: usize = 6;
 const OUTPUT_TARGET_RETRY_DELAY_MS: u64 = 50;
+const HYPRLAND_RESPONSE_LIMIT_BYTES: usize = 64 * 1024;
+const CHILD_STDOUT_LIMIT_BYTES: usize = 16 * 1024 * 1024;
+const CHILD_STDERR_LIMIT_BYTES: usize = 16 * 1024 * 1024;
+const CHILD_POLL_INTERVAL: Duration = Duration::from_millis(5);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutputTargetHint {
@@ -170,10 +177,7 @@ fn copy_to_wayland_clipboard(text: &str) -> Result<()> {
     if output.status.success() {
         Ok(())
     } else {
-        bail!(
-            "wl-copy failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        )
+        bail!("wl-copy failed")
     }
 }
 
@@ -221,7 +225,7 @@ fn press_key_chord(chord: &str, target: &OutputTarget) -> Result<()> {
         .args(["dispatch", "sendshortcut"])
         .arg(shortcut)
         .stdout(Stdio::null())
-        .stderr(Stdio::piped());
+        .stderr(Stdio::null());
     let output = spawn_and_wait(
         &mut command,
         KEY_SIMULATION_TIMEOUT_MS,
@@ -230,10 +234,7 @@ fn press_key_chord(chord: &str, target: &OutputTarget) -> Result<()> {
     if output.status.success() {
         Ok(())
     } else {
-        bail!(
-            "failed to dispatch Wayland paste chord: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        )
+        bail!("failed to dispatch Wayland paste chord")
     }
 }
 
@@ -272,7 +273,7 @@ fn press_key_chord_via_xdotool(chord: &str) -> Result<()> {
         .arg("--clearmodifiers")
         .arg(chord)
         .stdout(Stdio::null())
-        .stderr(Stdio::piped());
+        .stderr(Stdio::null());
     let output = spawn_and_wait(
         &mut command,
         KEY_SIMULATION_TIMEOUT_MS,
@@ -281,10 +282,7 @@ fn press_key_chord_via_xdotool(chord: &str) -> Result<()> {
     if output.status.success() {
         Ok(())
     } else {
-        bail!(
-            "failed to dispatch XWayland paste chord: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        )
+        bail!("failed to dispatch XWayland paste chord")
     }
 }
 
@@ -329,17 +327,26 @@ fn query_active_window_via_socket() -> Result<ActiveWindow> {
         .context("failed to query Hyprland active window over IPC")?;
     stream.shutdown(Shutdown::Write).ok();
 
-    let mut response = String::new();
-    stream
-        .read_to_string(&mut response)
-        .context("failed to read Hyprland active window response")?;
+    let response = match read_bounded(&mut stream, HYPRLAND_RESPONSE_LIMIT_BYTES) {
+        Ok(response) => response,
+        Err(StreamReadError::Io(error)) => {
+            return Err(error).context("failed to read Hyprland active window response");
+        }
+        Err(StreamReadError::LimitExceeded) => {
+            bail!("Hyprland active window response exceeded its size limit");
+        }
+    };
 
-    serde_json::from_str(&response).context("failed to parse Hyprland active window IPC JSON")
+    serde_json::from_slice(&response).context("failed to parse Hyprland active window IPC JSON")
 }
 
 fn query_active_window_via_hyprctl() -> Result<ActiveWindow> {
     let mut command = hyprctl_command();
-    command.arg("activewindow").arg("-j");
+    command
+        .arg("activewindow")
+        .arg("-j")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
     let output = spawn_and_wait(
         &mut command,
         ACTIVE_WINDOW_TIMEOUT_MS,
@@ -347,10 +354,7 @@ fn query_active_window_via_hyprctl() -> Result<ActiveWindow> {
     )?;
 
     if !output.status.success() {
-        bail!(
-            "hyprctl activewindow failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
+        bail!("hyprctl activewindow failed");
     }
 
     serde_json::from_slice(&output.stdout).context("failed to parse Hyprland active window JSON")
@@ -430,7 +434,7 @@ fn capture_x11_clipboard(target: &OutputTarget) -> Result<Option<Vec<u8>>> {
         .arg("clipboard")
         .arg("-out")
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .stderr(Stdio::null());
     let output = spawn_and_wait(
         &mut command,
         X11_CLIPBOARD_TIMEOUT_MS,
@@ -469,10 +473,7 @@ fn copy_to_x11_clipboard(text: &[u8]) -> Result<()> {
     if output.status.success() {
         Ok(())
     } else {
-        bail!(
-            "xclip failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        )
+        bail!("xclip failed")
     }
 }
 
@@ -481,13 +482,22 @@ fn restore_x11_clipboard(text: &[u8]) -> Result<()> {
 }
 
 fn command_available(binary: &str) -> bool {
-    let mut command = Command::new("sh");
-    command
-        .arg("-c")
-        .arg(format!("command -v {binary} >/dev/null 2>&1"));
-    command
-        .status()
-        .map(|status| status.success())
+    command_available_in_path(binary, env::var_os("PATH").as_deref())
+}
+
+fn command_available_in_path(binary: &str, search_path: Option<&OsStr>) -> bool {
+    if binary.contains('/') {
+        return is_executable_file(Path::new(binary));
+    }
+
+    search_path.is_some_and(|search_path| {
+        env::split_paths(search_path).any(|directory| is_executable_file(&directory.join(binary)))
+    })
+}
+
+fn is_executable_file(path: &Path) -> bool {
+    path.metadata()
+        .map(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
         .unwrap_or(false)
 }
 
@@ -550,7 +560,11 @@ fn session_environment() -> &'static HashMap<String, String> {
 
 fn load_session_environment() -> HashMap<String, String> {
     let mut command = Command::new("systemctl");
-    command.arg("--user").arg("show-environment");
+    command
+        .arg("--user")
+        .arg("show-environment")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
     let output = match spawn_and_wait(
         &mut command,
         SESSION_ENV_TIMEOUT_MS,
@@ -634,7 +648,10 @@ impl ClipboardBackup {
         }
 
         let mut list_types = Command::new("wl-paste");
-        list_types.arg("--list-types");
+        list_types
+            .arg("--list-types")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
         let type_output = match spawn_and_wait(
             &mut list_types,
             CLIPBOARD_QUERY_TIMEOUT_MS,
@@ -670,7 +687,11 @@ impl ClipboardBackup {
         };
 
         let mut paste = Command::new("wl-paste");
-        paste.arg("--type").arg(&mime_type);
+        paste
+            .arg("--type")
+            .arg(&mime_type)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
         let output = match spawn_and_wait(
             &mut paste,
             CLIPBOARD_QUERY_TIMEOUT_MS,
@@ -731,10 +752,7 @@ impl ClipboardBackup {
         if output.status.success() {
             Ok(())
         } else {
-            bail!(
-                "failed to restore clipboard contents: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            )
+            bail!("failed to restore clipboard contents")
         }
     }
 }
@@ -752,6 +770,7 @@ impl ImeGuard {
         }
 
         let mut command = Command::new("fcitx5-remote");
+        command.stdout(Stdio::piped()).stderr(Stdio::null());
         let output = match spawn_and_wait(
             &mut command,
             INPUT_METHOD_TIMEOUT_MS,
@@ -800,10 +819,16 @@ impl ImeGuard {
 }
 
 fn spawn_and_wait(command: &mut Command, timeout_ms: u64, label: &str) -> Result<Output> {
+    let timeout_ms = timeout_ms.max(1);
+    let started_at = Instant::now();
+    let deadline = started_at
+        .checked_add(Duration::from_millis(timeout_ms))
+        .unwrap_or(started_at);
+    command.process_group(0);
     let child = command
         .spawn()
         .with_context(|| format!("failed to launch {label}"))?;
-    wait_with_output_timeout(child, timeout_ms, label)
+    wait_with_output_timeout(child, None, deadline, timeout_ms, label)
 }
 
 fn spawn_with_input_and_wait(
@@ -812,55 +837,404 @@ fn spawn_with_input_and_wait(
     timeout_ms: u64,
     label: &str,
 ) -> Result<Output> {
-    let mut child = command
+    let timeout_ms = timeout_ms.max(1);
+    let started_at = Instant::now();
+    let deadline = started_at
+        .checked_add(Duration::from_millis(timeout_ms))
+        .unwrap_or(started_at);
+    command.process_group(0);
+    let child = command
         .spawn()
         .with_context(|| format!("failed to launch {label}"))?;
-    if let Some(stdin) = child.stdin.as_mut() {
-        stdin
-            .write_all(input)
-            .with_context(|| format!("failed to write stdin for {label}"))?;
-    }
-    drop(child.stdin.take());
-    wait_with_output_timeout(child, timeout_ms, label)
+    wait_with_output_timeout(child, Some(input.to_vec()), deadline, timeout_ms, label)
 }
 
-fn wait_with_output_timeout(mut child: Child, timeout_ms: u64, label: &str) -> Result<Output> {
-    let deadline = Instant::now() + Duration::from_millis(timeout_ms.max(1));
+#[derive(Debug)]
+enum StreamReadError {
+    Io(io::Error),
+    LimitExceeded,
+}
+
+enum ProcessIoMessage {
+    Stdin(io::Result<()>),
+    Stdout(std::result::Result<Vec<u8>, StreamReadError>),
+    Stderr(std::result::Result<Vec<u8>, StreamReadError>),
+}
+
+fn wait_with_output_timeout(
+    mut child: Child,
+    input: Option<Vec<u8>>,
+    deadline: Instant,
+    timeout_ms: u64,
+    label: &str,
+) -> Result<Output> {
+    let (sender, receiver) = mpsc::channel();
+    let mut workers = Vec::new();
+
+    match (input, child.stdin.take()) {
+        (Some(input), Some(mut stdin)) => {
+            let sender = sender.clone();
+            workers.push(thread::spawn(move || {
+                let result = stdin.write_all(&input);
+                drop(stdin);
+                let _ = sender.send(ProcessIoMessage::Stdin(result));
+            }));
+        }
+        (Some(_), None) => {
+            terminate_process_group(&mut child);
+            bail!("stdin for {label} is not piped");
+        }
+        (None, stdin) => drop(stdin),
+    }
+
+    if let Some(stdout) = child.stdout.take() {
+        let sender = sender.clone();
+        workers.push(thread::spawn(move || {
+            let result = read_bounded(stdout, CHILD_STDOUT_LIMIT_BYTES);
+            let _ = sender.send(ProcessIoMessage::Stdout(result));
+        }));
+    }
+
+    if let Some(stderr) = child.stderr.take() {
+        let sender = sender.clone();
+        workers.push(thread::spawn(move || {
+            let result = read_bounded(stderr, CHILD_STDERR_LIMIT_BYTES);
+            let _ = sender.send(ProcessIoMessage::Stderr(result));
+        }));
+    }
+    drop(sender);
+
+    let mut pending_workers = workers.len();
+    let mut status = None;
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
 
     loop {
-        if let Some(_status) = child
-            .try_wait()
-            .with_context(|| format!("failed to poll {label}"))?
-        {
-            return child
-                .wait_with_output()
-                .with_context(|| format!("failed waiting for {label}"));
+        loop {
+            match receiver.try_recv() {
+                Ok(message) => {
+                    pending_workers -= 1;
+                    if let Err(error) = record_process_io(message, label, &mut stdout, &mut stderr)
+                    {
+                        terminate_process_group(&mut child);
+                        join_workers(workers);
+                        return Err(error);
+                    }
+                }
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    if pending_workers != 0 {
+                        terminate_process_group(&mut child);
+                        join_workers(workers);
+                        bail!("I/O worker failed for {label}");
+                    }
+                    break;
+                }
+            }
+        }
+
+        if status.is_none() {
+            match child.try_wait() {
+                Ok(polled_status) => status = polled_status,
+                Err(error) => {
+                    terminate_process_group(&mut child);
+                    join_workers(workers);
+                    return Err(error).with_context(|| format!("failed to poll {label}"));
+                }
+            }
+        }
+
+        if let Some(status) = status.filter(|_| pending_workers == 0) {
+            if workers.into_iter().any(|worker| worker.join().is_err()) {
+                bail!("I/O worker failed for {label}");
+            }
+            return Ok(Output {
+                status,
+                stdout,
+                stderr,
+            });
         }
 
         if Instant::now() >= deadline {
-            child.kill().ok();
-            let _ = child.wait();
-            bail!("{label} timed out after {} ms", timeout_ms.max(1));
+            terminate_process_group(&mut child);
+            join_workers(workers);
+            bail!("{label} timed out after {timeout_ms} ms");
         }
 
-        thread::sleep(Duration::from_millis(25));
+        thread::sleep(
+            deadline
+                .saturating_duration_since(Instant::now())
+                .min(CHILD_POLL_INTERVAL),
+        );
+    }
+}
+
+fn read_bounded<R: Read>(
+    mut reader: R,
+    limit: usize,
+) -> std::result::Result<Vec<u8>, StreamReadError> {
+    let mut output = Vec::new();
+    let mut buffer = [0_u8; 8 * 1024];
+
+    loop {
+        let count = reader.read(&mut buffer).map_err(StreamReadError::Io)?;
+        if count == 0 {
+            return Ok(output);
+        }
+        if count > limit - output.len() {
+            return Err(StreamReadError::LimitExceeded);
+        }
+        output.extend_from_slice(&buffer[..count]);
+    }
+}
+
+fn record_process_io(
+    message: ProcessIoMessage,
+    label: &str,
+    stdout: &mut Vec<u8>,
+    stderr: &mut Vec<u8>,
+) -> Result<()> {
+    match message {
+        ProcessIoMessage::Stdin(Ok(())) => Ok(()),
+        ProcessIoMessage::Stdin(Err(error)) => {
+            Err(error).with_context(|| format!("failed to write stdin for {label}"))
+        }
+        ProcessIoMessage::Stdout(Ok(data)) => {
+            *stdout = data;
+            Ok(())
+        }
+        ProcessIoMessage::Stdout(Err(StreamReadError::Io(error))) => {
+            Err(error).with_context(|| format!("failed to read stdout for {label}"))
+        }
+        ProcessIoMessage::Stdout(Err(StreamReadError::LimitExceeded)) => {
+            bail!("{label} stdout exceeded {CHILD_STDOUT_LIMIT_BYTES}-byte limit")
+        }
+        ProcessIoMessage::Stderr(Ok(data)) => {
+            *stderr = data;
+            Ok(())
+        }
+        ProcessIoMessage::Stderr(Err(StreamReadError::Io(error))) => {
+            Err(error).with_context(|| format!("failed to read stderr for {label}"))
+        }
+        ProcessIoMessage::Stderr(Err(StreamReadError::LimitExceeded)) => {
+            bail!("{label} stderr exceeded {CHILD_STDERR_LIMIT_BYTES}-byte limit")
+        }
+    }
+}
+
+fn terminate_process_group(child: &mut Child) {
+    if let Ok(process_group) = i32::try_from(child.id()) {
+        // SAFETY: spawn_and_wait and spawn_with_input_and_wait place the child in a
+        // process group whose ID is the child's PID. A negative PID therefore targets
+        // only that child process group.
+        unsafe {
+            libc::kill(-process_group, libc::SIGKILL);
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+fn join_workers(workers: Vec<thread::JoinHandle<()>>) {
+    for worker in workers {
+        let _ = worker.join();
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use std::process::Command;
+    use std::{
+        env, fs,
+        io::Write,
+        os::unix::fs::PermissionsExt,
+        process::{Command, Stdio},
+        thread,
+        time::{Duration, Instant},
+    };
 
     use super::{
-        ActiveWindow, OutputTarget, hyprland_shortcut, select_clipboard_payload_mime,
-        wayland_payload_copy_command, wayland_restore_copy_command,
+        ActiveWindow, CHILD_STDERR_LIMIT_BYTES, CHILD_STDOUT_LIMIT_BYTES, OutputTarget,
+        command_available_in_path, hyprland_shortcut, select_clipboard_payload_mime,
+        spawn_and_wait, spawn_with_input_and_wait, wayland_payload_copy_command,
+        wayland_restore_copy_command,
     };
+
+    const PROCESS_TEST_MODE: &str = "VOICE_INPUT_OUTPUT_PROCESS_TEST_MODE";
 
     fn command_args(command: &Command) -> Vec<String> {
         command
             .get_args()
             .map(|argument| argument.to_string_lossy().into_owned())
             .collect()
+    }
+
+    fn process_test_command(mode: &str) -> Command {
+        let mut command = Command::new(env::current_exe().expect("test executable should exist"));
+        command
+            .arg("--exact")
+            .arg("output::tests::process_test_child")
+            .arg("--nocapture")
+            .env(PROCESS_TEST_MODE, mode);
+        command
+    }
+
+    fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+        haystack
+            .windows(needle.len())
+            .any(|window| window == needle)
+    }
+
+    #[test]
+    fn process_test_child() {
+        let Ok(mode) = env::var(PROCESS_TEST_MODE) else {
+            return;
+        };
+
+        match mode.as_str() {
+            "no-stdin-read" => thread::sleep(Duration::from_secs(5)),
+            "large-both" => {
+                let stdout = thread::spawn(|| {
+                    std::io::stdout()
+                        .write_all(&vec![b'o'; 2 * 1024 * 1024])
+                        .expect("stdout write should succeed");
+                });
+                let stderr = thread::spawn(|| {
+                    std::io::stderr()
+                        .write_all(&vec![b'e'; 2 * 1024 * 1024])
+                        .expect("stderr write should succeed");
+                });
+                stdout.join().expect("stdout writer should finish");
+                stderr.join().expect("stderr writer should finish");
+            }
+            "stdout-over-limit" => {
+                std::io::stdout()
+                    .write_all(b"secret-child-stdout\n")
+                    .expect("stdout prefix write should succeed");
+                std::io::stdout()
+                    .write_all(&vec![b'o'; CHILD_STDOUT_LIMIT_BYTES + 1])
+                    .expect("stdout bulk write should succeed");
+            }
+            "stderr-over-limit" => {
+                std::io::stderr()
+                    .write_all(b"secret-child-stderr\n")
+                    .expect("stderr prefix write should succeed");
+                std::io::stderr()
+                    .write_all(&vec![b'e'; CHILD_STDERR_LIMIT_BYTES + 1])
+                    .expect("stderr bulk write should succeed");
+            }
+            "normal" => {
+                std::io::stdout()
+                    .write_all(b"normal-stdout")
+                    .expect("stdout write should succeed");
+                std::io::stderr()
+                    .write_all(b"normal-stderr")
+                    .expect("stderr write should succeed");
+            }
+            _ => panic!("unknown process test mode"),
+        }
+    }
+
+    #[test]
+    fn command_lookup_rejects_non_executable_file() {
+        let directory = tempfile::tempdir().expect("temporary directory should be created");
+        let binary = directory.path().join("tool");
+        fs::write(&binary, b"not executable").expect("test file should be written");
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o644))
+            .expect("test permissions should be set");
+
+        assert!(!command_available_in_path(
+            "tool",
+            Some(directory.path().as_os_str())
+        ));
+    }
+
+    #[test]
+    fn command_lookup_accepts_executable_file_and_direct_path() {
+        let directory = tempfile::tempdir().expect("temporary directory should be created");
+        let binary = directory.path().join("tool");
+        fs::write(&binary, b"executable").expect("test file should be written");
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o755))
+            .expect("test permissions should be set");
+
+        assert!(command_available_in_path(
+            "tool",
+            Some(directory.path().as_os_str())
+        ));
+        assert!(command_available_in_path(
+            binary.to_str().expect("test path should be UTF-8"),
+            None
+        ));
+    }
+
+    #[test]
+    fn command_lookup_rejects_missing_file() {
+        let directory = tempfile::tempdir().expect("temporary directory should be created");
+        assert!(!command_available_in_path(
+            "missing",
+            Some(directory.path().as_os_str())
+        ));
+    }
+
+    #[test]
+    fn stdin_write_obeys_process_deadline() {
+        let mut command = process_test_command("no-stdin-read");
+        command
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let input = vec![b's'; 1024 * 1024];
+        let started_at = Instant::now();
+
+        let error = spawn_with_input_and_wait(&mut command, &input, 100, "stdin timeout test")
+            .expect_err("blocked stdin should time out");
+
+        assert!(error.to_string().contains("timed out after 100 ms"));
+        assert!(!error.to_string().contains("secret"));
+        assert!(started_at.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn simultaneous_large_stdout_and_stderr_do_not_deadlock() {
+        let mut command = process_test_command("large-both");
+        command.stdout(Stdio::piped()).stderr(Stdio::piped());
+
+        let output = spawn_and_wait(&mut command, 1_500, "large output test")
+            .expect("large output should complete");
+
+        assert!(output.status.success());
+        assert!(output.stdout.len() >= 2 * 1024 * 1024);
+        assert!(output.stderr.len() >= 2 * 1024 * 1024);
+    }
+
+    #[test]
+    fn stdout_and_stderr_limits_return_value_free_errors() {
+        for (mode, stream, secret) in [
+            ("stdout-over-limit", "stdout", "secret-child-stdout"),
+            ("stderr-over-limit", "stderr", "secret-child-stderr"),
+        ] {
+            let mut command = process_test_command(mode);
+            command.stdout(Stdio::piped()).stderr(Stdio::piped());
+
+            let error = spawn_and_wait(&mut command, 1_500, "output limit test")
+                .expect_err("oversized output should fail");
+            let message = error.to_string();
+
+            assert!(message.contains(&format!("{stream} exceeded 16777216-byte limit")));
+            assert!(!message.contains(secret));
+        }
+    }
+
+    #[test]
+    fn process_output_and_status_are_preserved() {
+        let mut command = process_test_command("normal");
+        command.stdout(Stdio::piped()).stderr(Stdio::piped());
+
+        let output = spawn_and_wait(&mut command, 1_000, "normal output test")
+            .expect("normal process should complete");
+
+        assert!(output.status.success());
+        assert!(contains_bytes(&output.stdout, b"normal-stdout"));
+        assert!(contains_bytes(&output.stderr, b"normal-stderr"));
     }
 
     #[test]

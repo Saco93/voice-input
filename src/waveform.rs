@@ -128,8 +128,20 @@ impl WaveformAnalyzer {
         }
     }
 
-    pub fn push(&mut self, samples: &[i16], voice_active: bool) -> Vec<WaveformFrame> {
+    #[cfg(test)]
+    fn push(&mut self, samples: &[i16], voice_active: bool) -> Vec<WaveformFrame> {
         let mut frames = Vec::new();
+        self.push_into(samples, voice_active, &mut frames);
+        frames
+    }
+
+    pub fn push_into(
+        &mut self,
+        samples: &[i16],
+        voice_active: bool,
+        frames: &mut Vec<WaveformFrame>,
+    ) {
+        frames.clear();
         for sample in samples {
             if self.window.len() == ANALYSIS_WINDOW_SAMPLES {
                 self.window.pop_front();
@@ -141,7 +153,7 @@ impl WaveformAnalyzer {
                 && self.samples_since_frame >= ANALYSIS_HOP_SAMPLES
             {
                 self.samples_since_frame = 0;
-                let window = self.window.iter().copied().collect::<Vec<_>>();
+                let window = self.window.make_contiguous();
                 let frame_seconds = ANALYSIS_HOP_SAMPLES as f32 / self.sample_rate as f32;
                 let half_count = self.half_levels.len();
                 for (index, level) in self.half_levels.iter_mut().enumerate() {
@@ -177,7 +189,7 @@ impl WaveformAnalyzer {
                 );
 
                 let analyzed = voice_active && window_rms > ANALYSIS_MIN_RMS;
-                if analyzed && let Some(frequency) = estimate_pitch(&window, self.sample_rate) {
+                if analyzed && let Some(frequency) = estimate_pitch(window, self.sample_rate) {
                     let pitch_target = (frequency / PITCH_MIN_FREQUENCY).ln()
                         / (PITCH_MAX_FREQUENCY / PITCH_MIN_FREQUENCY).ln();
                     smooth(
@@ -192,7 +204,7 @@ impl WaveformAnalyzer {
                 // breathing rate does not jump on fricatives and pauses.
 
                 let timbre_target = if analyzed {
-                    let ratio = high_band_ratio(&window, self.sample_rate);
+                    let ratio = high_band_ratio(window, self.sample_rate);
                     ((ratio - TIMBRE_MIN_RATIO) / (TIMBRE_MAX_RATIO - TIMBRE_MIN_RATIO))
                         .clamp(0.0, 1.0)
                 } else {
@@ -207,7 +219,7 @@ impl WaveformAnalyzer {
                 );
 
                 let spectrum_target = if analyzed {
-                    spectrum_profile(&window, self.sample_rate)
+                    spectrum_profile(window, self.sample_rate)
                 } else {
                     [0.0; SPECTRUM_BAND_COUNT]
                 };
@@ -288,7 +300,6 @@ impl WaveformAnalyzer {
                 });
             }
         }
-        frames
     }
 }
 
@@ -733,10 +744,12 @@ mod tests {
         let expected = whole.push(&samples, true);
 
         let mut chunked = WaveformAnalyzer::new(16_000);
-        let actual = samples
-            .chunks(73)
-            .flat_map(|chunk| chunked.push(chunk, true))
-            .collect::<Vec<_>>();
+        let mut frames = Vec::new();
+        let mut actual = Vec::new();
+        for chunk in samples.chunks(73) {
+            chunked.push_into(chunk, true, &mut frames);
+            actual.extend_from_slice(&frames);
+        }
         assert_eq!(actual, expected);
         assert_eq!(
             actual.len(),

@@ -41,17 +41,46 @@ jobs:
       - name: Validate HUD shader assets
         run: |
           qsb_path=$(command -v qsb)
-          qsb --help | grep -q -- '--qt6'
+          "$qsb_path" --help | grep -F -- '--qt6' >/dev/null
           stage="$RUNNER_TEMP/quickshell"
           make install-hud-assets QSB="$qsb_path" QUICKSHELL_DIR="$stage"
           test -s "$stage/WavyHalo.qml"
           test -s "$stage/shaders/wavy-halo.frag.qsb"
           test -s "$RUNNER_TEMP/fonts/NotoSansSC-Variable.ttf"
           test -s "$RUNNER_TEMP/fonts/OFL-NotoSansSC.txt"
-          shader_dump=$(qsb --dump "$stage/shaders/wavy-halo.frag.qsb")
-          grep -q 'GLSL' <<<"$shader_dump"
-          grep -q 'HLSL' <<<"$shader_dump"
-          grep -q 'MSL' <<<"$shader_dump"
+          shader_dump="$RUNNER_TEMP/wavy-halo-qsb.dump"
+          "$qsb_path" --dump "$stage/shaders/wavy-halo.frag.qsb" >"$shader_dump"
+          grep -Fqx 'Has 6 shaders:' "$shader_dump"
+          grep -Fqx '  Shader 0: SPIR-V 100 [Standard]' "$shader_dump"
+          grep -Fqx '  Shader 1: GLSL 100 es [Standard]' "$shader_dump"
+          grep -Fqx '  Shader 2: GLSL 120 [Standard]' "$shader_dump"
+          grep -Fqx '  Shader 3: GLSL 150 [Standard]' "$shader_dump"
+          grep -Fqx '  Shader 4: HLSL 50 [Standard]' "$shader_dump"
+          grep -Fqx '  Shader 5: MSL 12 [Standard]' "$shader_dump"
+          python3 - "$shader_dump" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          dump = Path(sys.argv[1]).read_text()
+          reflection_source = dump.split("Reflection info:", 1)[1].lstrip()
+          reflection, _ = json.JSONDecoder().raw_decode(reflection_source)
+          buf = next(
+              block
+              for block in reflection["uniformBlocks"]
+              if block["blockName"] == "buf"
+          )
+          assert buf["binding"] == 0, buf
+
+          members = {member["name"]: member for member in buf["members"]}
+          expected = {
+              "qt_Matrix": {"offset": 0, "type": "mat4", "size": 64},
+              "qt_Opacity": {"offset": 64, "type": "float", "size": 4},
+          }
+          for name, layout in expected.items():
+              actual = {key: members[name][key] for key in layout}
+              assert actual == layout, f"{name}: expected {layout}, got {actual}"
+          PY
 
       - name: Cache Rust build
         uses: Swatinem/rust-cache@v2

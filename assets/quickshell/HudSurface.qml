@@ -166,7 +166,6 @@ PanelWindow {
     readonly property int cardWidth: expanded ? 600 : 300
     property real clockNowMs: Date.now()
     property real recordingClockAccumulator: 0
-    property real stateRefreshFallbackAccumulator: 0
     property real statusIndicatorCycles: 0
     readonly property real statusIndicatorBreath: 0.5 - 0.5 * Math.cos(statusIndicatorCycles * 2 * Math.PI)
     readonly property real displayedRecordingDurationMs: {
@@ -296,7 +295,6 @@ PanelWindow {
 
             if (!running) {
                 panel.recordingClockAccumulator = 0;
-                panel.stateRefreshFallbackAccumulator = 0;
                 panel.speechPaceSmoothed = 0;
                 panel.transcriptPaceSmoothed = 0;
                 panel.levelSmoothed = 0;
@@ -309,15 +307,6 @@ PanelWindow {
         }
         // frameTime is the elapsed time in seconds since the previous frame.
         onTriggered: {
-            panel.stateRefreshFallbackAccumulator += frameTime;
-            // StateStore normally polls at 20 Hz. This low-rate fallback
-            // couples state refresh to the visible animation heartbeat across
-            // arming, recording, and processing phases.
-            if (panel.stateRefreshFallbackAccumulator >= 0.25) {
-                store.refreshSnapshot();
-                panel.stateRefreshFallbackAccumulator = 0;
-            }
-
             if (panel.recording) {
                 panel.lastRecordingColor = panel.glowColor;
                 panel.recordingClockAccumulator += frameTime;

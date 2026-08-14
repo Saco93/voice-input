@@ -7,6 +7,17 @@ QtObject {
 
     readonly property int protocolVersion: 1
     readonly property int requestTimeoutMs: 30000
+    // A valid configuration can contain 256 KiB of Audio 3 terms plus JSON
+    // escaping and the rest of the settings envelope.
+    readonly property int maximumResponseLineLength: 2 * 1024 * 1024
+    readonly property int maximumRevisionLength: 4096
+    readonly property int maximumProtocolMessageLength: 16384
+    readonly property int initialBackendRestartDelayMs: 250
+    readonly property int maximumBackendRestartDelayMs: 8000
+    readonly property int maximumBackendRestartAttempts: 6
+    readonly property var credentialIds: ["alibaba-api-key", "openrouter-api-key"]
+    readonly property var serviceStates: ["active", "activating", "deactivating", "inactive", "failed", "unknown"]
+    readonly property var runtimePhases: ["idle", "arming", "recording", "transcribing", "refining", "outputting", "error"]
     readonly property string backendBinary: Quickshell.env("VOICE_INPUT_BIN")
     readonly property bool backendConfigured: backendBinary.length > 0
     property int nextRequestId: 1
@@ -14,6 +25,8 @@ QtObject {
     })
     property var loadedConfig: ({
     })
+    property string loadedConfigFingerprint: ""
+    property string loadedAudio3VocabularyText: ""
     property var draft: ({
     })
     property var credentials: ({
@@ -31,20 +44,21 @@ QtObject {
     })
     property string runtimeStatusState: "unknown"
     property string runtimeStatusMessage: ""
-    property var revision: null
+    property string revision: ""
     // Secrets live only in these transient properties. They are never copied into
     // draft config, logged, or placed in process arguments.
     property string alibabaCredential: ""
     property string openrouterCredential: ""
     property string audio3VocabularyText: ""
     readonly property bool busy: loading || saving || testing
-    readonly property bool audio3VocabularyDirty: audio3VocabularyText !== formatAudio3Vocabulary(loadedConfig)
-    readonly property bool dirty: JSON.stringify(draft) !== JSON.stringify(loadedConfig) || audio3VocabularyDirty || alibabaCredential.length > 0 || openrouterCredential.length > 0
+    readonly property bool audio3VocabularyDirty: audio3VocabularyText !== loadedAudio3VocabularyText
+    readonly property bool dirty: JSON.stringify(draft) !== loadedConfigFingerprint || audio3VocabularyDirty || alibabaCredential.length > 0 || openrouterCredential.length > 0
     property Process backendProcess
     property Timer runtimePollTimer
     property Timer requestTimeoutTimer
     property Timer backendRestartTimer
     property bool backendRestarting: false
+    property int backendFailureCount: 0
 
     signal loaded()
     signal saved()
@@ -144,7 +158,23 @@ QtObject {
         return JSON.parse(JSON.stringify(value));
     }
 
-    function formatAudio3Vocabulary(config) {
+    function isPlainObject(value): bool {
+        if (value === null || typeof value !== "object" || Array.isArray(value))
+            return false;
+
+        const prototype = Object.getPrototypeOf(value);
+        return prototype === Object.prototype || prototype === null;
+    }
+
+    function hasOwn(value, key: string): bool {
+        return Object.prototype.hasOwnProperty.call(value, key);
+    }
+
+    function boundedString(value, maximumLength: int, allowEmpty: bool): bool {
+        return typeof value === "string" && value.length <= maximumLength && (allowEmpty || value.trim().length > 0);
+    }
+
+    function formatAudio3Vocabulary(config): string {
         const audio3 = config && config.asr ? config.asr.alibaba_audio3 : null;
         const entries = audio3 && Array.isArray(audio3.vocabulary) ? audio3.vocabulary : [];
         const lines = [];
@@ -153,6 +183,16 @@ QtObject {
             "weight": entries[i].weight
         }))
         return lines.join("\n");
+    }
+
+    function replaceLoadedConfig(config) {
+        const nextLoaded = clone(config);
+        const vocabularyText = formatAudio3Vocabulary(nextLoaded);
+        loadedConfig = nextLoaded;
+        loadedConfigFingerprint = JSON.stringify(nextLoaded);
+        loadedAudio3VocabularyText = vocabularyText;
+        draft = clone(nextLoaded);
+        audio3VocabularyText = vocabularyText;
     }
 
     function setAudio3VocabularyText(value) {
@@ -278,7 +318,7 @@ QtObject {
             return ;
 
         draft = clone(loadedConfig);
-        audio3VocabularyText = formatAudio3Vocabulary(loadedConfig);
+        audio3VocabularyText = loadedAudio3VocabularyText;
         alibabaCredential = "";
         openrouterCredential = "";
         clearMessages();
@@ -369,10 +409,6 @@ QtObject {
             "deadlineMs": Date.now() + requestTimeoutMs
         };
         // Pending request metadata must never retain credential request bodies.
-        // Save needs only the already-sanitized config as a response fallback.
-        if (method === "settings.save")
-            requestMetadata.configFallback = clone(params.config);
-
         nextPending[String(id)] = requestMetadata;
         pending = nextPending;
         // Versioned NDJSON is the only backend channel. JSON and the trailing
@@ -391,6 +427,18 @@ QtObject {
             return ;
 
         clearMessages();
+        if (!backendProcess.running) {
+            if (!backendConfigured) {
+                globalError = "VOICE_INPUT_BIN is not set; cannot start the settings backend.";
+                return ;
+            }
+            // A manual reload may make one immediate attempt after automatic
+            // retries stop. Only a valid response resets backendFailureCount.
+            backendRestartTimer.stop();
+            backendRestarting = false;
+            backendProcess.running = true;
+            return ;
+        }
         loading = true;
         if (send("settings.get", {
         }, false) < 0)
@@ -472,6 +520,10 @@ QtObject {
             return ;
 
         clearMessages();
+        if (revision.trim().length === 0) {
+            globalError = "Reload settings before saving.";
+            return ;
+        }
         const config = normalizedDraft();
         if (!config)
             return ;
@@ -558,7 +610,148 @@ QtObject {
         routeFirstError();
     }
 
-    function failProtocol(message) {
+    function credentialsAreValid(candidate): bool {
+        if (!isPlainObject(candidate))
+            return false;
+
+        const ids = Object.keys(candidate);
+        for (let i = 0; i < ids.length; ++i) {
+            const credentialId = ids[i];
+            const metadata = candidate[credentialId];
+            if (credentialIds.indexOf(credentialId) < 0 || !isPlainObject(metadata) || typeof metadata.configured !== "boolean")
+                return false;
+
+            const metadataKeys = Object.keys(metadata);
+            for (let j = 0; j < metadataKeys.length; ++j) {
+                if (["id", "configured", "source"].indexOf(metadataKeys[j]) < 0)
+                    return false;
+
+            }
+            if (metadata.id !== undefined && metadata.id !== credentialId)
+                return false;
+
+            if (metadata.source !== undefined && !boundedString(metadata.source, 256, false))
+                return false;
+
+        }
+        return true;
+    }
+
+    function stringMapIsValid(candidate, keysMustBeCredentialIds: bool): bool {
+        if (!isPlainObject(candidate))
+            return false;
+
+        const keys = Object.keys(candidate);
+        for (let i = 0; i < keys.length; ++i) {
+            if (keysMustBeCredentialIds && credentialIds.indexOf(keys[i]) < 0)
+                return false;
+
+            if (!boundedString(keys[i], 1024, false) || !boundedString(candidate[keys[i]], maximumProtocolMessageLength, false))
+                return false;
+
+        }
+        return true;
+    }
+
+    function errorIsValid(candidate): bool {
+        if (!isPlainObject(candidate) || !boundedString(candidate.code, 256, false) || !boundedString(candidate.message, maximumProtocolMessageLength, false))
+            return false;
+
+        const keys = Object.keys(candidate);
+        for (let i = 0; i < keys.length; ++i) {
+            if (["code", "message", "fields"].indexOf(keys[i]) < 0)
+                return false;
+
+        }
+        return candidate.fields === undefined || stringMapIsValid(candidate.fields, false);
+    }
+
+    function envelopeIsValid(candidate): bool {
+        if (!isPlainObject(candidate) || candidate.version !== protocolVersion || !Number.isSafeInteger(candidate.id) || candidate.id <= 0 || typeof candidate.ok !== "boolean")
+            return false;
+
+        const keys = Object.keys(candidate);
+        if (keys.length !== 4)
+            return false;
+
+        if (candidate.ok)
+            return hasOwn(candidate, "result") && !hasOwn(candidate, "error") && isPlainObject(candidate.result);
+
+        return hasOwn(candidate, "error") && !hasOwn(candidate, "result") && isPlainObject(candidate.error);
+    }
+
+    function settingsConfigShapeIsValid(candidate): bool {
+        return isPlainObject(candidate)
+            && boundedString(candidate.state_file, 4096, false)
+            && isPlainObject(candidate.hotkey)
+            && isPlainObject(candidate.audio)
+            && isPlainObject(candidate.asr)
+            && isPlainObject(candidate.asr.alibaba)
+            && isPlainObject(candidate.asr.alibaba_audio3)
+            && Array.isArray(candidate.asr.alibaba_audio3.vocabulary)
+            && isPlainObject(candidate.output)
+            && isPlainObject(candidate.ime)
+            && isPlainObject(candidate.llm)
+            && isPlainObject(candidate.hud);
+    }
+
+    function settingsResultIsValid(candidate, savingResult: bool): bool {
+        if (!settingsConfigShapeIsValid(candidate.config) || !boundedString(candidate.revision, maximumRevisionLength, false) || !credentialsAreValid(candidate.credentials))
+            return false;
+
+        if (!savingResult)
+            return true;
+
+        if (candidate.saved !== true || typeof candidate.partial !== "boolean")
+            return false;
+
+        if (candidate.message !== undefined && !boundedString(candidate.message, maximumProtocolMessageLength, true))
+            return false;
+
+        return candidate.credential_errors === undefined || stringMapIsValid(candidate.credential_errors, true);
+    }
+
+    function runtimeResultIsValid(candidate): bool {
+        if (!isPlainObject(candidate.service) || serviceStates.indexOf(candidate.service.state) < 0 || !isPlainObject(candidate.runtime) || typeof candidate.runtime.available !== "boolean")
+            return false;
+
+        const runtime = candidate.runtime;
+        if (runtime.phase !== undefined && runtimePhases.indexOf(runtime.phase) < 0)
+            return false;
+
+        if (runtime.updated_at_ms !== undefined && (!Number.isSafeInteger(runtime.updated_at_ms) || runtime.updated_at_ms < 0))
+            return false;
+
+        const optionalStrings = [["language", 256], ["engine", 2048], ["model", 2048]];
+        for (let i = 0; i < optionalStrings.length; ++i) {
+            const field = optionalStrings[i][0];
+            if (runtime[field] !== undefined && !boundedString(runtime[field], optionalStrings[i][1], false))
+                return false;
+
+        }
+        return true;
+    }
+
+    function responsePayloadIsValid(method: string, response): bool {
+        if (!response.ok)
+            return errorIsValid(response.error);
+
+        if (method === "settings.get")
+            return settingsResultIsValid(response.result, false);
+
+        if (method === "settings.save")
+            return settingsResultIsValid(response.result, true);
+
+        if (method === "llm.test")
+            return response.result.connected === true && (response.result.message === undefined || boundedString(response.result.message, maximumProtocolMessageLength, true));
+
+        if (method === "runtime.get")
+            return runtimeResultIsValid(response.result);
+
+        return false;
+    }
+
+    function clearBackendState() {
         pending = ({
         });
         loading = false;
@@ -568,20 +761,39 @@ QtObject {
         runtimeRefreshPending = false;
         runtimeStatusState = "unavailable";
         runtimeStatusMessage = "Runtime status is unavailable.";
-        if (message && message.length > 0)
-            globalError = message;
-
     }
 
-    function restartBackend() {
-        if (!backendConfigured || backendRestarting)
+    function armBackendRestartTimer() {
+        if (!backendConfigured) {
+            backendRestarting = false;
             return ;
+        }
+        if (backendFailureCount > maximumBackendRestartAttempts) {
+            backendRestarting = false;
+            if (globalError.indexOf("Automatic restart limit reached.") < 0)
+                globalError += (globalError.length > 0 ? " " : "") + "Automatic restart limit reached. Reload to try again.";
 
+            return ;
+        }
+        backendRestartTimer.interval = Math.min(maximumBackendRestartDelayMs, initialBackendRestartDelayMs * Math.pow(2, Math.max(0, backendFailureCount - 1)));
+        backendRestartTimer.restart();
+    }
+
+    function recordBackendFailure(message: string) {
+        clearBackendState();
+        if (message.length > 0)
+            globalError = message;
+
+        backendFailureCount += 1;
         backendRestarting = true;
         if (backendProcess.running)
             backendProcess.running = false;
         else
-            backendRestartTimer.restart();
+            armBackendRestartTimer();
+    }
+
+    function failProtocol(message: string) {
+        recordBackendFailure(message);
     }
 
     function expireRequests() {
@@ -598,13 +810,14 @@ QtObject {
         if (!expired)
             return ;
 
-        failProtocol(userFacing ? "The settings backend did not respond in time and is being restarted. The operation may not have completed." : "");
-        restartBackend();
+        failProtocol(userFacing ? "The settings backend did not respond in time. The operation may not have completed." : "");
     }
 
-    function consumeLine(line) {
-        if (!line || line.trim().length === 0)
+    function consumeLine(line: string) {
+        if (line.length === 0 || line.length > maximumResponseLineLength) {
+            failProtocol(line.length > maximumResponseLineLength ? "The settings backend returned an oversized response." : "The settings backend returned an invalid response.");
             return ;
+        }
 
         let response;
         try {
@@ -613,19 +826,25 @@ QtObject {
             failProtocol("The settings backend returned malformed JSON.");
             return ;
         }
-        if (!response || typeof response !== "object" || Array.isArray(response)) {
+        if (!envelopeIsValid(response)) {
             failProtocol("The settings backend returned an invalid response.");
             return ;
         }
-        if (response.version !== protocolVersion) {
-            failProtocol("Unsupported settings protocol version: " + response.version);
+
+        const key = String(response.id);
+        if (!hasOwn(pending, key)) {
+            failProtocol("The settings backend returned an unexpected response.");
             return ;
         }
-        const key = String(response.id);
         const request = pending[key];
-        if (!request)
+        if (!responsePayloadIsValid(request.method, response)) {
+            failProtocol("The settings backend returned an invalid response.");
             return ;
+        }
 
+        // A response is successful at the protocol level only after both its
+        // envelope and method-specific payload have passed validation.
+        backendFailureCount = 0;
         const nextPending = clone(pending);
         delete nextPending[key];
         pending = nextPending;
@@ -639,8 +858,7 @@ QtObject {
         else if (method === "runtime.get")
             runtimeLoading = false;
         if (!response.ok) {
-            const error = response.error || {
-            };
+            const error = response.error;
             if (method === "runtime.get") {
                 runtimeStatusState = "unavailable";
                 runtimeStatusMessage = error.code === "method_not_found" ? "Runtime status is unavailable." : "Runtime status is temporarily unavailable.";
@@ -650,34 +868,24 @@ QtObject {
                 }
                 return ;
             }
-            globalError = error.message || "The settings backend rejected the request.";
+            globalError = error.message;
             applyBackendFields(error.fields);
             return ;
         }
-        const result = response.result || {
-        };
+        const result = response.result;
         if (method === "settings.get") {
-            const config = withoutPlaintextSecrets(merge(defaults(), result.config || {
-            }));
-            loadedConfig = clone(config);
-            draft = clone(config);
-            audio3VocabularyText = formatAudio3Vocabulary(config);
-            revision = result.revision === undefined ? null : result.revision;
-            credentials = clone(result.credentials || {
-            });
+            const config = withoutPlaintextSecrets(merge(defaults(), result.config));
+            replaceLoadedConfig(config);
+            revision = result.revision;
+            credentials = clone(result.credentials);
             statusMessage = "Settings loaded.";
             loaded();
             refreshRuntimeStatus();
         } else if (method === "settings.save") {
-            const config = withoutPlaintextSecrets(merge(defaults(), result.config || request.configFallback));
-            loadedConfig = clone(config);
-            draft = clone(config);
-            audio3VocabularyText = formatAudio3Vocabulary(config);
-            if (result.revision !== undefined)
-                revision = result.revision;
-
-            if (result.credentials)
-                credentials = clone(result.credentials);
+            const config = withoutPlaintextSecrets(merge(defaults(), result.config));
+            replaceLoadedConfig(config);
+            revision = result.revision;
+            credentials = clone(result.credentials);
 
             if (result.partial) {
                 const partialFields = {
@@ -708,9 +916,7 @@ QtObject {
     }
 
     Component.onCompleted: {
-        loadedConfig = defaults();
-        draft = clone(loadedConfig);
-        audio3VocabularyText = formatAudio3Vocabulary(loadedConfig);
+        replaceLoadedConfig(defaults());
         if (!backendConfigured)
             globalError = "Set VOICE_INPUT_BIN to the Voice Input executable path.";
 
@@ -725,19 +931,11 @@ QtObject {
             root.reload();
         }
         onExited: (exitCode, exitStatus) => {
-            root.pending = ({
-            });
-            root.loading = false;
-            root.saving = false;
-            root.testing = false;
-            root.runtimeLoading = false;
-            root.runtimeRefreshPending = false;
-            root.runtimeStatusState = "unavailable";
-            root.runtimeStatusMessage = "Runtime status is unavailable.";
-            if (root.backendRestarting)
-                root.backendRestartTimer.restart();
-            else if (root.globalError.length === 0)
-                root.globalError = "Settings backend exited (code " + exitCode + ").";
+            if (root.backendRestarting) {
+                root.armBackendRestartTimer();
+            } else {
+                root.recordBackendFailure("Settings backend exited (code " + exitCode + ").");
+            }
         }
 
         // stdout is exclusively versioned, newline-delimited JSON. SplitParser
@@ -777,13 +975,14 @@ QtObject {
     }
 
     backendRestartTimer: Timer {
-        interval: 250
+        interval: root.initialBackendRestartDelayMs
         repeat: false
         onTriggered: {
+            // Clear this before launch so a failure before onStarted counts as
+            // another failed attempt instead of reusing the same short delay.
+            root.backendRestarting = false;
             if (root.backendConfigured)
                 root.backendProcess.running = true;
-            else
-                root.backendRestarting = false;
         }
     }
 

@@ -119,33 +119,46 @@ float broadBandPeak(float coordinate, float center, float width)
 // Arming, silent Listening, and processing supply calm virtual frequency bands
 // to the same spline used by microphone input. Their broad peaks preserve full
 // geometric reach without pretending that silence or processing is live speech.
-float syntheticSpectrumBand(float index, float syntheticStage, float time)
+float syntheticSpectrumBand(
+    float index,
+    float primaryCenter,
+    float secondaryCenter,
+    float primaryWidth,
+    float secondaryWidth,
+    float primaryWeight
+)
 {
     float coordinate = clamp(index, 0.0, 11.0) / 11.0;
+    float profile = primaryWeight * broadBandPeak(coordinate, primaryCenter, primaryWidth)
+        + (1.0 - primaryWeight)
+            * broadBandPeak(coordinate, secondaryCenter, secondaryWidth);
+    return clamp(0.34 + 0.66 * profile, 0.0, 1.0);
+}
+
+float syntheticSpectrumEnvelope(float coordinate, float syntheticStage, float time)
+{
     float primaryCenter;
     float secondaryCenter;
-    float profile;
-
+    float primaryWidth;
+    float secondaryWidth;
+    float primaryWeight;
     if (syntheticStage < 0.5) {
         primaryCenter = 0.50 + 0.08 * sin(6.2831853072 * time * 0.70);
         secondaryCenter = 0.24 + 0.04 * sin(6.2831853072 * time * 0.46 + 1.2);
-        profile = 0.80 * broadBandPeak(coordinate, primaryCenter, 7.0)
-            + 0.20 * broadBandPeak(coordinate, secondaryCenter, 11.0);
+        primaryWidth = 7.0;
+        secondaryWidth = 11.0;
+        primaryWeight = 0.80;
     } else {
         // Finalizing, Refining, and Sending share this one continuously moving
         // profile. Stage changes therefore alter color without selecting a new
         // geometric animation or restarting its phase.
         primaryCenter = 0.50 + 0.12 * sin(6.2831853072 * time * 0.78);
         secondaryCenter = 0.72 - 0.06 * sin(6.2831853072 * time * 0.52 + 0.8);
-        profile = 0.76 * broadBandPeak(coordinate, primaryCenter, 6.0)
-            + 0.24 * broadBandPeak(coordinate, secondaryCenter, 9.0);
+        primaryWidth = 6.0;
+        secondaryWidth = 9.0;
+        primaryWeight = 0.76;
     }
 
-    return clamp(0.34 + 0.66 * profile, 0.0, 1.0);
-}
-
-float syntheticSpectrumEnvelope(float coordinate, float syntheticStage, float time)
-{
     float position = clamp(coordinate, 0.0, 1.0) * 11.0;
     float base = floor(position);
     float t = fract(position);
@@ -156,10 +169,14 @@ float syntheticSpectrumEnvelope(float coordinate, float syntheticStage, float ti
     float weight2 = (1.0 + 3.0 * t + 3.0 * t2 - 3.0 * t3) / 6.0;
     float weight3 = t3 / 6.0;
     return clamp(
-        weight0 * syntheticSpectrumBand(base - 1.0, syntheticStage, time)
-            + weight1 * syntheticSpectrumBand(base, syntheticStage, time)
-            + weight2 * syntheticSpectrumBand(base + 1.0, syntheticStage, time)
-            + weight3 * syntheticSpectrumBand(base + 2.0, syntheticStage, time),
+        weight0 * syntheticSpectrumBand(base - 1.0, primaryCenter,
+            secondaryCenter, primaryWidth, secondaryWidth, primaryWeight)
+            + weight1 * syntheticSpectrumBand(base, primaryCenter,
+                secondaryCenter, primaryWidth, secondaryWidth, primaryWeight)
+            + weight2 * syntheticSpectrumBand(base + 1.0, primaryCenter,
+                secondaryCenter, primaryWidth, secondaryWidth, primaryWeight)
+            + weight3 * syntheticSpectrumBand(base + 2.0, primaryCenter,
+                secondaryCenter, primaryWidth, secondaryWidth, primaryWeight),
         0.0,
         1.0
     );
@@ -220,6 +237,11 @@ void main()
     float radius = clamp(cornerRadius, 0.0, min(halfCapsule.x, halfCapsule.y));
     vec2 point = qt_TexCoord0 * effectSize - 0.5 * effectSize;
     float distanceToCapsule = roundedBoxDistance(point, halfCapsule, radius);
+    float antialias = max(fwidth(distanceToCapsule), 0.5);
+    if (distanceToCapsule <= -antialias) {
+        fragColor = vec4(0.0);
+        return;
+    }
 
     float straightWidth = max(capsuleWidth - 2.0 * radius, 0.0);
     float straightHeight = max(capsuleHeight - 2.0 * radius, 0.0);
@@ -278,10 +300,11 @@ void main()
     // energetic bands produce a visibly deeper geometric height difference.
     float spectralWave = smoothstep(0.48, 0.96, spectrumEnvelope(spectralCoordinate));
     spectralWave = pow(spectralWave, 1.35);
+    float syntheticTime = phase / max(capsuleWidth, 1.0);
     float syntheticEnvelope = syntheticSpectrumEnvelope(
         spectralCoordinate,
         stage,
-        phase / max(capsuleWidth, 1.0)
+        syntheticTime
     );
     float syntheticWave = smoothstep(0.34, 0.88, syntheticEnvelope);
     syntheticWave = pow(syntheticWave, 0.90);
@@ -339,7 +362,6 @@ void main()
     float activeReach = mix(ambientReach, maximumActiveReach, taperedHeightWave);
     float topSpectrumDrive = topEdgeMask * stageDrive;
     float localReach = mix(ambientReach, activeReach, reachDrive);
-    float antialias = max(fwidth(distanceToCapsule), 0.5);
     float outside = smoothstep(-antialias, antialias, distanceToCapsule);
     float falloff = 1.0 - smoothstep(0.0, localReach, distanceToCapsule);
     falloff *= falloff;
@@ -359,7 +381,11 @@ void main()
     // vertical boundary where old and new phase colors met on the top edge.
     float colorBlend = smootherStep(0.0, 1.0, colorTransition);
     vec4 effectiveHaloColor = mix(previousHaloColor, haloColor, colorBlend);
-    float waveAlpha = outside * falloff * brightness * effectiveHaloColor.a;
+    float sourceAlpha = effectiveHaloColor.a;
+    vec3 straightHaloColor = sourceAlpha > 0.0
+        ? effectiveHaloColor.rgb / sourceAlpha
+        : vec3(0.0);
+    float waveAlpha = outside * falloff * brightness * sourceAlpha;
 
     // A narrow continuous foot keeps every spectral lobe optically attached to
     // the capsule even when the local wave contrast reaches a deep trough.
@@ -367,7 +393,7 @@ void main()
     float anchorFalloff = 1.0 - smoothstep(0.0, anchorReach, distanceToCapsule);
     anchorFalloff *= anchorFalloff;
     float anchorAlpha = outside * anchorFalloff * normalizedStrength
-        * mix(0.16, 0.24, activity) * effectiveHaloColor.a;
+        * mix(0.16, 0.24, activity) * sourceAlpha;
     float alpha = max(waveAlpha, anchorAlpha);
 
     // Enter processing with a short breath-like handoff: preserve the final
@@ -390,9 +416,9 @@ void main()
     float spectralTone = mix(normalizedTimbre, normalizedCentroid, 0.82);
     float spectralHighlight = topSpectrumDrive * spectralTone * pow(heightWave, 0.6)
         + 0.08 * normalizedFlux * topEdgeMask;
-    vec3 localColor = effectiveHaloColor.rgb * mix(0.84, 1.0, heightWave);
+    vec3 localColor = straightHaloColor * mix(0.84, 1.0, heightWave);
     localColor = mix(localColor, vec3(1.0), 0.14 * spectralHighlight);
-    vec3 baseHsv = rgbToHsv(effectiveHaloColor.rgb);
+    vec3 baseHsv = rgbToHsv(straightHaloColor);
     float frequencyHue = (spectralCoordinate - 0.5) * 0.28;
     float energyHue = (spectralWave - 0.42) * 0.24
         * smoothstep(0.04, 0.55, spectralPresence);

@@ -19,28 +19,40 @@ QtObject {
     readonly property int waveformBarCount: 30
     readonly property int spectrumBandCount: 12
     readonly property int maximumTranscriptLength: 1024 * 1024
+    // Four snapshot fields may each contain a maximum-length transcript, and a
+    // JSON control character can require a six-character escape. Leave another
+    // MiB for the fixed schema and diagnostics while bounding unknown fields.
+    readonly property int maximumStateFileLength: maximumTranscriptLength * 4 * 6 + 1024 * 1024
+    readonly property int maximumWaveformLineLength: 16 * 1024
     readonly property var snapshotPhases: ["idle", "arming", "recording", "transcribing", "refining", "outputting", "error"]
     readonly property var hudPositions: ["bottom-center", "bottom-left", "bottom-right"]
     readonly property var emptyWaveform: new Array(waveformBarCount).fill(0)
     readonly property var emptySpectrum: new Array(spectrumBandCount).fill(0)
-    property var waveformBars: emptyWaveform
-    property var voiceSpectrum: emptySpectrum
-    property vector4d voiceSpectrum0: Qt.vector4d(0, 0, 0, 0)
-    property vector4d voiceSpectrum1: Qt.vector4d(0, 0, 0, 0)
-    property vector4d voiceSpectrum2: Qt.vector4d(0, 0, 0, 0)
-    property real voiceSpectralFlux: 0
-    property real voiceSpectralCentroid: 0.5
-    property real voiceSpeechPace: 0
-    // Aggregate voice metrics published alongside the bars. The glow-style HUD
-    // visualization is driven by these; level falls back to the bar average
-    // when an older daemon does not send it.
-    property real voiceLevel: 0
-    // Fundamental-frequency estimate, 0..1 (deep .. high). Neutral default
-    // keeps the breathing rate steady until the first voiced frame arrives.
-    property real voicePitch: 0.35
-    // Brightness estimate, 0..1 (muffled .. bright). Drives the hue shift.
-    property real voiceTimbre: 0.5
-    property int waveformFrameCount: 0
+    property var waveformState: ({
+        "bars": emptyWaveform,
+        "spectrum": emptySpectrum,
+        "spectralFlux": 0,
+        "spectralCentroid": 0.5,
+        "speechPace": 0,
+        "level": 0,
+        "pitch": 0.35,
+        "timbre": 0.5,
+        "frameCount": 0
+    })
+    readonly property var waveformBars: waveformState.bars
+    readonly property var voiceSpectrum: waveformState.spectrum
+    readonly property vector4d voiceSpectrum0: Qt.vector4d(voiceSpectrum[0], voiceSpectrum[1], voiceSpectrum[2], voiceSpectrum[3])
+    readonly property vector4d voiceSpectrum1: Qt.vector4d(voiceSpectrum[4], voiceSpectrum[5], voiceSpectrum[6], voiceSpectrum[7])
+    readonly property vector4d voiceSpectrum2: Qt.vector4d(voiceSpectrum[8], voiceSpectrum[9], voiceSpectrum[10], voiceSpectrum[11])
+    readonly property real voiceSpectralFlux: waveformState.spectralFlux
+    readonly property real voiceSpectralCentroid: waveformState.spectralCentroid
+    readonly property real voiceSpeechPace: waveformState.speechPace
+    readonly property real voiceLevel: waveformState.level
+    readonly property real voicePitch: waveformState.pitch
+    readonly property real voiceTimbre: waveformState.timbre
+    readonly property int waveformFrameCount: waveformState.frameCount
+    property double waveformSessionId: 0
+    property double lastWaveformSequence: -1
     property var themePalette: ({
         "accent": "#7dd3fc",
         "foreground": "#eef2ff",
@@ -67,6 +79,7 @@ QtObject {
         "recording_started_at_ms": null,
         "recording_duration_ms": 0,
         "revision": 0,
+        "updated_at_ms": 0,
         "error": null
     })
     readonly property string phase: snapshot.phase || "idle"
@@ -116,17 +129,25 @@ QtObject {
         return value === undefined || value === null || Number.isSafeInteger(value) && value >= 0 && value <= maximum;
     }
 
+    function isPlainObject(value): bool {
+        if (value === null || typeof value !== "object" || Array.isArray(value))
+            return false;
+
+        const prototype = Object.getPrototypeOf(value);
+        return prototype === Object.prototype || prototype === null;
+    }
+
     function snapshotValidationError(candidate) {
-        if (!candidate || typeof candidate !== "object" || Array.isArray(candidate))
-            return "snapshot is not an object";
+        if (!isPlainObject(candidate))
+            return "snapshot is not a plain object";
 
         if (typeof candidate.phase !== "string" || snapshotPhases.indexOf(candidate.phase) < 0)
             return "phase is invalid";
 
-        if (!Number.isFinite(candidate.updated_at_ms) || candidate.updated_at_ms < 0)
+        if (!Number.isSafeInteger(candidate.updated_at_ms) || candidate.updated_at_ms < 0)
             return "updated_at_ms is invalid";
 
-        if (candidate.revision !== undefined && (!Number.isSafeInteger(candidate.revision) || candidate.revision < 0))
+        if (!Number.isSafeInteger(candidate.revision) || candidate.revision < 0)
             return "revision is invalid";
 
         const requiredStrings = [["class", 64], ["icon", 64], ["text", 1024], ["tooltip", maximumTranscriptLength], ["transcript", maximumTranscriptLength], ["language", 256], ["engine", 2048], ["model", 2048]];
@@ -176,6 +197,42 @@ QtObject {
         return "";
     }
 
+    function snapshotForUi(candidate) {
+        return {
+            "phase": candidate.phase,
+            "transcript": candidate.transcript,
+            "tooltip": candidate.tooltip,
+            "bars": candidate.bars.slice(),
+            "hud_enabled": candidate.hud_enabled,
+            "hud_margin_bottom": candidate.hud_margin_bottom,
+            "hud_height": candidate.hud_height,
+            "hud_position": candidate.hud_position,
+            "hud_offset_x": candidate.hud_offset_x,
+            "hud_offset_y": candidate.hud_offset_y,
+            "recording_started_at_ms": candidate.recording_started_at_ms,
+            "recording_duration_ms": candidate.recording_duration_ms,
+            "revision": candidate.revision,
+            "updated_at_ms": candidate.updated_at_ms,
+            "error": candidate.error
+        };
+    }
+
+    function compareSnapshotVersion(candidate): int {
+        if (candidate.updated_at_ms < snapshot.updated_at_ms)
+            return -1;
+
+        if (candidate.updated_at_ms > snapshot.updated_at_ms)
+            return 1;
+
+        if (candidate.revision < snapshot.revision)
+            return -1;
+
+        if (candidate.revision > snapshot.revision)
+            return 1;
+
+        return 0;
+    }
+
     function reportInvalidSnapshot(reason) {
         invalidSnapshotCount++;
         if (invalidSnapshotCount === 1 || invalidSnapshotCount % 100 === 0)
@@ -186,25 +243,28 @@ QtObject {
     function refreshSnapshot() {
         try {
             stateFile.reload();
-            const parsed = JSON.parse(stateFile.text());
+            const source = stateFile.text();
+            if (source.length > maximumStateFileLength) {
+                reportInvalidSnapshot("state JSON exceeds the size limit");
+                return ;
+            }
+            const parsed = JSON.parse(source);
             const validationError = snapshotValidationError(parsed);
             if (validationError.length > 0) {
                 reportInvalidSnapshot(validationError);
                 return ;
             }
-            const revisionsAvailable = Number.isSafeInteger(parsed.revision) && Number.isSafeInteger(snapshot.revision);
-            const revisionChanged = revisionsAvailable && parsed.revision !== snapshot.revision;
-            const snapshotChanged = revisionChanged || parsed.updated_at_ms !== snapshot.updated_at_ms;
-            if (snapshotChanged) {
-                const previousPhase = snapshot.phase;
-                snapshot = parsed;
-                invalidSnapshotCount = 0;
-                if (parsed.phase !== previousPhase) {
-                    console.info("Voice Input HUD state:", previousPhase, "->", parsed.phase);
-                    if (parsed.phase === "idle")
-                        resetWaveform();
+            if (compareSnapshotVersion(parsed) <= 0)
+                return ;
 
-                }
+            const previousPhase = snapshot.phase;
+            snapshot = snapshotForUi(parsed);
+            invalidSnapshotCount = 0;
+            if (parsed.phase !== previousPhase) {
+                console.info("Voice Input HUD state:", previousPhase, "->", parsed.phase);
+                if (parsed.phase === "idle")
+                    resetWaveform();
+
             }
         } catch (error) {
             reportInvalidSnapshot("state JSON could not be parsed");
@@ -237,97 +297,141 @@ QtObject {
     }
 
     function resetWaveform() {
-        waveformBars = emptyWaveform.slice();
-        voiceLevel = 0;
-        voicePitch = 0.35;
-        voiceTimbre = 0.5;
-        voiceSpectrum = emptySpectrum.slice();
-        voiceSpectrum0 = Qt.vector4d(0, 0, 0, 0);
-        voiceSpectrum1 = Qt.vector4d(0, 0, 0, 0);
-        voiceSpectrum2 = Qt.vector4d(0, 0, 0, 0);
-        voiceSpectralFlux = 0;
-        voiceSpectralCentroid = 0.5;
-        voiceSpeechPace = 0;
-        waveformFrameCount = 0;
+        waveformState = {
+            "bars": emptyWaveform.slice(),
+            "spectrum": emptySpectrum.slice(),
+            "spectralFlux": 0,
+            "spectralCentroid": 0.5,
+            "speechPace": 0,
+            "level": 0,
+            "pitch": 0.35,
+            "timbre": 0.5,
+            "frameCount": 0
+        };
     }
 
-    function consumeWaveform(data) {
+    function resetWaveformProtocol() {
+        waveformSessionId = 0;
+        lastWaveformSequence = -1;
+    }
+
+    function isNonnegativeSafeInteger(value): bool {
+        return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+    }
+
+    function isUnitNumber(value): bool {
+        return typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= 1;
+    }
+
+    function isUnitNumberArray(value, expectedLength: int): bool {
+        if (!Array.isArray(value) || value.length !== expectedLength)
+            return false;
+
+        for (let index = 0; index < value.length; index++) {
+            if (!isUnitNumber(value[index]))
+                return false;
+
+        }
+        return true;
+    }
+
+    function waveformValidationError(message): string {
+        if (!isPlainObject(message))
+            return "message is not a plain object";
+
+        if (message.type !== "reset" && message.type !== "waveform")
+            return "type is invalid";
+
+        if (!isNonnegativeSafeInteger(message.session_id) || !isNonnegativeSafeInteger(message.sequence))
+            return "protocol identifiers are invalid";
+
+        if (message.type === "reset")
+            return "";
+
+        if (message.session_id === 0)
+            return "waveform session_id is invalid";
+
+        if (!isUnitNumberArray(message.bars, waveformBarCount))
+            return "bars are invalid";
+
+        if (!isUnitNumberArray(message.spectrum, spectrumBandCount))
+            return "spectrum is invalid";
+
+        const scalarFields = ["level", "pitch", "timbre", "spectral_flux", "spectral_centroid", "speech_pace"];
+        for (let index = 0; index < scalarFields.length; index++) {
+            if (!isUnitNumber(message[scalarFields[index]]))
+                return scalarFields[index] + " is invalid";
+
+        }
+        return "";
+    }
+
+    function consumeWaveform(data: string) {
+        if (data.length > maximumWaveformLineLength)
+            return ;
+
         try {
             const message = JSON.parse(data);
+            if (waveformValidationError(message).length > 0)
+                return ;
+
+            if (message.sequence <= lastWaveformSequence)
+                return ;
+
             if (message.type === "reset") {
-                const resetSessionId = Number(message.session_id);
+                lastWaveformSequence = message.sequence;
+                waveformSessionId = message.session_id;
                 // The daemon closes an accepted recording with session_id 0
                 // before the polled snapshot can advance to transcribing. Keep
                 // the final live frame through that ordering gap so Listening
                 // crossfades directly into processing instead of flashing its
                 // silent standby envelope. The idle snapshot clears it shortly
                 // afterward; a positive ID still resets a newly starting session.
-                if (resetSessionId !== 0 || phase === "idle")
+                if (message.session_id !== 0 || phase === "idle")
                     resetWaveform();
 
                 return ;
             }
-            if (message.type !== "waveform" || !Array.isArray(message.bars) || message.bars.length !== waveformBarCount)
+            // A client can reconnect in the middle of a session, after its
+            // reset frame was already broadcast. Let the first valid waveform
+            // establish that connection's session, then reject cross-session
+            // frames until the next reset.
+            if (waveformSessionId === 0)
+                waveformSessionId = message.session_id;
+            else if (message.session_id !== waveformSessionId)
                 return ;
 
-            const next = [];
-            for (let index = 0; index < message.bars.length; index++) {
-                const value = Number(message.bars[index]);
-                if (!Number.isFinite(value))
-                    return ;
-
-                next.push(Math.max(0, Math.min(1, value)));
-            }
-            waveformBars = next;
-            const average = next.reduce((sum, value) => {
-                return sum + value;
-            }, 0) / next.length;
-            const clamp01 = (value) => {
-                return Math.max(0, Math.min(1, value));
+            const nextState = {
+                "bars": message.bars.slice(),
+                "spectrum": message.spectrum.slice(),
+                "spectralFlux": message.spectral_flux,
+                "spectralCentroid": message.spectral_centroid,
+                "speechPace": message.speech_pace,
+                "level": message.level,
+                "pitch": message.pitch,
+                "timbre": message.timbre,
+                "frameCount": waveformFrameCount + 1
             };
-            const level = Number(message.level);
-            const pitch = Number(message.pitch);
-            const timbre = Number(message.timbre);
-            voiceLevel = Number.isFinite(level) ? clamp01(level) : average;
-            voicePitch = Number.isFinite(pitch) ? clamp01(pitch) : 0.35;
-            voiceTimbre = Number.isFinite(timbre) ? clamp01(timbre) : 0.5;
-            const spectrum = emptySpectrum.slice();
-            if (Array.isArray(message.spectrum) && message.spectrum.length === spectrumBandCount) {
-                for (let index = 0; index < spectrumBandCount; index++) {
-                    const value = Number(message.spectrum[index]);
-                    if (Number.isFinite(value))
-                        spectrum[index] = clamp01(value);
-
-                }
-            }
-            voiceSpectrum = spectrum;
-            voiceSpectrum0 = Qt.vector4d(spectrum[0], spectrum[1], spectrum[2], spectrum[3]);
-            voiceSpectrum1 = Qt.vector4d(spectrum[4], spectrum[5], spectrum[6], spectrum[7]);
-            voiceSpectrum2 = Qt.vector4d(spectrum[8], spectrum[9], spectrum[10], spectrum[11]);
-            const spectralFlux = Number(message.spectral_flux);
-            const spectralCentroid = Number(message.spectral_centroid);
-            const speechPace = Number(message.speech_pace);
-            voiceSpectralFlux = Number.isFinite(spectralFlux) ? clamp01(spectralFlux) : 0;
-            voiceSpectralCentroid = Number.isFinite(spectralCentroid) ? clamp01(spectralCentroid) : 0.5;
-            voiceSpeechPace = Number.isFinite(speechPace) ? clamp01(speechPace) : 0;
-            waveformFrameCount++;
-            if (waveformFrameCount === 30) {
-                const minimum = next.reduce((result, value) => {
+            waveformState = nextState;
+            lastWaveformSequence = message.sequence;
+            if (nextState.frameCount === 30) {
+                const minimum = nextState.bars.reduce((result, value) => {
                     return Math.min(result, value);
                 }, 1).toFixed(3);
-                const maximum = next.reduce((result, value) => {
+                const maximum = nextState.bars.reduce((result, value) => {
                     return Math.max(result, value);
                 }, 0).toFixed(3);
-                const spectrumMaximum = spectrum.reduce((result, value) => {
+                const spectrumMaximum = nextState.spectrum.reduce((result, value) => {
                     return Math.max(result, value);
                 }, 0).toFixed(3);
-                console.info("Voice Input HUD waveform connected: bars", minimum, "..", maximum, "level", voiceLevel.toFixed(3), "pitch", voicePitch.toFixed(3), "timbre", voiceTimbre.toFixed(3), "spectrum max", spectrumMaximum, "flux", voiceSpectralFlux.toFixed(3), "centroid", voiceSpectralCentroid.toFixed(3), "pace", voiceSpeechPace.toFixed(3));
+                console.info("Voice Input HUD waveform connected: bars", minimum, "..", maximum, "level", nextState.level.toFixed(3), "pitch", nextState.pitch.toFixed(3), "timbre", nextState.timbre.toFixed(3), "spectrum max", spectrumMaximum, "flux", nextState.spectralFlux.toFixed(3), "centroid", nextState.spectralCentroid.toFixed(3), "pace", nextState.speechPace.toFixed(3));
             }
         } catch (error) {
         }
     }
 
     function connectWaveform() {
+        resetWaveformProtocol();
         if (waveformSocket) {
             waveformSocket.connected = false;
             waveformSocket.destroy();
