@@ -35,7 +35,8 @@ pub fn run() -> Result<()> {
             daemon::run(config)
         }
         ParsedCommand::Record(action) => {
-            let command = record_control_command(action);
+            let capture_focus = record_action_needs_focus(&Config::load()?, action);
+            let command = record_control_command(action, capture_focus);
             let response = daemon::send_control_command(&command)?;
             print!("{response}");
             Ok(())
@@ -71,19 +72,31 @@ pub fn run() -> Result<()> {
     }
 }
 
-fn record_control_command(action: crate::args::RecordAction) -> String {
-    // Capture the destination before any output-target probing so toggle-off
-    // describes the window focused as close as possible to the key press.
-    let focused_window_hint = matches!(
-        action,
-        crate::args::RecordAction::Stop | crate::args::RecordAction::Toggle
-    )
-    .then(|| {
-        focused_window::capture()
-            .ok()
-            .map(|window| window.control_hint())
-    })
-    .flatten();
+fn record_action_needs_focus(config: &Config, action: crate::args::RecordAction) -> bool {
+    let start_terminology_consumer = config.llm.agent_context_enabled
+        && (config.llm.enabled || config.asr.provider == AsrProvider::AlibabaQwenAudio3);
+    match action {
+        crate::args::RecordAction::Start | crate::args::RecordAction::Restart => {
+            start_terminology_consumer
+        }
+        // A toggle can start and consume start-time terminology, or stop and
+        // consume destination style for refinement.
+        crate::args::RecordAction::Toggle => start_terminology_consumer || config.llm.enabled,
+        crate::args::RecordAction::Stop => config.llm.enabled,
+        crate::args::RecordAction::Cancel => false,
+    }
+}
+
+fn record_control_command(action: crate::args::RecordAction, capture_focus: bool) -> String {
+    // Capture focus before output-target probing and only when an active
+    // consumer needs destination style or start-time Pi/Codex terminology.
+    let focused_window_hint = capture_focus
+        .then(|| {
+            focused_window::capture()
+                .ok()
+                .map(|window| window.control_hint())
+        })
+        .flatten();
     let base = match action {
         crate::args::RecordAction::Start => "start",
         crate::args::RecordAction::Stop => "stop",
@@ -278,8 +291,11 @@ fn stream_pcm_with_backend(
 ) -> Result<Option<String>> {
     let session = asr.spawn_session(
         config,
-        AudioSpec {
-            sample_rate_hz: config.audio.sample_rate,
+        backend::AsrSessionOptions {
+            audio: AudioSpec {
+                sample_rate_hz: config.audio.sample_rate,
+            },
+            agent_terminology: None,
         },
     )?;
     let AsrSessionHandle {
@@ -450,14 +466,12 @@ mod tests {
     use anyhow::Result;
 
     use super::{
-        StreamOutcome, collect_stream_events, format_diagnostics, stream_pcm_with_backend,
+        StreamOutcome, collect_stream_events, format_diagnostics, record_action_needs_focus,
+        stream_pcm_with_backend,
     };
     use crate::{
-        args::OutputFormat,
-        backend::{
-            ASR_CONTROL_QUEUE_CAPACITY, AsrBackend, AsrControl, AsrEvent, AsrSessionHandle,
-            AudioSpec,
-        },
+        args::{OutputFormat, RecordAction},
+        backend::{ASR_CONTROL_QUEUE_CAPACITY, AsrBackend, AsrControl, AsrEvent, AsrSessionHandle},
         config::{AsrProvider, Config, NativeFinalPassMode},
         diagnostics::{
             DIAGNOSTICS_SCHEMA_VERSION, Diagnostics, FailureKind, FinalPassKind, OverallOutcome,
@@ -471,7 +485,11 @@ mod tests {
     }
 
     impl AsrBackend for FakeStreamingBackend {
-        fn spawn_session(&self, _config: &Config, _spec: AudioSpec) -> Result<AsrSessionHandle> {
+        fn spawn_session(
+            &self,
+            _config: &Config,
+            _options: crate::backend::AsrSessionOptions,
+        ) -> Result<AsrSessionHandle> {
             let (control_tx, control_rx) = mpsc::sync_channel(ASR_CONTROL_QUEUE_CAPACITY);
             let (event_tx, event_rx) = mpsc::channel();
             let controls = self.controls.clone();
@@ -659,6 +677,30 @@ mod tests {
             collect_stream_events(&event_rx, Duration::from_secs(1)),
             StreamOutcome::Error
         );
+    }
+
+    #[test]
+    fn focus_capture_is_gated_by_active_consumers() {
+        let mut config = Config::default();
+        assert!(!record_action_needs_focus(&config, RecordAction::Start));
+        assert!(!record_action_needs_focus(&config, RecordAction::Stop));
+
+        config.llm.agent_context_enabled = true;
+        assert!(!record_action_needs_focus(&config, RecordAction::Start));
+        config.asr.provider = AsrProvider::AlibabaQwenAudio3;
+        assert!(record_action_needs_focus(&config, RecordAction::Start));
+        assert!(!record_action_needs_focus(&config, RecordAction::Stop));
+
+        config.llm.enabled = true;
+        assert!(record_action_needs_focus(&config, RecordAction::Start));
+        assert!(record_action_needs_focus(&config, RecordAction::Stop));
+        assert!(!record_action_needs_focus(&config, RecordAction::Cancel));
+
+        config.llm.agent_context_enabled = false;
+        config.asr.provider = AsrProvider::LocalCli;
+        assert!(!record_action_needs_focus(&config, RecordAction::Start));
+        assert!(record_action_needs_focus(&config, RecordAction::Toggle));
+        assert!(record_action_needs_focus(&config, RecordAction::Stop));
     }
 
     #[test]

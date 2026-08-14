@@ -71,8 +71,9 @@ api_base_url = "https://api.openai.com/v1"
 model = ""
 timeout_ms = 15000
 provider_sort = ""
+# Opt in to start-time Pi/Codex terminology for Audio3 Session Context and Refine.
 agent_context_enabled = false
-# Local redacted source budget before segmentation; only bounded terminology is sent.
+# Local redacted source budget; each consumer applies its own smaller output limit.
 agent_context_max_chars = 6000
 
 [hud]

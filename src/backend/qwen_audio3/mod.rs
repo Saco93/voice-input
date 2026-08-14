@@ -7,7 +7,7 @@ use anyhow::Result;
 use serde_json::{Map, Value, json};
 
 use crate::{
-    backend::{AsrBackend, AsrSessionHandle, AudioSpec},
+    backend::{AsrBackend, AsrSessionHandle, AsrSessionOptions},
     config::{Audio3VocabularyTerm, Config, Language},
 };
 
@@ -20,8 +20,12 @@ impl QwenAudio3Backend {
 }
 
 impl AsrBackend for QwenAudio3Backend {
-    fn spawn_session(&self, config: &Config, spec: AudioSpec) -> Result<AsrSessionHandle> {
-        streaming::spawn_session(config, spec)
+    fn spawn_session(
+        &self,
+        config: &Config,
+        options: AsrSessionOptions,
+    ) -> Result<AsrSessionHandle> {
+        streaming::spawn_session(config, options)
     }
 
     fn transcribe_file(&self, config: &Config, wav_path: &Path) -> Result<String> {

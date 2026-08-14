@@ -18,6 +18,7 @@ use std::{
 use anyhow::Result;
 
 use crate::{
+    agent_context::AgentTerminologyCapture,
     config::{AsrProvider, Config},
     diagnostics::{FailureKind, ProviderErrorCode},
 };
@@ -29,6 +30,11 @@ pub use text::apply_script_conversion;
 #[derive(Debug, Clone, Copy)]
 pub struct AudioSpec {
     pub sample_rate_hz: u32,
+}
+
+pub struct AsrSessionOptions {
+    pub audio: AudioSpec,
+    pub agent_terminology: Option<AgentTerminologyCapture>,
 }
 
 // At the 16 kHz capture rate, 128 packets bound queued PCM to roughly 16
@@ -65,6 +71,9 @@ pub struct TimestampDiagnosticsDelta {
 #[derive(Debug, Clone)]
 pub enum AsrEvent {
     Ready,
+    /// Confirms that a nonempty terminology context was included in a
+    /// successfully written Audio3 run-task request. Contains no term text.
+    SessionContextSent,
     SpeechStarted,
     SpeechStopped,
     RealtimeRestarting,
@@ -117,7 +126,11 @@ pub struct AsrSessionHandle {
 }
 
 pub trait AsrBackend: Send + Sync {
-    fn spawn_session(&self, config: &Config, spec: AudioSpec) -> Result<AsrSessionHandle>;
+    fn spawn_session(
+        &self,
+        config: &Config,
+        options: AsrSessionOptions,
+    ) -> Result<AsrSessionHandle>;
 
     fn transcribe_file(&self, config: &Config, wav_path: &Path) -> Result<String>;
 }

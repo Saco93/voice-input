@@ -28,9 +28,10 @@ use tungstenite::{
 };
 
 use crate::{
+    agent_context::AgentTerminologyCapture,
     backend::{
-        ASR_CONTROL_QUEUE_CAPACITY, AsrControl, AsrEvent, AsrSessionHandle, AudioSpec,
-        TimestampDiagnosticsDelta,
+        ASR_CONTROL_QUEUE_CAPACITY, AsrControl, AsrEvent, AsrSessionHandle, AsrSessionOptions,
+        AudioSpec, TimestampDiagnosticsDelta,
     },
     config::{
         AlibabaAudio3Config, Audio3VocabularyTerm, Config, EffectiveAudio3RecognitionControls,
@@ -100,15 +101,26 @@ const MAX_TRANSCRIPT_BYTES: usize = 16 * 1024;
 const MAX_TIMED_UNITS_PER_RESULT: usize = 512;
 static TASK_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
-pub(super) fn spawn_session(config: &Config, spec: AudioSpec) -> Result<AsrSessionHandle> {
+pub(super) fn spawn_session(
+    config: &Config,
+    options: AsrSessionOptions,
+) -> Result<AsrSessionHandle> {
     let (control_tx, control_rx) = mpsc::sync_channel(ASR_CONTROL_QUEUE_CAPACITY);
     let (event_tx, event_rx) = mpsc::channel();
     let abort_flag = Arc::new(AtomicBool::new(false));
     let worker_abort_flag = abort_flag.clone();
     let config = config.clone();
 
-    let join =
-        thread::spawn(move || run_session(config, spec, control_rx, worker_abort_flag, event_tx));
+    let join = thread::spawn(move || {
+        run_session(
+            config,
+            options.audio,
+            options.agent_terminology,
+            control_rx,
+            worker_abort_flag,
+            event_tx,
+        )
+    });
 
     Ok(AsrSessionHandle {
         control_tx,
@@ -121,6 +133,7 @@ pub(super) fn spawn_session(config: &Config, spec: AudioSpec) -> Result<AsrSessi
 fn run_session(
     config: Config,
     spec: AudioSpec,
+    agent_terminology: Option<AgentTerminologyCapture>,
     control_rx: mpsc::Receiver<AsrControl>,
     abort_flag: Arc<AtomicBool>,
     event_tx: mpsc::Sender<AsrEvent>,
@@ -133,9 +146,16 @@ fn run_session(
         bail!("experimental Qwen-Audio-3 ASR requires an API key");
     }
 
+    let context_wait_budget = Duration::from_millis(config.asr.connect_timeout_ms.min(5_000));
+    let session_context = agent_terminology
+        .and_then(|capture| capture.wait_with_abort(&abort_flag, context_wait_budget))
+        .and_then(|snapshot| snapshot.select_for_audio3())
+        .map(|context| Arc::<str>::from(context.text));
+
     run_reconnect_driver(
         &config,
         spec,
+        session_context.as_deref(),
         control_rx,
         &abort_flag,
         &event_tx,
@@ -309,6 +329,7 @@ enum ActiveAttemptOutcome {
 fn run_reconnect_driver<F, I, P, C>(
     config: &Config,
     spec: AudioSpec,
+    session_context: Option<&str>,
     control_rx: mpsc::Receiver<AsrControl>,
     abort_flag: &AtomicBool,
     event_tx: &mpsc::Sender<AsrEvent>,
@@ -344,6 +365,7 @@ where
         clock,
         config,
         spec,
+        session_context,
         &initial_task_id,
         startup_deadline,
         abort_flag,
@@ -449,6 +471,7 @@ where
             clock,
             config,
             spec,
+            session_context,
             &replacement_task_id,
             replacement_deadline,
             abort_flag,
@@ -487,6 +510,7 @@ fn start_task<S: SocketIo, C: DeadlineClock>(
     clock: &C,
     config: &Config,
     spec: AudioSpec,
+    session_context: Option<&str>,
     task_id: &str,
     startup_deadline: C::Deadline,
     abort_flag: &AtomicBool,
@@ -522,11 +546,15 @@ fn start_task<S: SocketIo, C: DeadlineClock>(
                     heartbeat_enabled: audio3.heartbeat_enabled,
                     recognition,
                     vocabulary: &audio3.vocabulary,
+                    session_context,
                 },
             )
             .to_string(),
         ))
         .context("failed to send Qwen-Audio-3 run-task")?;
+    if session_context.is_some_and(|context| !context.trim().is_empty()) {
+        let _ = event_tx.send(AsrEvent::SessionContextSent);
+    }
 
     loop {
         if abort_flag.load(Ordering::SeqCst) {
@@ -815,6 +843,7 @@ fn run_established_socket<S: SocketIo, C: DeadlineClock>(
                 heartbeat_enabled: audio3.heartbeat_enabled,
                 recognition,
                 vocabulary: &audio3.vocabulary,
+                session_context: None,
             },
         ),
     )?;
@@ -1164,6 +1193,7 @@ struct Audio3RequestControls<'a> {
     heartbeat_enabled: bool,
     recognition: EffectiveAudio3RecognitionControls,
     vocabulary: &'a [Audio3VocabularyTerm],
+    session_context: Option<&'a str>,
 }
 
 fn run_task_envelope(
@@ -1178,6 +1208,7 @@ fn run_task_envelope(
         heartbeat_enabled,
         recognition,
         vocabulary,
+        session_context,
     } = controls;
     let mut envelope = json!({
         "header": {
@@ -1211,6 +1242,15 @@ fn run_task_envelope(
     }
     if let Some(vocabulary) = super::vocabulary_value(vocabulary) {
         envelope["payload"]["parameters"]["vocabulary"] = vocabulary;
+    }
+    if let Some(context) = session_context.filter(|context| !context.is_empty()) {
+        envelope["payload"]["input"]["context"] = json!([{
+            "role": "user",
+            "content": [{
+                "type": "input_text",
+                "text": context
+            }]
+        }]);
     }
     envelope
 }
@@ -2570,6 +2610,7 @@ mod tests {
                 AudioSpec {
                     sample_rate_hz: 16_000,
                 },
+                Some("RareModel\nQwen-Audio-3"),
                 control_rx,
                 &abort,
                 &event_tx,
@@ -2580,7 +2621,9 @@ mod tests {
             )
         });
 
-        assert_eq!(sent_json(&sent_rx)["header"]["task_id"], first_id);
+        let initial_run_task = sent_json(&sent_rx);
+        assert_eq!(initial_run_task["header"]["task_id"], first_id);
+        let initial_context = initial_run_task["payload"]["input"]["context"].clone();
         first_tx
             .send(ScriptRead::Message(task_event(
                 first_id,
@@ -2588,6 +2631,10 @@ mod tests {
                 json!({}),
             )))
             .unwrap();
+        assert!(matches!(
+            event_rx.recv().unwrap(),
+            AsrEvent::SessionContextSent
+        ));
         assert!(matches!(event_rx.recv().unwrap(), AsrEvent::Ready));
         control_tx
             .send(crate::backend::AsrControl::append_pcm16(vec![1, -2, 3]))
@@ -2626,7 +2673,12 @@ mod tests {
             event_rx.recv().unwrap(),
             AsrEvent::RealtimeRestarting
         ));
-        assert_eq!(sent_json(&sent_rx)["header"]["task_id"], second_id);
+        let replacement_run_task = sent_json(&sent_rx);
+        assert_eq!(replacement_run_task["header"]["task_id"], second_id);
+        assert_eq!(
+            replacement_run_task["payload"]["input"]["context"],
+            initial_context
+        );
         second_tx
             .send(ScriptRead::Message(task_event(
                 second_id,
@@ -2634,6 +2686,10 @@ mod tests {
                 json!({}),
             )))
             .unwrap();
+        assert!(matches!(
+            event_rx.recv().unwrap(),
+            AsrEvent::SessionContextSent
+        ));
         assert!(matches!(
             event_rx.recv().unwrap(),
             AsrEvent::StreamingReconnect { succeeded: 1, .. }
@@ -2701,6 +2757,7 @@ mod tests {
                 AudioSpec {
                     sample_rate_hz: 16_000,
                 },
+                None,
                 control_rx,
                 &abort,
                 &event_tx,
@@ -2812,6 +2869,7 @@ mod tests {
                 AudioSpec {
                     sample_rate_hz: 16_000,
                 },
+                None,
                 control_rx,
                 &worker_abort,
                 &event_tx,
@@ -2912,6 +2970,7 @@ mod tests {
                 AudioSpec {
                     sample_rate_hz: 16_000,
                 },
+                None,
                 control_rx,
                 &abort,
                 &event_tx,
@@ -3003,6 +3062,7 @@ mod tests {
                 AudioSpec {
                     sample_rate_hz: 16_000,
                 },
+                None,
                 control_rx,
                 &abort,
                 &event_tx,
@@ -3063,6 +3123,7 @@ mod tests {
                 AudioSpec {
                     sample_rate_hz: 16_000,
                 },
+                None,
                 control_rx,
                 &abort,
                 &event_tx,
@@ -3130,6 +3191,7 @@ mod tests {
                 AudioSpec {
                     sample_rate_hz: 16_000,
                 },
+                None,
                 control_rx,
                 &abort,
                 &event_tx,
@@ -3528,6 +3590,7 @@ mod tests {
                     heartbeat_enabled: true,
                     recognition: AlibabaAudio3Config::default().effective_recognition_controls(),
                     vocabulary: &[],
+                    session_context: None,
                 },
             ),
             json!({
@@ -3556,6 +3619,36 @@ mod tests {
     }
 
     #[test]
+    fn run_task_envelope_sends_one_plain_text_session_context_message() {
+        let envelope = run_task_envelope(
+            TASK_ID,
+            "model",
+            AudioSpec {
+                sample_rate_hz: 16_000,
+            },
+            Audio3RequestControls {
+                language: Language::English,
+                language_hints_enabled: false,
+                heartbeat_enabled: false,
+                recognition: AlibabaAudio3Config::default().effective_recognition_controls(),
+                vocabulary: &[],
+                session_context: Some("RareModel\nQwen-Audio-3"),
+            },
+        );
+        assert_eq!(
+            envelope["payload"]["input"]["context"],
+            json!([{
+                "role": "user",
+                "content": [{
+                    "type": "input_text",
+                    "text": "RareModel\nQwen-Audio-3"
+                }]
+            }])
+        );
+        assert!(!envelope.to_string().contains("continue-task"));
+    }
+
+    #[test]
     fn run_task_envelope_sends_explicit_controls_and_omits_empty_vocabulary() {
         let disabled = run_task_envelope(
             TASK_ID,
@@ -3574,6 +3667,7 @@ mod tests {
                     speech_noise_threshold: None,
                 },
                 vocabulary: &[],
+                session_context: None,
             },
         );
         assert!(
@@ -3636,6 +3730,7 @@ mod tests {
                 heartbeat_enabled: true,
                 recognition: custom_audio3.effective_recognition_controls(),
                 vocabulary: &vocabulary,
+                session_context: None,
             },
         );
         assert_eq!(
@@ -3678,6 +3773,7 @@ mod tests {
                 heartbeat_enabled: false,
                 recognition: audio3.effective_recognition_controls(),
                 vocabulary: &[],
+                session_context: None,
             },
         );
         let low_parameters = &low_latency["payload"]["parameters"];
@@ -3699,6 +3795,7 @@ mod tests {
                 heartbeat_enabled: false,
                 recognition: audio3.effective_recognition_controls(),
                 vocabulary: &[],
+                session_context: None,
             },
         );
         let long_parameters = &long_form["payload"]["parameters"];

@@ -101,7 +101,7 @@ Provider-facing decisions, confirmed fields, endpoint constants, ambiguities, an
 
 ## Milestone 3 — Streaming resilience and local refinement context
 
-Alibaba Session Context and Filetrans are deferred and are not part of this milestone.
+Filetrans remains deferred. Alibaba Session Context is implemented as a start-time, opt-in view over the same local terminology snapshot used by Refine.
 
 ### 8. Audio3 streaming reconnect
 
@@ -111,9 +111,14 @@ Alibaba Session Context and Filetrans are deferred and are not part of this mile
 - [x] Preserve cancellation, finish-during-replay, retry, retention, and deadline safety, then use the existing full-audio Native/local recovery after terminal failure.
 - [~] Add deterministic disconnect, exact-replay, stale-transcript reset, second-failure, timeout, cancellation, retention-bound, and privacy tests before live testing. Deterministic tests are complete; an authorized live disconnect canary remains pending.
 
-### 9. Local terminology extraction for Refine
+### 9. Shared local terminology for Audio3 Session Context and Refine
 
-- [x] Treat the latest completed Pi/Codex assistant message as the terminology source; do not derive correction vocabulary from the potentially incorrect ASR transcript.
+- [x] Treat the latest completed Pi/Codex assistant message from the session focused at dictation start as the terminology source; do not derive correction vocabulary from the potentially incorrect ASR transcript.
+- [x] Build one immutable snapshot per Voice Input operation, count case-insensitive occurrences, and sort rare terms first with stable candidate-order ties. Ordinary windows do not construct terminology.
+- [x] Send a complete-term, newline-separated view of at most 400 characters only in Audio3 Streaming `run-task`; do not implement `continue-task`, and reuse the identical view for a reconnect replacement task.
+- [x] Select Refine's existing 96-term/1,500-character view independently from the same snapshot.
+- [x] Normalize high-confidence dynamic technical variants around Refine using only the per-operation snapshot, with complete boundaries, separator/case folding, longest-match preference, and conflict rejection.
+- [x] In Adaptive mode, preserve a healthy completed Streaming result that actually sent nonempty Session Context instead of invoking Native solely for the 30-second duration threshold; retain Native for every degradation condition and Always mode.
 - [x] Redact the source locally before tokenization, then perform bounded local segmentation, stable deduplication, and filtering without sending the original unredacted message anywhere.
 - [~] Compare the previous bounded excerpt, a terminology-only payload, and a bounded excerpt plus terminology payload for payload size, extraction latency, terminology correction, and false replacement. Deterministic synthetic size/latency measurements are complete; the authorized private-corpus accuracy A/B remains pending.
 - [x] Keep context opt-in and untrusted. The Refine prompt must use extracted terms only when the transcript has a clear spoken match and must never follow instructions found in context.
@@ -137,6 +142,7 @@ Alibaba Session Context and Filetrans are deferred and are not part of this mile
 | 2026-08-05 | Milestone 2 item 7 deterministic regional routing | Implemented; Beijing live canaries passed; Singapore pending | Added presence-aware exact-pair migration, typed Regional/Custom and Beijing/Singapore configuration, fixed-constant Streaming/Native endpoint resolution, Custom byte preservation, active-provider isolation, normal Settings controls and region-scoped credential warnings, schema-4-safe routing summaries, bilingual documentation, and offline resolver/request/privacy tests. Authorized Beijing Regional Streaming and Native calls succeeded. Singapore was not attempted without a matching region credential. |
 | 2026-08-12 | Milestone 3 Audio3 streaming reconnect | Deterministic implementation completed; live disconnect canary pending | Added one bounded pre-finish replacement task, prefix-complete PCM retention, 4× replay while capture continues, authoritative transcript reset, finish/cancellation/retry safety, aggregate schema-4 diagnostics, and deterministic exact-replay/second-failure/protocol/task-failure/retention tests. Task transcripts are never merged and timestamps are not used for deduplication. |
 | 2026-08-12 | Refine local terminology extraction | Experimental implementation and synthetic measurements completed; private-corpus A/B pending | Replaced the remotely sent agent excerpt with locally redacted, Jieba-segmented, stably deduplicated terminology capped at 96 terms and 1,500 characters. The source remains the latest completed Pi/Codex assistant message, never the ASR transcript. Aggregate size, latency, and binary-size measurements are in `docs/refine-local-terminology-experiment.md`. |
+| 2026-08-12 | Audio3 Session Context snapshot sharing | Deterministic implementation complete; authorized live evaluation pending | Moved Pi/Codex terminology construction to dictation start, added rare-first frequency ordering and independent 400-character Audio3/96-term Refine selectors, sent context only through `run-task`, and reused the identical snapshot for reconnect. |
 
 ## Official references
 

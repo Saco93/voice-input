@@ -419,6 +419,9 @@ impl Default for SessionDiagnostics {
 #[serde(default)]
 pub struct StreamingStage {
     pub status: StageStatus,
+    /// Whether a nonempty terminology context was successfully written in an
+    /// Audio3 run-task request. No context text is retained.
+    pub session_context_sent: bool,
     pub ready_latency_ms: Option<u64>,
     pub first_partial_latency_ms: Option<u64>,
     pub first_nonempty_partial_latency_ms: Option<u64>,

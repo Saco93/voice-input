@@ -4,9 +4,9 @@ Date: 2026-08-12
 
 ## Scope
 
-The source is the latest completed assistant message from the Pi or Codex session focused when dictation ends. The ASR transcript is not used to create correction terminology because it can contain the recognition errors that Refine is expected to correct.
+The source is the latest completed assistant message from the Pi or Codex session focused when dictation starts. The ASR transcript is not used to create correction terminology because it can contain the recognition errors that Refine is expected to correct.
 
-Alibaba Session Context is not used. Agent context remains disabled by default and is captured only after explicit opt-in.
+One immutable, opt-in snapshot is built at start and shared by Alibaba Audio3 Session Context and Refine. Ordinary windows do not trigger terminology construction.
 
 ## Prototype
 
@@ -19,8 +19,9 @@ The prototype performs these operations locally, in this order:
 5. preserve structured technical forms such as model IDs, identifiers, paths, and flags;
 6. segment the remaining text with `jieba-rs` 0.10.3;
 7. filter common English and Chinese words and stable-deduplicate terms case-insensitively;
-8. cap output to 96 terms and 1,500 term characters;
-9. send only `reference_context.agent` and `reference_context.terminology` to Refine.
+8. count case-insensitive occurrences in the bounded source and sort by frequency ascending, retaining candidate order for ties;
+9. derive an Audio3 view of at most 400 characters including newline separators and a Refine view of at most 96 terms and 1,500 term characters;
+10. send only the bounded plain-text terminology view in Audio3 `run-task` and only `reference_context.agent` plus `reference_context.terminology` to Refine. Reconnect reuses the identical Audio3 view; `continue-task` is not used.
 
 The source assistant message is no longer sent to the LLM. The terminology array remains untrusted data. The system prompt permits an exact substitution only when the transcript has a clear phonetic or spoken-form match, and prohibits following or acting on terminology entries.
 
@@ -40,7 +41,7 @@ A deterministic synthetic mixed Chinese/English technical reference was used. It
 | Release binary size with `jieba-rs` | 13,944,152 bytes |
 | Binary-size increase | 5,629,048 bytes (67.7%) |
 
-The cold initialization is moved into the existing session-discovery worker so it runs in parallel with capture finalization and does not block the audio capture thread. Runtime logs contain only source character count, terminology count, terminology character count, and extraction duration; they do not contain terms or source text.
+Voice Input freezes the focused agent and completed source at command receipt, starts or continues audio capture before local segmentation, and performs Jieba initialization and terminology extraction in a start-time worker. Audio3 waits for the one-shot snapshot before sending `run-task`. Runtime logs contain only source character count, terminology count, terminology character count, and extraction duration; they do not contain terms or source text.
 
 ## Interpretation
 

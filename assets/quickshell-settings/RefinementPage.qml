@@ -70,9 +70,9 @@ SettingsPage {
 
             SettingSwitch {
                 theme: root.theme
-                label: "Use agent context"
+                label: "Use Pi/Codex session terminology"
                 checked: root.controller.value("llm.agent_context_enabled", false)
-                help: "Locally segment a redacted Pi or Codex excerpt and send only bounded, deduplicated terminology."
+                help: "At dictation start, locally extract rare-first terminology for Audio3 Session Context and Refine."
                 enabled: !root.controller.busy
                 onToggled: (checked) => {
                     return root.controller.setValue("llm.agent_context_enabled", checked);
@@ -147,14 +147,14 @@ SettingsPage {
 
             SectionCard {
                 theme: root.theme
-                title: "Agent context"
+                title: "Session terminology"
                 showDivider: false
 
                 SettingTextField {
                     theme: root.theme
                     label: "Context limit"
                     value: root.controller.value("llm.agent_context_max_chars", 6000)
-                    help: "Maximum redacted agent-session characters (500–12000)."
+                    help: "Maximum redacted source characters before local terminology extraction (500–12000)."
                     error: root.controller.errorFor("llm.agent_context_max_chars")
                     enabled: !root.controller.busy
                     onEdited: (value) => {
