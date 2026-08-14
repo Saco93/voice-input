@@ -27,6 +27,7 @@ Voice Input 是一个采用 Rust 2024 的应用，并包含两套 Quickshell/Qt 
 - 对封闭状态集合使用 domain type 和 enum。TOML、JSON、socket、subprocess 或远程 service 的数据进入可信应用状态时必须经过验证。
 - 尽量减少 `unsafe`。每个 `unsafe` block 附近都必须有 `SAFETY` 注释，用来说明它依赖的不变量。
 - 不要在执行无上限 I/O 或等待无关 worker 时持有 mutex。如果有意进行串行处理，应记录该不变量，并确保每次等待都有 deadline。
+- Subprocess wrapper 必须在可能阻塞的 stdin/stdout 操作之前建立 deadline，并发排空 stdout 与 stderr，分别限制两条 stream 的大小；如果 descendant 可能继续持有继承的 pipe，timeout 时必须终止整个 process group。
 - 如果拆分为职责明确的 module 和纯 helper 可以测试生命周期行为，应优先采用这种结构。不要只为减少文件行数而拆分 module。
 
 ### QML 与 Quickshell
@@ -35,7 +36,7 @@ Voice Input 是一个采用 Rust 2024 的应用，并包含两套 Quickshell/Qt 
 - 共享的 `Process`、`Socket` 和 `Timer` 应位于按 screen 创建的 `Variants` 之外。每个 screen 创建一次的 component 应尽量只保存 presentation state。
 - Binding 应保持声明式且执行成本较低。每帧 handler 应更新 animation scalar，不应解析 string、分配 array 或执行 I/O。
 - JSON 和 socket frame 必须先验证，再赋给 property。输入损坏或不完整时应保留最近一次有效状态，并在不记录 secret 的前提下报告错误。
-- `Process.command` 应使用 argument array，不要让用户数据经过 shell。Request 必须有 timeout，并提供可恢复的 process lifecycle。
+- `Process.command` 应使用 argument array，不要让用户数据经过 shell。Request 必须有 timeout，严格验证 response ID 和 payload schema，并提供可恢复但重启次数受限的 process lifecycle。
 - Shader 应编译为 `.qsb`。必须保留 Qt 6 uniform block 和 binding 规则、premultiplied alpha，以及 CI 验证的全部 GLSL/HLSL/MSL target。
 
 ## 验证
@@ -48,7 +49,15 @@ make hud-shaders QSB=/usr/lib/qt6/bin/qsb
 git diff --check
 ```
 
-`make validate` 会使用当前 Qt 和 Quickshell 安装提供的 import path 运行 `qmllint`。如果 executable 不在 `PATH` 中，请设置 `QMLLINT`。存在未解析 import 时，lint 结果并不完整，不应忽略该问题。
+`make validate` 会使用当前 Qt 和 Quickshell 安装提供的 import path 运行 `qmllint`。如果 executable 不在 `PATH` 中，请设置 `QMLLINT`。存在未解析 import 时，lint 结果并不完整，不应忽略该问题。CI 还会使用 Qt 6.8.3 的 `qmlformat` 解析每一个 QML asset；语法解析与 import-aware lint 是互补检查，不能互相替代。
+
+Shader 构建结果必须精确包含 CI 使用的 Qt 6 target set：SPIR-V 100、GLSL 100 es、GLSL 120、GLSL 150、HLSL 50 和 MSL 12。使用以下命令检查：
+
+```sh
+/usr/lib/qt6/bin/qsb --dump target/quickshell/shaders/wavy-halo.frag.qsb
+```
+
+Reflection 必须保持 uniform block `buf` 位于 binding 0，`qt_Matrix` 是 offset 0、大小 64 byte 的 `mat4`，`qt_Opacity` 是 offset 64、大小 4 byte 的 `float`。
 
 测试应覆盖正常行为和相关边界，包括损坏的输入、最大尺寸、timeout、断开连接、过期状态或并发访问。解析和不变量优先使用较小的纯 unit test；如果正确性取决于 socket、process、filesystem permission 或多 thread lifecycle，再增加 integration test。
 

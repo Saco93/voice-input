@@ -53,6 +53,14 @@ cd voice-input
 make enable-service
 ```
 
+To update an existing source installation:
+
+```bash
+git pull --ff-only && make enable-service
+```
+
+This overwrites the installed binary, service definitions, and bundled desktop assets while preserving your user configuration and encrypted credentials. After an update, reopen Settings, reload Pi, and reload Hyprland. If you copied a Waybar snippet instead of referencing the installed snippet, merge the current snippet into your Waybar configuration again.
+
 Then open Settings:
 
 ```bash
@@ -76,6 +84,14 @@ F10                Discard and restart active dictation (ignored while idle)
 Super+Ctrl+Alt+…   Move/reset the HUD
 ```
 
+The corresponding recording commands are:
+
+```bash
+voice-input record toggle
+voice-input record restart   # discard and restart; ignored while idle
+voice-input record cancel
+```
+
 Verify the service:
 
 ```bash
@@ -85,13 +101,13 @@ systemctl --user status voice-input.service voice-input-hud.service
 
 ## Safe support diagnostics
 
-Use `voice-input diagnostics [--format text|json]` as the canonical output for support reports. Schema 4 contains bounded stage statuses and failure categories; aggregate streaming delivery/result timings and counts (ready, partial, nonempty partial, segment-final, audio packets and sent duration, queue delays, finish, task completion/failure, and finalization); bounded Audio3 timestamp aggregates (timestamp-bearing results, accepted timed units, truncated units, results with rejected timestamp metadata, and the latest event-reported valid numeric audio-relative end in milliseconds); the Audio3 native-pass mode/decision/reason; and a safe configuration summary for one session only: the active or most recently completed session. Each normal result contributes at most one rejected-timestamp-metadata count when its timestamp block contains any invalid scalar, relationship, words shape, or processed unit; truncation alone contributes zero. The latest valid end is overwritten by a later event that supplies one, with no cross-event monotonicity assumption. Timestamp diagnostics never include sentence IDs, timed-unit text or punctuation, transcripts, or provider messages. The safe summary reports the Audio3 endpoint mode and region, whether language hints and heartbeat are enabled, the effective maximum sentence silence and semantic-punctuation state after preset resolution, and the dynamic-vocabulary entry count. It never includes route identifiers, endpoint/host values, model, key, or vocabulary terms. A failed provider task may include an optional strictly bounded provider error identifier. That session summary remains available after completion and is reset when the next recording starts. It contains no audio, credentials, endpoints, model names, provider messages, window/application data, prompt context, tooltips, session history, or normal recognized/refined transcript text.
+Use `voice-input diagnostics [--format text|json]` as the canonical output for support reports. Schema 4 contains a safe summary of the current configuration and, when available, one active or most recently completed session. The session summary uses bounded stage statuses and failure categories; aggregate streaming delivery/result timings and counts (ready, partial, nonempty partial, segment-final, audio packets and sent duration, queue delays, finish, task completion/failure, and finalization); bounded Audio3 timestamp aggregates (timestamp-bearing results, accepted timed units, truncated units, results with rejected timestamp metadata, and the latest event-reported valid numeric audio-relative end in milliseconds); and the Audio3 native-pass mode/decision/reason. Each normal result contributes at most one rejected-timestamp-metadata count when its timestamp block contains any invalid scalar, relationship, words shape, or processed unit; truncation alone contributes zero. The latest valid end is overwritten by a later event that supplies one, with no cross-event monotonicity assumption. Timestamp diagnostics never include sentence IDs, timed-unit text or punctuation, transcripts, or provider messages. The safe summary reports the Audio3 endpoint mode and region, whether language hints and heartbeat are enabled, the effective maximum sentence silence and semantic-punctuation state after preset resolution, and the dynamic-vocabulary entry count. It never includes route identifiers, endpoint/host values, model, key, or vocabulary terms. A failed provider task may include an optional strictly bounded provider error identifier. That session summary remains available after completion and is reset when the next recording starts. It contains no audio, credentials, endpoints, model names, provider messages, window/application data, prompt context, tooltips, session history, or normal recognized/refined transcript text.
 
 Do not paste `voice-input status` output into reports, with or without `--extended`. Status output is intended for local UI integration and can include the current or most recent transcript and tooltip text.
 
 ## Experimental Qwen-Audio-3
 
-Qwen-Audio-3 is available as an explicit experimental provider. It is disabled by default and is not offered by the stable setup wizard. The explicit experimental gate and setup-wizard omission remain intentional while the beta is prepared. To try it, open Settings, choose **Qwen-Audio-3 (experimental)**, acknowledge the experimental-provider warning, and save. The existing encrypted Alibaba credential is shared with this provider.
+Qwen-Audio-3 is available as an explicit experimental provider. It is disabled by default and is not offered by the stable setup wizard. The explicit experimental gate and setup-wizard omission remain intentional while the beta is prepared. To try it, open Settings, choose **Qwen-Audio-3 (experimental)**, acknowledge the experimental-provider warning, and save. The existing encrypted Alibaba credential is shared with this provider. See the Wiki [Architecture](https://github.com/Saco93/voice-input/wiki/Architecture) and [Configuration](https://github.com/Saco93/voice-input/wiki/Configuration) pages for the detailed flow and option reference.
 
 **Endpoint mode** defaults to **Regional**, with **Beijing** as the default region; **Singapore** is also selectable. Regional mode selects the fixed reviewed legacy Streaming and Native hosts for the chosen region. **Custom** mode uses the configured Streaming and Native URLs exactly, including path, port, and query bytes.
 
@@ -99,13 +115,13 @@ Migration is presence-aware. A configuration without `endpoint_mode` migrates to
 
 Alibaba API keys are region-scoped. Changing the region may require replacing the encrypted Alibaba credential. Voice Input never probes another region and never migrates a key automatically. Singapore availability does not establish feature parity: each model, control combination, and language/vocabulary scenario still requires authorized live validation.
 
-The streaming model supplies realtime text. When explicitly enabled and dictation starts in a validated Pi or Codex session, its `run-task` also receives at most 400 characters of locally redacted, low-frequency-first Session Context terminology; no `continue-task` event is used. On one recoverable transport interruption before `finish-task`, Voice Input creates a new Audio3 task, discards the old task's transcript, and replays retained PCM from the beginning at 4× realtime while recording continues. Retention is prefix-complete and limited by the configured recording duration, 300 seconds, and 10 MiB of PCM; exceeding the limit disables reconnect without evicting an audio prefix. A second interruption or a post-finish interruption uses the existing Native/local complete-audio recovery. **Language hints** and **streaming heartbeat** are independent opt-in settings and are disabled by default. Enabling language hints sends the existing language selection to Audio3: English uses `en`; Simplified and Traditional Chinese use `zh,en`; Japanese uses `ja,en`; and Korean uses `ko,en`. The extra English hint retains mixed-English recognition for Chinese, Japanese, and Korean; leaving the switch disabled preserves the provider's automatic detection. Enabling streaming heartbeat keeps long silent push-to-talk sessions alive while correctly formatted audio frames continue.
+The streaming model supplies realtime text. When explicitly enabled and dictation starts in a validated Pi or Codex session, its `run-task` also receives at most 400 characters of locally redacted, low-frequency-first Session Context terminology; no `continue-task` event is used. On one recoverable transport interruption before `finish-task`, Voice Input creates a new Audio3 task, discards the old task's transcript, and replays retained PCM from the beginning at 4× realtime while recording continues. Retention is prefix-complete and limited by the configured recording duration, 300 seconds, and 10 MiB of PCM; exceeding the limit disables reconnect instead of retaining or replaying an incomplete prefix. A second interruption or a post-finish interruption uses the existing Native/local complete-audio recovery. **Language hints** and **streaming heartbeat** are independent opt-in settings and are disabled by default. Enabling language hints sends the existing language selection to Audio3: English uses `en`; Simplified and Traditional Chinese use `zh,en`; Japanese uses `ja,en`; and Korean uses `ko,en`. The extra English hint retains mixed-English recognition for Chinese, Japanese, and Korean; leaving the switch disabled preserves the provider's automatic detection. Enabling streaming heartbeat keeps long silent push-to-talk sessions alive while correctly formatted audio frames continue.
 
 **Recognition preset** defaults to **Standard**, which preserves the existing `800` ms maximum sentence silence with semantic punctuation and multi-threshold mode disabled and no speech/noise threshold. **Low-latency dictation** uses `400` ms with multi-threshold mode enabled; **Long-form** uses `1300` ms with semantic punctuation enabled. Both mappings were accepted in an authorized, one-speaker evaluation and retained both clauses across a matrix with 250–2200 ms of inserted digital silence; acoustic speech boundaries remained dependent on local RMS trimming. The bounded sample does not establish a general accuracy or latency recommendation, so Standard remains the default. See [`docs/qwen-audio3-milestone2-evaluation.md`](docs/qwen-audio3-milestone2-evaluation.md). **Custom** exposes all raw controls; semantic punctuation and multi-threshold mode cannot be enabled together. Its optional speech/noise threshold must be finite and between `-1` and `1`; omission preserves provider behavior because Alibaba publishes no default. Settings displays every value that a custom request can send.
 
 Optional **Dynamic vocabulary** entries are global to Audio3 and are sent to both streaming and native requests only when configured. Settings displays every remotely sent entry as one JSON object per line, for example `{"term":"Voice Input","weight":5}`. Terms use weights `1`–`5` or `50`; the local validator enforces the provider's term, duplicate, count, and weight limits. Dynamic terms are deliberately absent from routine support diagnostics.
 
-**Native final pass** has three modes. **Streaming only** (the default) never sends the complete recording. **Adaptive** runs native recognition when realtime delivery is overloaded, a backend/event worker is interrupted, streaming is empty/failed/degraded, the server does not send an explicit `Finished` completion, or captured audio lasts at least 30 seconds. It skips only a usable, non-overloaded, explicitly finished stream shorter than 30 seconds. **Always** is the explicit maximum-accuracy choice and runs native recognition for every non-cancelled, nonempty recording. Existing configurations whose legacy boolean was `true` migrate to **Always**; `false` migrates to **Streaming only**.
+**Native final pass** has three modes. **Streaming only** (the default) never sends the complete recording. **Adaptive** runs native recognition when realtime delivery is overloaded, a backend/event worker is interrupted, streaming is empty/failed/degraded, the server does not send an explicit `Finished` completion, or captured audio normally lasts at least 30 seconds. A usable, non-overloaded, explicitly finished stream skips Native when it is shorter than 30 seconds, and also when it actually sent Session Context even if it is longer; all degradation recovery conditions still apply. **Always** is the explicit maximum-accuracy choice and runs native recognition for every non-cancelled, nonempty recording. Existing configurations whose legacy boolean was `true` migrate to **Always**; `false` migrates to **Streaming only**.
 
 When native recognition runs, it sends the complete recording to `qwen-audio-3.0-asr-flash`. A successful native transcript takes precedence. A native no-words result is authoritative when no usable streaming transcript exists; otherwise the usable streaming transcript is retained. If the native request fails or times out, usable streaming text remains available, followed by the configured local fallback only when needed. Cancellation never launches native recognition. Native requests accept at most 10 MiB of raw WAV audio.
 
@@ -140,10 +156,12 @@ Both commands require Qwen-Audio-3 to be selected and explicitly enabled in the 
 | Architecture | [Architecture](https://github.com/Saco93/voice-input/wiki/Architecture) | [实现原理](https://github.com/Saco93/voice-input/wiki/Architecture.zh-CN) |
 | Installation | [Installation](https://github.com/Saco93/voice-input/wiki/Installation) | [安装指南](https://github.com/Saco93/voice-input/wiki/Installation.zh-CN) |
 | Configuration | [Configuration](https://github.com/Saco93/voice-input/wiki/Configuration) | [配置参考](https://github.com/Saco93/voice-input/wiki/Configuration.zh-CN) |
+| Agent Context | [Agent Context](https://github.com/Saco93/voice-input/wiki/Agent-Context) | [Agent 上下文](https://github.com/Saco93/voice-input/wiki/Agent-Context.zh-CN) |
+| Desktop Integration | [Desktop Integration](https://github.com/Saco93/voice-input/wiki/Desktop-Integration) | [桌面集成](https://github.com/Saco93/voice-input/wiki/Desktop-Integration.zh-CN) |
+| Security and Privacy | [Security and Privacy](https://github.com/Saco93/voice-input/wiki/Security-and-Privacy) | [安全与隐私](https://github.com/Saco93/voice-input/wiki/Security-and-Privacy.zh-CN) |
 | Troubleshooting | [Troubleshooting](https://github.com/Saco93/voice-input/wiki/Troubleshooting) | [故障排查](https://github.com/Saco93/voice-input/wiki/Troubleshooting.zh-CN) |
-| Development | [Contributing](CONTRIBUTING.md) | [贡献指南](CONTRIBUTING.zh-CN.md) |
-
-The Wiki also covers agent context, desktop integration, privacy, and development.
+| Development | [Development](https://github.com/Saco93/voice-input/wiki/Development) | [开发指南](https://github.com/Saco93/voice-input/wiki/Development.zh-CN) |
+| Contributing | [Contributing](CONTRIBUTING.md) | [贡献指南](CONTRIBUTING.zh-CN.md) |
 
 ## Privacy
 

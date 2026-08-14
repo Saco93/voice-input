@@ -51,6 +51,10 @@ the current design or enforces an invariant.
 - Avoid holding a mutex while performing unbounded I/O or waiting for an
   unrelated worker. If serialization is intentional, document that invariant
   and ensure every wait has a deadline.
+- Subprocess wrappers must establish the deadline before potentially blocking
+  stdin/stdout work, drain stdout and stderr concurrently, cap both streams,
+  and terminate the whole process group on timeout when descendants can retain
+  inherited pipes.
 - Prefer focused modules and pure helpers when they make lifecycle behavior
   testable. Do not split modules solely to reduce line counts.
 
@@ -68,7 +72,8 @@ the current design or enforces an invariant.
   the last valid state after malformed or partial input, and report failures
   without logging secrets.
 - Use argument arrays for `Process.command`; do not pass user data through a
-  shell. Requests need a timeout and a recoverable process lifecycle.
+  shell. Requests need a timeout, strictly validated response IDs and payload
+  schemas, and a recoverable but bounded process-restart lifecycle.
 - Compile shaders to `.qsb`. Maintain the Qt 6 uniform block and binding rules,
   premultiplied alpha, and all CI-validated GLSL/HLSL/MSL targets.
 
@@ -85,7 +90,18 @@ git diff --check
 `make validate` runs `qmllint` with the import paths from the active Qt and
 Quickshell installation. Set `QMLLINT` when the executable is outside `PATH`.
 Unresolved imports make a lint result incomplete and must not be silently
-ignored.
+ignored. CI additionally parses every QML asset with Qt 6.8.3 `qmlformat`;
+syntax parsing and import-aware linting are complementary, not interchangeable.
+
+The shader build must contain exactly the Qt 6 target set used by CI: SPIR-V
+100, GLSL 100 es, GLSL 120, GLSL 150, HLSL 50, and MSL 12. Inspect it with:
+
+```sh
+/usr/lib/qt6/bin/qsb --dump target/quickshell/shaders/wavy-halo.frag.qsb
+```
+
+Reflection must keep uniform block `buf` at binding 0, `qt_Matrix` as a 64-byte
+`mat4` at offset 0, and `qt_Opacity` as a 4-byte `float` at offset 64.
 
 Tests should cover normal behavior and the relevant boundary: malformed input,
 maximum size, timeout, disconnect, stale state, or concurrent access. Prefer a

@@ -53,7 +53,15 @@ cd voice-input
 make enable-service
 ```
 
-打开设置：
+如果要更新现有的源码安装版本，请运行：
+
+```bash
+git pull --ff-only && make enable-service
+```
+
+该命令会覆盖已安装的二进制文件、服务定义和内置桌面资产，但会保留用户配置和加密凭据。更新后，请重新打开 Settings、重新加载 Pi，并重新加载 Hyprland 配置。如果你复制了 Waybar snippet，而不是引用已安装的 snippet，还需要把当前版本的 snippet 重新合并到 Waybar 配置中。
+
+然后打开设置：
 
 ```bash
 voice-input settings
@@ -76,6 +84,14 @@ F10                丢弃并重新开始正在录制的 dictation（idle 时忽�
 Super+Ctrl+Alt+…   移动或重置 HUD
 ```
 
+对应的录音命令如下：
+
+```bash
+voice-input record toggle
+voice-input record restart   # 丢弃并重新开始；idle 时忽略
+voice-input record cancel
+```
+
 检查服务：
 
 ```bash
@@ -91,7 +107,7 @@ systemctl --user status voice-input.service voice-input-hud.service
 
 ## 实验性 Qwen-Audio-3
 
-Qwen-Audio-3 目前作为需要明确启用的实验性提供商使用。该选项默认关闭，稳定安装向导也不会提供它。在 beta 准备期间，明确的实验功能开关以及安装向导不提供该选项都是有意保留的设计。如需试用，请打开 Settings，选择 **Qwen-Audio-3（实验性）**，确认实验功能警告后保存。该提供商与现有 Alibaba 实时识别共用同一份加密凭据。
+Qwen-Audio-3 目前作为需要明确启用的实验性提供商使用。该选项默认关闭，稳定安装向导也不会提供它。在 beta 准备期间，明确的实验功能开关以及安装向导不提供该选项都是有意保留的设计。如需试用，请打开 Settings，选择 **Qwen-Audio-3（实验性）**，确认实验功能警告后保存。该提供商与现有 Alibaba 实时识别共用同一份加密凭据。详细流程和选项参考请查看 Wiki 的[架构](https://github.com/Saco93/voice-input/wiki/Architecture.zh-CN)与[配置参考](https://github.com/Saco93/voice-input/wiki/Configuration.zh-CN)。
 
 **端点模式**默认使用**区域路由**，默认区域为**北京**，也可以选择**新加坡**。区域路由会为所选区域使用固定且经过审核的旧版流式主机和原生主机。**自定义**模式会原样使用已配置的流式 URL 和原生 URL，包括路径、端口和 query 字节。
 
@@ -99,13 +115,13 @@ Qwen-Audio-3 目前作为需要明确启用的实验性提供商使用。该选�
 
 Alibaba API key 受区域范围约束。更改区域后，用户可能需要替换加密的 Alibaba 凭据。Voice Input 绝不会探测其他区域，也不会自动迁移 key。支持选择新加坡区域并不表示已经实现完整功能一致性；每个模型、控制项组合以及语言或词汇表场景仍需完成经过授权的在线验证。
 
-流式模型负责提供实时文本。用户明确启用 Session 术语，并且听写开始时聚焦的是经过验证的 Pi 或 Codex session 时，`run-task` 还会接收最多 400 个字符且低频优先的本地脱敏 Session Context 术语；程序不会发送 `continue-task`。如果在发送 `finish-task` 前发生一次可恢复的传输中断，Voice Input 会创建新的 Audio3 task，使旧 task 的 transcript 失效，并且以 4 倍实时速度从头重放保留的 PCM，同时继续录音。保留的 PCM 必须包含完整前缀，其上限取配置的最大录音时长、300 秒和 10 MiB PCM 三者中的最小值；超过上限会停用重连，同时不会丢弃前缀后继续重放。第二次中断或发送 `finish-task` 后的中断会使用现有的 Native 或本地完整音频恢复。**语言提示**和**流式 heartbeat** 是两个相互独立的选用设置，默认均为关闭。启用语言提示后，程序会把现有语言选项发送给 Audio3：英语使用 `en`；简体中文和繁体中文使用 `zh,en`；日语使用 `ja,en`；韩语使用 `ko,en`。中文、日语和韩语的额外英语提示用于保留英语混合识别；关闭该开关会保留服务商的自动检测行为。启用流式 heartbeat 后，只要程序继续发送格式正确的音频帧，它就能使长时间静音的按键说话 session 保持连接。
+流式模型负责提供实时文本。用户明确启用 Session 术语，并且听写开始时聚焦的是经过验证的 Pi 或 Codex session 时，`run-task` 还会接收最多 400 个字符且低频优先的本地脱敏 Session Context 术语；程序不会发送 `continue-task`。如果在发送 `finish-task` 前发生一次可恢复的传输中断，Voice Input 会创建新的 Audio3 task，使旧 task 的 transcript 失效，并且以 4 倍实时速度从头重放保留的 PCM，同时继续录音。保留的 PCM 必须包含完整前缀，其上限取配置的最大录音时长、300 秒和 10 MiB PCM 三者中的最小值；超过上限会停用重连，不会改为保留或重放不完整的前缀。第二次中断或发送 `finish-task` 后的中断会使用现有的 Native 或本地完整音频恢复。**语言提示**和**流式 heartbeat** 是两个相互独立的选用设置，默认均为关闭。启用语言提示后，程序会把现有语言选项发送给 Audio3：英语使用 `en`；简体中文和繁体中文使用 `zh,en`；日语使用 `ja,en`；韩语使用 `ko,en`。中文、日语和韩语的额外英语提示用于保留英语混合识别；关闭该开关会保留服务商的自动检测行为。启用流式 heartbeat 后，只要程序继续发送格式正确的音频帧，它就能使长时间静音的按键说话 session 保持连接。
 
 **识别预设**默认使用**标准**。该预设保留现有行为：最大句末静音时长为 `800` 毫秒，语义标点和多阈值模式均关闭，并且不发送语音/噪声阈值。**低延迟听写**使用 `400` 毫秒并启用多阈值模式；**长篇语音**使用 `1300` 毫秒并启用语义标点。经过授权的单说话人评估确认服务端接受这两个映射；在插入了 250–2200 毫秒数字静音的测试矩阵中，两者都保留了静音前后的内容。声学语音边界仍取决于本地 RMS 裁剪。有限样本无法形成通用的准确率或延迟建议，因此标准预设仍为默认值。详见 [`docs/qwen-audio3-milestone2-evaluation.md`](docs/qwen-audio3-milestone2-evaluation.md)。**自定义**会显示全部原始控制项；语义标点与多阈值模式不能同时启用。可选的语音/噪声阈值必须是 `-1` 到 `1` 之间的有限数值；Alibaba 未公布默认值，因此省略该字段可以保留服务商行为。Settings 会显示自定义请求可能发送的每一个值。
 
 用户可以配置可选的全局**动态词汇表**。程序只在配置不为空时，才会把词条发送给 Audio3 的流式请求和原生请求。Settings 会用每行一个 JSON 对象的方式显示所有将发送到远程服务的词条，例如 `{"term":"Voice Input","weight":5}`。权重可以是 `1`–`5` 或 `50`；本地验证会检查服务商规定的词条、重复项、数量和权重限制。常规支持诊断信息不会包含动态词条。
 
-**原生最终处理**提供三种模式。默认的**仅流式识别**不会发送完整录音。**自适应**模式会在实时音频传输过载、后端或事件 worker 中断、流式识别为空/失败/降级、服务端未发送明确的 `Finished` 完成事件，或者录音达到 30 秒时运行原生识别。只有可用、未过载、明确完成且短于 30 秒的流式识别才会跳过原生识别。**始终运行**是明确请求最高准确度的选项，会对每段未取消且非空的录音运行原生识别。旧配置中的 boolean 为 `true` 时会迁移到**始终运行**，为 `false` 时会迁移到**仅流式识别**。
+**原生最终处理**提供三种模式。默认的**仅流式识别**不会发送完整录音。**自适应**模式会在实时音频传输过载、后端或事件 worker 中断、流式识别为空/失败/降级、服务端未发送明确的 `Finished` 完成事件，或者录音通常达到 30 秒时运行原生识别。可用、未过载且明确完成的流式识别在短于 30 秒时会跳过原生识别；如果它确实发送了 Session Context，即使录音更长也同样会跳过。所有异常恢复条件仍然生效。**始终运行**是明确请求最高准确度的选项，会对每段未取消且非空的录音运行原生识别。旧配置中的 boolean 为 `true` 时会迁移到**始终运行**，为 `false` 时会迁移到**仅流式识别**。
 
 运行原生识别时，程序会把完整录音发送给 `qwen-audio-3.0-asr-flash`。成功的原生 transcript 优先级最高。如果原生服务返回无词结果，并且没有可用的流式 transcript，该结果具有最终效力；如果已有可用的流式 transcript，程序会保留它。原生请求失败或超时时，程序会保留可用的流式文本；仍无可用文本时，才会使用已配置的本地备用识别。取消操作不会启动原生识别。原生请求最多接受 10 MiB 的原始 WAV 音频。
 
@@ -140,10 +156,12 @@ voice-input asr test --file sample.wav         # 原生完整音频识别
 | 实现原理 | [Architecture](https://github.com/Saco93/voice-input/wiki/Architecture) | [实现原理](https://github.com/Saco93/voice-input/wiki/Architecture.zh-CN) |
 | 安装 | [Installation](https://github.com/Saco93/voice-input/wiki/Installation) | [安装指南](https://github.com/Saco93/voice-input/wiki/Installation.zh-CN) |
 | 配置 | [Configuration](https://github.com/Saco93/voice-input/wiki/Configuration) | [配置参考](https://github.com/Saco93/voice-input/wiki/Configuration.zh-CN) |
+| Agent 上下文 | [Agent Context](https://github.com/Saco93/voice-input/wiki/Agent-Context) | [Agent 上下文](https://github.com/Saco93/voice-input/wiki/Agent-Context.zh-CN) |
+| 桌面集成 | [Desktop Integration](https://github.com/Saco93/voice-input/wiki/Desktop-Integration) | [桌面集成](https://github.com/Saco93/voice-input/wiki/Desktop-Integration.zh-CN) |
+| 安全与隐私 | [Security and Privacy](https://github.com/Saco93/voice-input/wiki/Security-and-Privacy) | [安全与隐私](https://github.com/Saco93/voice-input/wiki/Security-and-Privacy.zh-CN) |
 | 故障排查 | [Troubleshooting](https://github.com/Saco93/voice-input/wiki/Troubleshooting) | [故障排查](https://github.com/Saco93/voice-input/wiki/Troubleshooting.zh-CN) |
+| 开发指南 | [Development](https://github.com/Saco93/voice-input/wiki/Development) | [开发指南](https://github.com/Saco93/voice-input/wiki/Development.zh-CN) |
 | 开发与贡献 | [Contributing](CONTRIBUTING.md) | [贡献指南](CONTRIBUTING.zh-CN.md) |
-
-Wiki 还包含 Agent context、桌面集成、安全隐私和开发说明。
 
 ## 隐私
 
