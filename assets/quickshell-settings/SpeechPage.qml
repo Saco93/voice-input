@@ -63,9 +63,9 @@ SettingsPage {
             SettingCombo {
                 theme: root.theme
                 label: "Provider"
-                value: root.controller.value("asr.provider", "local-cli")
-                labels: ["Local CLI", "Alibaba Qwen realtime", "Qwen-Audio-3 (experimental)"]
-                values: ["local-cli", "alibaba-qwen-realtime", "alibaba-qwen-audio3"]
+                value: root.controller.value("asr.provider", "alibaba-qwen-audio3")
+                labels: ["Qwen-Audio-3", "Local CLI"]
+                values: ["alibaba-qwen-audio3", "local-cli"]
                 error: root.controller.errorFor("asr.provider")
                 enabled: !root.controller.busy
                 onSelected: (value) => {
@@ -101,7 +101,7 @@ SettingsPage {
         }
 
         SectionCard {
-            visible: root.controller.value("asr.provider", "local-cli") === "local-cli" || root.controller.value("asr.fallback_to_local", true) || root.controller.hasErrorPrefix("asr.backend_command") || root.controller.hasErrorPrefix("asr.engine") || root.controller.hasErrorPrefix("asr.model")
+            visible: root.controller.value("asr.provider", "alibaba-qwen-audio3") === "local-cli" || root.controller.value("asr.fallback_to_local", true) || root.controller.hasErrorPrefix("asr.backend_command") || root.controller.hasErrorPrefix("asr.engine") || root.controller.hasErrorPrefix("asr.model")
             theme: root.theme
             title: "Local recognition"
             description: "Local CLI backend used as the provider or fallback."
@@ -144,10 +144,10 @@ SettingsPage {
         }
 
         SectionCard {
-            visible: root.controller.value("asr.provider", "local-cli") === "alibaba-qwen-realtime" || root.controller.value("asr.provider", "local-cli") === "alibaba-qwen-audio3" || root.controller.errorFor("credentials.alibaba-api-key").length > 0
+            visible: root.controller.value("asr.provider", "alibaba-qwen-audio3") === "alibaba-qwen-audio3" || root.controller.errorFor("credentials.alibaba-api-key").length > 0
             theme: root.theme
             title: "Alibaba credential"
-            description: "Shared by Alibaba realtime and Qwen-Audio-3."
+            description: "Used by Qwen-Audio-3."
 
             SettingTextField {
                 theme: root.theme
@@ -168,54 +168,10 @@ SettingsPage {
         }
 
         SectionCard {
-            visible: root.controller.value("asr.provider", "local-cli") === "alibaba-qwen-realtime" || root.controller.hasErrorPrefix("asr.alibaba.")
+            visible: root.controller.value("asr.provider", "alibaba-qwen-audio3") === "alibaba-qwen-audio3" || root.controller.hasErrorPrefix("asr.alibaba_audio3.") || root.controller.audio3VocabularyDirty
             theme: root.theme
-            title: "Alibaba realtime"
-            description: "Realtime recognition behavior."
-
-            SettingTextField {
-                theme: root.theme
-                label: "Realtime model"
-                value: root.controller.value("asr.alibaba.model", "")
-                error: root.controller.errorFor("asr.alibaba.model")
-                enabled: !root.controller.busy
-                onEdited: (value) => {
-                    return root.controller.setValue("asr.alibaba.model", value);
-                }
-            }
-
-            SettingCombo {
-                theme: root.theme
-                label: "Turn mode"
-                value: root.controller.value("asr.alibaba.turn_mode", "server-vad")
-                labels: ["Server VAD", "Manual commit"]
-                values: ["server-vad", "manual"]
-                error: root.controller.errorFor("asr.alibaba.turn_mode")
-                enabled: !root.controller.busy
-                onSelected: (value) => {
-                    return root.controller.setValue("asr.alibaba.turn_mode", value);
-                }
-            }
-
-        }
-
-        SectionCard {
-            visible: root.controller.value("asr.provider", "local-cli") === "alibaba-qwen-audio3" || root.controller.hasErrorPrefix("asr.alibaba_audio3.") || root.controller.audio3VocabularyDirty
-            theme: root.theme
-            title: "Qwen-Audio-3 (experimental)"
-            description: "Experimental provider; behavior and API compatibility may change."
-
-            SettingSwitch {
-                theme: root.theme
-                label: "I understand and enable experimental Qwen-Audio-3"
-                checked: root.controller.value("asr.alibaba_audio3.experimental_enabled", false)
-                help: "Selecting the provider does not enable this acknowledgement."
-                error: root.controller.errorFor("asr.alibaba_audio3.experimental_enabled")
-                enabled: !root.controller.busy
-                onToggled: (checked) => {
-                    return root.controller.setValue("asr.alibaba_audio3.experimental_enabled", checked);
-                }
-            }
+            title: "Qwen-Audio-3"
+            description: "Primary streaming recognition with an optional native final pass."
 
             SettingCombo {
                 theme: root.theme
@@ -367,7 +323,7 @@ SettingsPage {
             SectionCard {
                 theme: root.theme
                 title: "Recognition timeouts"
-                showDivider: alibabaTuningCard.visible || alibabaFinalPassCard.visible || audio3StreamingCard.visible || audio3NativeCard.visible
+                showDivider: audio3StreamingCard.visible || audio3NativeCard.visible
 
                 SettingTextField {
                     theme: root.theme
@@ -396,118 +352,9 @@ SettingsPage {
             }
 
             SectionCard {
-                id: alibabaTuningCard
-
-                visible: root.controller.value("asr.provider", "local-cli") === "alibaba-qwen-realtime" || root.controller.hasErrorPrefix("asr.alibaba.")
-                theme: root.theme
-                title: "Alibaba tuning"
-                showDivider: alibabaFinalPassCard.visible || audio3StreamingCard.visible || audio3NativeCard.visible
-
-                SettingTextField {
-                    theme: root.theme
-                    label: "Endpoint"
-                    value: root.controller.value("asr.alibaba.endpoint", "")
-                    error: root.controller.errorFor("asr.alibaba.endpoint")
-                    enabled: !root.controller.busy
-                    onEdited: (value) => {
-                        return root.controller.setValue("asr.alibaba.endpoint", value);
-                    }
-                }
-
-                SettingTextField {
-                    theme: root.theme
-                    label: "VAD threshold"
-                    value: root.controller.value("asr.alibaba.vad_threshold", 0.2)
-                    error: root.controller.errorFor("asr.alibaba.vad_threshold")
-                    enabled: !root.controller.busy
-                    onEdited: (value) => {
-                        return root.controller.setValue("asr.alibaba.vad_threshold", value);
-                    }
-                }
-
-                SettingTextField {
-                    theme: root.theme
-                    label: "Silence duration"
-                    value: root.controller.value("asr.alibaba.silence_duration_ms", 400)
-                    help: "Milliseconds."
-                    error: root.controller.errorFor("asr.alibaba.silence_duration_ms")
-                    enabled: !root.controller.busy
-                    onEdited: (value) => {
-                        return root.controller.setValue("asr.alibaba.silence_duration_ms", value);
-                    }
-                }
-
-            }
-
-            SectionCard {
-                id: alibabaFinalPassCard
-
-                visible: root.controller.value("asr.provider", "local-cli") === "alibaba-qwen-realtime" || root.controller.hasErrorPrefix("asr.alibaba.final_pass_")
-                theme: root.theme
-                title: "Alibaba final pass"
-                showDivider: audio3StreamingCard.visible || audio3NativeCard.visible
-
-                SettingSwitch {
-                    theme: root.theme
-                    label: "Enable final pass"
-                    checked: root.controller.value("asr.alibaba.final_pass_enabled", false)
-                    enabled: !root.controller.busy
-                    onToggled: (checked) => {
-                        return root.controller.setValue("asr.alibaba.final_pass_enabled", checked);
-                    }
-                }
-
-                SettingTextField {
-                    theme: root.theme
-                    label: "Base URL"
-                    value: root.controller.value("asr.alibaba.final_pass_base_url", "")
-                    error: root.controller.errorFor("asr.alibaba.final_pass_base_url")
-                    enabled: !root.controller.busy
-                    onEdited: (value) => {
-                        return root.controller.setValue("asr.alibaba.final_pass_base_url", value);
-                    }
-                }
-
-                SettingTextField {
-                    theme: root.theme
-                    label: "Model"
-                    value: root.controller.value("asr.alibaba.final_pass_model", "")
-                    error: root.controller.errorFor("asr.alibaba.final_pass_model")
-                    enabled: !root.controller.busy
-                    onEdited: (value) => {
-                        return root.controller.setValue("asr.alibaba.final_pass_model", value);
-                    }
-                }
-
-                SettingTextField {
-                    theme: root.theme
-                    label: "Timeout"
-                    value: root.controller.value("asr.alibaba.final_pass_timeout_ms", 20000)
-                    help: "Milliseconds."
-                    error: root.controller.errorFor("asr.alibaba.final_pass_timeout_ms")
-                    enabled: !root.controller.busy
-                    onEdited: (value) => {
-                        return root.controller.setValue("asr.alibaba.final_pass_timeout_ms", value);
-                    }
-                }
-
-                SettingSwitch {
-                    theme: root.theme
-                    label: "Enable ITN"
-                    checked: root.controller.value("asr.alibaba.final_pass_enable_itn", false)
-                    help: "Apply inverse text normalization."
-                    enabled: !root.controller.busy
-                    onToggled: (checked) => {
-                        return root.controller.setValue("asr.alibaba.final_pass_enable_itn", checked);
-                    }
-                }
-
-            }
-
-            SectionCard {
                 id: audio3StreamingCard
 
-                visible: root.controller.value("asr.provider", "local-cli") === "alibaba-qwen-audio3" || root.controller.hasErrorPrefix("asr.alibaba_audio3.endpoint") || root.controller.hasErrorPrefix("asr.alibaba_audio3.model") || root.controller.hasErrorPrefix("asr.alibaba_audio3.max_sentence_silence_ms") || root.controller.hasErrorPrefix("asr.alibaba_audio3.semantic_punctuation_enabled") || root.controller.hasErrorPrefix("asr.alibaba_audio3.multi_threshold_mode_enabled") || root.controller.hasErrorPrefix("asr.alibaba_audio3.speech_noise_threshold")
+                visible: root.controller.value("asr.provider", "alibaba-qwen-audio3") === "alibaba-qwen-audio3" || root.controller.hasErrorPrefix("asr.alibaba_audio3.endpoint") || root.controller.hasErrorPrefix("asr.alibaba_audio3.model") || root.controller.hasErrorPrefix("asr.alibaba_audio3.max_sentence_silence_ms") || root.controller.hasErrorPrefix("asr.alibaba_audio3.semantic_punctuation_enabled") || root.controller.hasErrorPrefix("asr.alibaba_audio3.multi_threshold_mode_enabled") || root.controller.hasErrorPrefix("asr.alibaba_audio3.speech_noise_threshold")
                 theme: root.theme
                 title: "Qwen-Audio-3 streaming"
                 showDivider: audio3NativeCard.visible
@@ -611,7 +458,7 @@ SettingsPage {
             SectionCard {
                 id: audio3NativeCard
 
-                visible: root.controller.value("asr.provider", "local-cli") === "alibaba-qwen-audio3" || root.controller.hasErrorPrefix("asr.alibaba_audio3.native_")
+                visible: root.controller.value("asr.provider", "alibaba-qwen-audio3") === "alibaba-qwen-audio3" || root.controller.hasErrorPrefix("asr.alibaba_audio3.native_")
                 theme: root.theme
                 title: "Qwen-Audio-3 native final pass"
                 showDivider: false

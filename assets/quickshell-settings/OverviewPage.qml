@@ -17,10 +17,8 @@ SettingsPage {
         switch (value) {
         case "local-cli":
             return root.theme.tr("Local CLI");
-        case "alibaba-qwen-realtime":
-            return root.theme.tr("Alibaba Qwen realtime");
         case "alibaba-qwen-audio3":
-            return root.theme.tr("Qwen-Audio-3 (experimental)");
+            return root.theme.tr("Qwen-Audio-3");
         default:
             return root.theme.tr("Unknown provider");
         }
@@ -44,7 +42,6 @@ SettingsPage {
                 Label {
                     text: root.serviceUnit
                     color: root.theme.foreground
-                    font.family: root.theme.fontFamily
                     font.pixelSize: 12
                     font.weight: Font.ExtraBold
                     elide: Text.ElideRight
@@ -54,7 +51,6 @@ SettingsPage {
                 Label {
                     text: root.runtimeSummary
                     color: root.theme.subtle
-                    font.family: root.theme.fontFamily
                     font.weight: Font.ExtraBold
                     font.pixelSize: 11
                     wrapMode: Text.WordWrap
@@ -66,7 +62,6 @@ SettingsPage {
             Label {
                 text: root.serviceSummary
                 color: root.serviceRunning === false ? root.theme.error : root.theme.foreground
-                font.family: root.theme.fontFamily
                 font.pixelSize: 12
                 font.weight: Font.ExtraBold
             }
@@ -86,7 +81,7 @@ SettingsPage {
             SummaryCard {
                 theme: root.theme
                 title: "Speech"
-                summary: root.providerLabel(root.controller.value("asr.provider", "local-cli"))
+                summary: root.providerLabel(root.controller.value("asr.provider", "alibaba-qwen-audio3"))
                 detail: "Language: " + root.controller.value("asr.language", "simplified-chinese")
                 onActivated: root.navigateRequested("Speech")
             }

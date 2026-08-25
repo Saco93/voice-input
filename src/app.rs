@@ -207,7 +207,6 @@ fn open_settings() -> Result<()> {
         .args(["--daemonize", "--no-duplicate", "--path"])
         .arg(settings_dir)
         .env("VOICE_INPUT_BIN", paths::current_executable()?)
-        .env("VOICE_INPUT_FONT_PATH", paths::ui_font_path()?)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -267,19 +266,15 @@ fn load_audio3_test_config(command: &str) -> Result<Config> {
     if config.asr.provider != AsrProvider::AlibabaQwenAudio3 {
         bail!("{command} requires selected provider `alibaba-qwen-audio3`");
     }
-    if !config.asr.alibaba_audio3.experimental_enabled {
-        bail!("{command} requires `asr.alibaba_audio3.experimental_enabled = true`");
-    }
     Ok(config)
 }
 
 fn apply_audio3_test_credentials(config: &mut Config) -> Result<()> {
     crate::credentials::apply_runtime_credentials(config)?;
     if config.asr.alibaba_audio3.api_key.trim().is_empty() {
-        let api_key = crate::credentials::decrypt(crate::credentials::ALIBABA_CREDENTIAL_ID)
-            .context("failed to load encrypted Alibaba credential")?;
-        config.asr.alibaba.api_key = api_key.clone();
-        config.asr.alibaba_audio3.api_key = api_key;
+        config.asr.alibaba_audio3.api_key =
+            crate::credentials::decrypt(crate::credentials::ALIBABA_CREDENTIAL_ID)
+                .context("failed to load encrypted Alibaba credential")?;
     }
     Ok(())
 }
@@ -583,7 +578,7 @@ mod tests {
         let config = Config::default();
         let unavailable = SupportPayload::new(&config, None);
         let text = format_diagnostics(&unavailable, OutputFormat::Text).unwrap();
-        assert!(text.starts_with("Voice Input diagnostics (schema 4)\n"));
+        assert!(text.starts_with("Voice Input diagnostics (schema 5)\n"));
         assert!(text.contains("Runtime: unavailable\n"));
         assert!(text.contains("Session: none\n"));
 
@@ -593,8 +588,8 @@ mod tests {
             schema_version: DIAGNOSTICS_SCHEMA_VERSION,
             session: Some(SessionDiagnostics::new(
                 7,
-                Provider::AlibabaQwenRealtime,
-                FinalPassKind::AlibabaCompatible,
+                Provider::AlibabaQwenAudio3,
+                FinalPassKind::QwenAudio3Native,
                 true,
             )),
         };
@@ -608,15 +603,13 @@ mod tests {
         let payload = SupportPayload::new(&config, Some(&snapshot));
         let text = format_diagnostics(&payload, OutputFormat::Text).unwrap();
         assert!(text.contains("Runtime: available (phase=idle, updated-at-ms=1234)"));
-        assert!(
-            text.contains("Session: 7 (asr-outcome=completed, provider=alibaba-qwen-realtime)")
-        );
+        assert!(text.contains("Session: 7 (asr-outcome=completed, provider=alibaba-qwen-audio3)"));
         assert!(text.contains("Streaming: completed, ready-latency-ms=12"));
         assert!(text.contains("Total ASR latency: 345 ms"));
 
         let json = format_diagnostics(&payload, OutputFormat::Json).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(parsed["schema_version"], 4);
+        assert_eq!(parsed["schema_version"], 5);
         assert_eq!(parsed["session"]["session_id"], 7);
         assert_eq!(parsed["session"]["asr_outcome"], "completed");
         assert!(parsed["session"].get("outcome").is_none());
@@ -682,6 +675,7 @@ mod tests {
     #[test]
     fn focus_capture_is_gated_by_active_consumers() {
         let mut config = Config::default();
+        config.asr.provider = AsrProvider::LocalCli;
         assert!(!record_action_needs_focus(&config, RecordAction::Start));
         assert!(!record_action_needs_focus(&config, RecordAction::Stop));
 

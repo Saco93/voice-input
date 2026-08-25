@@ -7,7 +7,7 @@ use crate::{
     state::{Phase, Snapshot},
 };
 
-pub const DIAGNOSTICS_SCHEMA_VERSION: u32 = 4;
+pub const DIAGNOSTICS_SCHEMA_VERSION: u32 = 5;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
@@ -543,7 +543,6 @@ pub struct LocalFallbackStage {
 pub enum Provider {
     #[default]
     LocalCli,
-    AlibabaQwenRealtime,
     AlibabaQwenAudio3,
 }
 
@@ -551,7 +550,6 @@ impl Provider {
     pub fn as_str(self) -> &'static str {
         match self {
             Self::LocalCli => "local-cli",
-            Self::AlibabaQwenRealtime => "alibaba-qwen-realtime",
             Self::AlibabaQwenAudio3 => "alibaba-qwen-audio3",
         }
     }
@@ -561,7 +559,6 @@ impl From<AsrProvider> for Provider {
     fn from(provider: AsrProvider) -> Self {
         match provider {
             AsrProvider::LocalCli => Self::LocalCli,
-            AsrProvider::AlibabaQwenRealtime => Self::AlibabaQwenRealtime,
             AsrProvider::AlibabaQwenAudio3 => Self::AlibabaQwenAudio3,
         }
     }
@@ -684,7 +681,6 @@ pub enum FinalPassKind {
     #[default]
     None,
     QwenAudio3Native,
-    AlibabaCompatible,
 }
 
 impl FinalPassKind {
@@ -692,7 +688,6 @@ impl FinalPassKind {
         match self {
             Self::None => "none",
             Self::QwenAudio3Native => "qwen-audio3-native",
-            Self::AlibabaCompatible => "alibaba-compatible",
         }
     }
 }
@@ -704,7 +699,6 @@ pub enum SelectedResult {
     Pending,
     Streaming,
     QwenAudio3Native,
-    AlibabaCompatibleFinal,
     LocalPrimary,
     LocalFallback,
     None,
@@ -716,7 +710,6 @@ impl SelectedResult {
             Self::Pending => "pending",
             Self::Streaming => "streaming",
             Self::QwenAudio3Native => "qwen-audio3-native",
-            Self::AlibabaCompatibleFinal => "alibaba-compatible-final",
             Self::LocalPrimary => "local-primary",
             Self::LocalFallback => "local-fallback",
             Self::None => "none",
@@ -873,7 +866,6 @@ impl SafeConfigSummary {
     fn from_config(config: &Config) -> Self {
         let final_pass_enabled = match config.asr.provider {
             AsrProvider::LocalCli => false,
-            AsrProvider::AlibabaQwenRealtime => config.asr.alibaba.final_pass_enabled,
             AsrProvider::AlibabaQwenAudio3 => {
                 config.asr.alibaba_audio3.native_final_pass_mode
                     != NativeFinalPassMode::StreamingOnly
@@ -952,8 +944,8 @@ mod tests {
             json!("qwen-audio3-native")
         );
         assert_eq!(
-            serde_json::to_value(SelectedResult::AlibabaCompatibleFinal).unwrap(),
-            json!("alibaba-compatible-final")
+            serde_json::to_value(SelectedResult::QwenAudio3Native).unwrap(),
+            json!("qwen-audio3-native")
         );
         assert_eq!(
             serde_json::to_value(SelectedResult::LocalPrimary).unwrap(),
@@ -1178,7 +1170,7 @@ mod tests {
         let mut snapshot = crate::state::Snapshot::idle(&config);
         snapshot.diagnostics = restored;
         let support = SupportPayload::new(&config, Some(&snapshot));
-        assert_eq!(support.schema_version, 4);
+        assert_eq!(support.schema_version, 5);
     }
 
     #[test]
@@ -1202,12 +1194,7 @@ mod tests {
     #[test]
     fn starting_a_session_replaces_the_previous_record() {
         let mut diagnostics = Diagnostics::inactive();
-        diagnostics.start_session(
-            3,
-            Provider::AlibabaQwenRealtime,
-            FinalPassKind::AlibabaCompatible,
-            true,
-        );
+        diagnostics.start_session(3, Provider::LocalCli, FinalPassKind::None, false);
         diagnostics.update_session(3, |session| {
             session.asr_outcome = OverallOutcome::Failed;
         });
@@ -1455,7 +1442,7 @@ mod tests {
 
         let payload = SupportPayload::new(&config, None);
         let json = serde_json::to_value(&payload).unwrap();
-        assert_eq!(json["schema_version"], 4);
+        assert_eq!(json["schema_version"], 5);
         assert_eq!(json["config"]["endpoint_mode"], "custom");
         assert_eq!(json["config"]["region"], "singapore");
         assert_eq!(json["config"]["audio3_native_final_pass_mode"], "adaptive");
@@ -1517,7 +1504,7 @@ mod tests {
             "audio3_semantic_punctuation_enabled": false,
             "audio3_vocabulary_count": 0
         }))
-        .expect("older schema 4/3 safe summaries remain readable");
+        .expect("older schema 4/3 safe summaries remain readable under schema 5");
         assert_eq!(summary.endpoint_mode, Audio3EndpointMode::Regional);
         assert_eq!(summary.region, Audio3Region::Beijing);
         assert!(

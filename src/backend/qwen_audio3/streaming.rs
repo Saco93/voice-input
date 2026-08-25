@@ -139,11 +139,8 @@ fn run_session(
     event_tx: mpsc::Sender<AsrEvent>,
 ) -> Result<()> {
     let audio3 = &config.asr.alibaba_audio3;
-    if !audio3.experimental_enabled {
-        bail!("experimental Qwen-Audio-3 ASR is not enabled");
-    }
     if audio3.api_key.trim().is_empty() {
-        bail!("experimental Qwen-Audio-3 ASR requires an API key");
+        bail!("Qwen-Audio-3 ASR requires an API key");
     }
 
     let context_wait_budget = Duration::from_millis(config.asr.connect_timeout_ms.min(5_000));
@@ -2583,7 +2580,7 @@ mod tests {
     #[test]
     fn reconnect_replays_exact_prefix_to_distinct_task_and_only_replacement_final_survives() {
         let mut config = crate::config::Config::default();
-        config.asr.alibaba_audio3.experimental_enabled = true;
+
         config.asr.alibaba_audio3.api_key = "test".into();
         let first_id = "11111111-1111-1111-1111-111111111111";
         let second_id = "22222222-2222-2222-2222-222222222222";
@@ -2733,7 +2730,7 @@ mod tests {
     #[test]
     fn finish_during_replacement_startup_waits_for_full_replay() {
         let mut config = crate::config::Config::default();
-        config.asr.alibaba_audio3.experimental_enabled = true;
+
         config.asr.alibaba_audio3.api_key = "test".into();
         let first_id = "11111111-1111-1111-1111-111111111111";
         let second_id = "22222222-2222-2222-2222-222222222222";
@@ -2844,7 +2841,7 @@ mod tests {
     #[test]
     fn cancellation_during_replay_closes_replacement_without_terminal_events() {
         let mut config = crate::config::Config::default();
-        config.asr.alibaba_audio3.experimental_enabled = true;
+
         config.asr.alibaba_audio3.api_key = "test".into();
         let first_id = "11111111-1111-1111-1111-111111111111";
         let second_id = "22222222-2222-2222-2222-222222222222";
@@ -2944,7 +2941,7 @@ mod tests {
     #[test]
     fn second_disconnect_is_terminal_and_never_opens_a_third_socket() {
         let mut config = crate::config::Config::default();
-        config.asr.alibaba_audio3.experimental_enabled = true;
+
         config.asr.alibaba_audio3.api_key = "test".into();
         let first_id = "11111111-1111-1111-1111-111111111111";
         let second_id = "22222222-2222-2222-2222-222222222222";
@@ -3040,7 +3037,7 @@ mod tests {
     #[test]
     fn protocol_error_is_terminal_without_reconnect() {
         let mut config = crate::config::Config::default();
-        config.asr.alibaba_audio3.experimental_enabled = true;
+
         config.asr.alibaba_audio3.api_key = "test".into();
         let (script_tx, script_rx) = mpsc::channel();
         let (sent_tx, sent_rx) = mpsc::channel();
@@ -3101,7 +3098,7 @@ mod tests {
     #[test]
     fn disconnect_after_finish_is_terminal_without_reconnect() {
         let mut config = crate::config::Config::default();
-        config.asr.alibaba_audio3.experimental_enabled = true;
+
         config.asr.alibaba_audio3.api_key = "test".into();
         let (script_tx, script_rx) = mpsc::channel();
         let (sent_tx, sent_rx) = mpsc::channel();
@@ -3169,7 +3166,7 @@ mod tests {
     #[test]
     fn task_failed_is_terminal_without_reconnect() {
         let mut config = crate::config::Config::default();
-        config.asr.alibaba_audio3.experimental_enabled = true;
+
         config.asr.alibaba_audio3.api_key = "test".into();
         let (script_tx, script_rx) = mpsc::channel();
         let (sent_tx, sent_rx) = mpsc::channel();

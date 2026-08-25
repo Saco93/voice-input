@@ -15,7 +15,7 @@ QtObject {
     }
     readonly property string statePath: runtimeDirectory + "/voice-input/state.json"
     readonly property string waveformPath: runtimeDirectory + "/voice-input/waveform.sock"
-    readonly property string themePath: Quickshell.env("HOME") + "/.config/omarchy/current/theme/colors.toml"
+    readonly property string themePath: Quickshell.env("HOME") + "/.local/state/omarchy/current/theme/colors.toml"
     readonly property int waveformBarCount: 30
     readonly property int spectrumBandCount: 12
     readonly property int maximumTranscriptLength: 1024 * 1024
@@ -55,15 +55,25 @@ QtObject {
     property double lastWaveformSequence: -1
     property var themePalette: ({
         "accent": "#7dd3fc",
+        "background": "#101827",
         "foreground": "#eef2ff",
-        "warning": "#facc15",
+        "secondaryForeground": "#a8b3c7",
+        "muted": "#64748b",
+        "finalizing": "#67e8f9",
         "refining": "#c4b5fd",
+        "outputting": "#60a5fa",
+        "warning": "#facc15",
         "error": "#fb7185"
     })
     readonly property color themeAccent: themePalette.accent
+    readonly property color themeBackground: themePalette.background
     readonly property color themeForeground: themePalette.foreground
-    readonly property color themeWarning: themePalette.warning
+    readonly property color themeSecondaryForeground: themePalette.secondaryForeground
+    readonly property color themeMuted: themePalette.muted
+    readonly property color themeFinalizing: themePalette.finalizing
     readonly property color themeRefining: themePalette.refining
+    readonly property color themeOutputting: themePalette.outputting
+    readonly property color themeWarning: themePalette.warning
     readonly property color themeError: themePalette.error
     property var snapshot: ({
         "phase": "idle",
@@ -283,10 +293,15 @@ QtObject {
             const source = themeFile.text();
             const next = {
                 "accent": themeColor(source, "accent", themePalette.accent),
+                "background": themeColor(source, "background", themePalette.background),
                 "foreground": themeColor(source, "foreground", themePalette.foreground),
-                "warning": themeColor(source, "color3", themePalette.warning),
-                "refining": themeColor(source, "color5", themePalette.refining),
-                "error": themeColor(source, "color1", themePalette.error)
+                "secondaryForeground": themeColor(source, "dark_foreground", themePalette.secondaryForeground),
+                "muted": themeColor(source, "muted", themePalette.muted),
+                "finalizing": themeColor(source, "cyan", themePalette.finalizing),
+                "refining": themeColor(source, "magenta", themePalette.refining),
+                "outputting": themeColor(source, "blue", themePalette.outputting),
+                "warning": themeColor(source, "yellow", themePalette.warning),
+                "error": themeColor(source, "red", themePalette.error)
             };
             if (JSON.stringify(next) !== JSON.stringify(themePalette)) {
                 themePalette = next;

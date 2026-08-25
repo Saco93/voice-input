@@ -4,6 +4,11 @@ import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 
 const MAX_REFERENCE_CHARS = 12_000;
+const REGISTRY_OWNER_KEY = Symbol.for("voice-input-session-registry:owner");
+
+type RegistryOwner = {
+  instanceId: string;
+};
 
 type RegistrySnapshot = {
   sessionId: string;
@@ -58,19 +63,43 @@ function captureSnapshot(ctx: ExtensionContext): RegistrySnapshot | undefined {
 }
 
 export default function (pi: ExtensionAPI) {
+  const instanceId = randomUUID();
+  const processState = globalThis as typeof globalThis & Record<symbol, unknown>;
+  if (processState[REGISTRY_OWNER_KEY]) {
+    // Embedded AgentSessions reload normal extensions in the same Pi process.
+    // The first activation belongs to the interactive parent session; child
+    // activations must not replace its process-scoped registry.
+    return;
+  }
+  processState[REGISTRY_OWNER_KEY] = { instanceId } satisfies RegistryOwner;
+
   const runtime = process.env.XDG_RUNTIME_DIR;
   const directory = runtime ? join(runtime, "voice-input", "agent-sessions") : undefined;
   const registry = directory ? join(directory, `pi-${process.pid}.json`) : undefined;
-  const instanceId = randomUUID();
   let heartbeat: ReturnType<typeof setInterval> | undefined;
   let currentContext: ExtensionContext | undefined;
+  let ownerSessionId: string | undefined;
+  let ownerSessionFile: string | undefined;
   let generation = 0;
   let stopped = true;
   let pendingWrite: Promise<void> = Promise.resolve();
   let cachedStartTicks: number | undefined;
 
+  function ownsProcessRegistry(): boolean {
+    const owner = processState[REGISTRY_OWNER_KEY] as RegistryOwner | undefined;
+    return owner?.instanceId === instanceId;
+  }
+
+  function ownsSession(ctx: ExtensionContext): boolean {
+    return (
+      ownsProcessRegistry() &&
+      ctx.sessionManager.getSessionId() === ownerSessionId &&
+      ctx.sessionManager.getSessionFile() === ownerSessionFile
+    );
+  }
+
   function isCurrent(expectedGeneration: number): boolean {
-    return !stopped && generation === expectedGeneration;
+    return ownsProcessRegistry() && !stopped && generation === expectedGeneration;
   }
 
   async function getProcessStartTicks(): Promise<number> {
@@ -140,6 +169,7 @@ export default function (pi: ExtensionAPI) {
   }
 
   function queuePublish(ctx: ExtensionContext): Promise<void> {
+    if (!ownsSession(ctx)) return Promise.resolve();
     const expectedGeneration = generation;
     let snapshot: RegistrySnapshot | undefined;
     try {
@@ -158,7 +188,7 @@ export default function (pi: ExtensionAPI) {
   }
 
   async function refresh(ctx: ExtensionContext): Promise<void> {
-    if (stopped) return;
+    if (stopped || !ownsSession(ctx)) return;
     currentContext = ctx;
     await queuePublish(ctx).catch(() => {});
   }
@@ -175,9 +205,12 @@ export default function (pi: ExtensionAPI) {
   }
 
   pi.on("session_start", async (_event, ctx) => {
+    if (!ownsProcessRegistry()) return;
     generation += 1;
     stopped = false;
     currentContext = ctx;
+    ownerSessionId = ctx.sessionManager.getSessionId();
+    ownerSessionFile = ctx.sessionManager.getSessionFile();
     startHeartbeat(generation);
     await queuePublish(ctx).catch(() => {});
   });
@@ -199,9 +232,12 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("session_shutdown", async () => {
+    if (!ownsProcessRegistry()) return;
     stopped = true;
     generation += 1;
     currentContext = undefined;
+    ownerSessionId = undefined;
+    ownerSessionFile = undefined;
     if (heartbeat) clearInterval(heartbeat);
     heartbeat = undefined;
 
@@ -210,5 +246,8 @@ export default function (pi: ExtensionAPI) {
     // only the file still owned by this extension instance.
     await pendingWrite;
     await removeOwnedRegistry();
+    if (ownsProcessRegistry()) {
+      delete processState[REGISTRY_OWNER_KEY];
+    }
   });
 }

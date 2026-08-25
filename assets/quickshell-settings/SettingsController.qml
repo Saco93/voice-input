@@ -80,7 +80,7 @@ QtObject {
                 "pre_roll_ms": 500
             },
             "asr": {
-                "provider": "local-cli",
+                "provider": "alibaba-qwen-audio3",
                 "backend_command": "/usr/bin/voxtype",
                 "engine": "sensevoice",
                 "model": "",
@@ -88,20 +88,7 @@ QtObject {
                 "connect_timeout_ms": 5000,
                 "finalize_timeout_ms": 8000,
                 "fallback_to_local": true,
-                "alibaba": {
-                    "endpoint": "wss://dashscope.aliyuncs.com/api-ws/v1/realtime",
-                    "model": "qwen3-asr-flash-realtime-2026-02-10",
-                    "turn_mode": "server-vad",
-                    "vad_threshold": 0.2,
-                    "silence_duration_ms": 400,
-                    "final_pass_enabled": false,
-                    "final_pass_base_url": "",
-                    "final_pass_model": "qwen3-asr-flash-2026-02-10",
-                    "final_pass_timeout_ms": 20000,
-                    "final_pass_enable_itn": false
-                },
                 "alibaba_audio3": {
-                    "experimental_enabled": false,
                     "endpoint_mode": "regional",
                     "region": "beijing",
                     "endpoint": "wss://dashscope.aliyuncs.com/api-ws/v1/inference",
@@ -234,9 +221,6 @@ QtObject {
 
     function withoutPlaintextSecrets(config) {
         const safe = clone(config);
-        if (safe.asr && safe.asr.alibaba)
-            delete safe.asr.alibaba.api_key;
-
         if (safe.asr && safe.asr.alibaba_audio3)
             delete safe.asr.alibaba_audio3.api_key;
 
@@ -344,8 +328,8 @@ QtObject {
     }
 
     function fieldNeedsAdvanced(path) {
-        const audio3Advanced = path.indexOf("asr.alibaba_audio3.") === 0 && path !== "asr.alibaba_audio3.experimental_enabled" && path !== "asr.alibaba_audio3.endpoint_mode" && path !== "asr.alibaba_audio3.region" && path !== "asr.alibaba_audio3.language_hints_enabled" && path !== "asr.alibaba_audio3.heartbeat_enabled" && path !== "asr.alibaba_audio3.recognition_preset" && path !== "asr.alibaba_audio3.vocabulary" && path !== "asr.alibaba_audio3.native_final_pass_mode";
-        return path === "audio.sample_rate" || path === "audio.partial_interval_ms" || path === "audio.pre_roll_ms" || path === "asr.connect_timeout_ms" || path === "asr.finalize_timeout_ms" || path.indexOf("asr.alibaba.endpoint") === 0 || path.indexOf("asr.alibaba.vad_") === 0 || path.indexOf("asr.alibaba.silence_") === 0 || path.indexOf("asr.alibaba.final_pass_") === 0 || audio3Advanced || path === "llm.api_base_url" || path === "llm.timeout_ms" || path === "llm.provider_sort" || path === "llm.agent_context_max_chars" || path === "output.type_delay_ms" || path === "output.pre_type_delay_ms" || path === "output.paste_keys" || path === "output.prefer_paste_for_xwayland" || path === "output.xwayland_paste_keys" || path === "hud.margin_bottom" || path === "hud.height" || path === "hud.offset_x" || path === "hud.offset_y" || path === "hud.nudge_step";
+        const audio3Advanced = path.indexOf("asr.alibaba_audio3.") === 0 && path !== "asr.alibaba_audio3.endpoint_mode" && path !== "asr.alibaba_audio3.region" && path !== "asr.alibaba_audio3.language_hints_enabled" && path !== "asr.alibaba_audio3.heartbeat_enabled" && path !== "asr.alibaba_audio3.recognition_preset" && path !== "asr.alibaba_audio3.vocabulary" && path !== "asr.alibaba_audio3.native_final_pass_mode";
+        return path === "audio.sample_rate" || path === "audio.partial_interval_ms" || path === "audio.pre_roll_ms" || path === "asr.connect_timeout_ms" || path === "asr.finalize_timeout_ms" || audio3Advanced || path === "llm.api_base_url" || path === "llm.timeout_ms" || path === "llm.provider_sort" || path === "llm.agent_context_max_chars" || path === "output.type_delay_ms" || path === "output.pre_type_delay_ms" || path === "output.paste_keys" || path === "output.prefer_paste_for_xwayland" || path === "output.xwayland_paste_keys" || path === "hud.margin_bottom" || path === "hud.height" || path === "hud.offset_x" || path === "hud.offset_y" || path === "hud.nudge_step";
     }
 
     function errorCountForPage(page) {
@@ -485,12 +469,11 @@ QtObject {
         fieldErrors = ({
         });
         const config = withoutPlaintextSecrets(draft);
-        const unsignedIntegers = [["audio.sample_rate", 1], ["audio.max_duration_secs", 0], ["audio.partial_interval_ms", 0], ["audio.pre_roll_ms", 0], ["asr.connect_timeout_ms", 0], ["asr.finalize_timeout_ms", 0], ["asr.alibaba.silence_duration_ms", 0], ["asr.alibaba.final_pass_timeout_ms", 0], ["asr.alibaba_audio3.max_sentence_silence_ms", 0], ["asr.alibaba_audio3.native_timeout_ms", 0], ["output.type_delay_ms", 0], ["output.pre_type_delay_ms", 0], ["llm.timeout_ms", 0], ["llm.agent_context_max_chars", 0]];
+        const unsignedIntegers = [["audio.sample_rate", 1], ["audio.max_duration_secs", 0], ["audio.partial_interval_ms", 0], ["audio.pre_roll_ms", 0], ["asr.connect_timeout_ms", 0], ["asr.finalize_timeout_ms", 0], ["asr.alibaba_audio3.max_sentence_silence_ms", 0], ["asr.alibaba_audio3.native_timeout_ms", 0], ["output.type_delay_ms", 0], ["output.pre_type_delay_ms", 0], ["llm.timeout_ms", 0], ["llm.agent_context_max_chars", 0]];
         const signedIntegers = ["hud.margin_bottom", "hud.height", "hud.offset_x", "hud.offset_y", "hud.nudge_step"];
         let valid = true;
         for (let i = 0; i < unsignedIntegers.length; ++i) valid = asNumber(config, unsignedIntegers[i][0], true, unsignedIntegers[i][1]) && valid
         for (let i = 0; i < signedIntegers.length; ++i) valid = asNumber(config, signedIntegers[i], true, null) && valid
-        valid = asNumber(config, "asr.alibaba.vad_threshold", false, null) && valid;
         const threshold = config.asr.alibaba_audio3.speech_noise_threshold;
         if (threshold !== null && threshold !== undefined) {
             if (String(threshold).trim().length === 0) {
@@ -686,7 +669,6 @@ QtObject {
             && isPlainObject(candidate.hotkey)
             && isPlainObject(candidate.audio)
             && isPlainObject(candidate.asr)
-            && isPlainObject(candidate.asr.alibaba)
             && isPlainObject(candidate.asr.alibaba_audio3)
             && Array.isArray(candidate.asr.alibaba_audio3.vocabulary)
             && isPlainObject(candidate.output)

@@ -12,7 +12,6 @@ PanelWindow {
 
     required property ShellScreen screenModel
     required property StateStore store
-    required property string fontFamily
     readonly property bool isFocusedScreen: {
         const focused = Hyprland.focusedMonitor;
         const monitor = Hyprland.monitorFor(screenModel);
@@ -207,13 +206,13 @@ PanelWindow {
             return store.themeAccent;
 
         if (finalizing)
-            return "#AAB7BE";
+            return store.themeFinalizing;
 
         if (refining)
-            return "#E8A9C4";
+            return store.themeRefining;
 
         if (outputting)
-            return "#7BA7D9";
+            return store.themeOutputting;
 
         if (store.phase === "error")
             return store.themeError;
@@ -497,9 +496,9 @@ PanelWindow {
         // the twenty-pixel text margins. A pill radius (height / 2) let the
         // top and bottom text rows escape past the curved border instead.
         radius: 14
-        color: Qt.rgba(0.067, 0.078, 0.106, 0.96)
+        color: Qt.alpha(store.themeBackground, 0.96)
         border.width: 1
-        border.color: Qt.alpha(store.themeForeground, 0.12)
+        border.color: Qt.alpha(store.themeMuted, 0.5)
         opacity: store.hudEnabled && store.active && panel.geometryReady ? 1 : 0
 
         Item {
@@ -529,7 +528,6 @@ PanelWindow {
                 y: implicitHeight <= parent.height ? (parent.height - implicitHeight) / 2 : parent.height - implicitHeight
                 text: panel.displayText
                 color: store.themeForeground
-                font.family: panel.fontFamily
                 font.pixelSize: 14
                 font.weight: Font.Bold
                 lineHeight: 1.28
@@ -559,12 +557,12 @@ PanelWindow {
                 gradient: Gradient {
                     GradientStop {
                         position: 0
-                        color: Qt.rgba(0.067, 0.078, 0.106, 1)
+                        color: store.themeBackground
                     }
 
                     GradientStop {
                         position: 1
-                        color: Qt.rgba(0.067, 0.078, 0.106, 0)
+                        color: Qt.alpha(store.themeBackground, 0)
                     }
 
                 }
@@ -589,7 +587,7 @@ PanelWindow {
                 anchors.right: parent.right
                 anchors.top: parent.top
                 height: 1
-                color: Qt.alpha(store.themeForeground, 0.1)
+                color: Qt.alpha(store.themeMuted, 0.45)
             }
 
             Row {
@@ -640,8 +638,7 @@ PanelWindow {
 
                 Text {
                     text: panel.phaseLabel
-                    color: Qt.alpha(store.themeForeground, 0.68)
-                    font.family: panel.fontFamily
+                    color: store.themeSecondaryForeground
                     font.pixelSize: 11
                     font.weight: Font.Bold
                 }
@@ -653,8 +650,7 @@ PanelWindow {
                 anchors.verticalCenter: parent.verticalCenter
                 anchors.verticalCenterOffset: 1
                 text: panel.formatRecordingDuration(panel.displayedRecordingDurationMs)
-                color: Qt.alpha(store.themeForeground, 0.62)
-                font.family: panel.fontFamily
+                color: Qt.alpha(store.themeSecondaryForeground, 0.92)
                 font.pixelSize: 11
                 font.weight: Font.Bold
             }

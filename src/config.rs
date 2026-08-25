@@ -62,47 +62,30 @@ pub struct AsrConfig {
     pub connect_timeout_ms: u64,
     pub finalize_timeout_ms: u64,
     pub fallback_to_local: bool,
-    pub alibaba: AlibabaRealtimeConfig,
+    #[serde(skip)]
+    plaintext_alibaba_credential_loaded: bool,
     pub alibaba_audio3: AlibabaAudio3Config,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct LegacyAlibabaCredentialConfig {
+    #[serde(default)]
+    endpoint: String,
+    #[serde(default)]
+    api_key: String,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
 pub enum AsrProvider {
-    #[default]
     LocalCli,
-    AlibabaQwenRealtime,
-    AlibabaQwenAudio3,
-}
-
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "kebab-case")]
-pub enum AlibabaTurnMode {
     #[default]
-    ServerVad,
-    Manual,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct AlibabaRealtimeConfig {
-    pub endpoint: String,
-    #[serde(default, skip_serializing)]
-    pub api_key: String,
-    pub model: String,
-    pub turn_mode: AlibabaTurnMode,
-    pub vad_threshold: f32,
-    pub silence_duration_ms: u32,
-    pub final_pass_enabled: bool,
-    pub final_pass_base_url: String,
-    pub final_pass_model: String,
-    pub final_pass_timeout_ms: u64,
-    pub final_pass_enable_itn: bool,
+    #[serde(alias = "alibaba-qwen-realtime")]
+    AlibabaQwenAudio3,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct AlibabaAudio3Config {
-    pub experimental_enabled: bool,
     pub endpoint_mode: Audio3EndpointMode,
     pub region: Audio3Region,
     /// Dormant in regional mode; retained for custom routing and migration.
@@ -279,7 +262,6 @@ impl NativeFinalPassMode {
 #[derive(Debug, Deserialize)]
 #[serde(default)]
 struct RawAlibabaAudio3Config {
-    experimental_enabled: bool,
     endpoint_mode: Option<Audio3EndpointMode>,
     region: Option<Audio3Region>,
     endpoint: String,
@@ -304,7 +286,6 @@ impl Default for RawAlibabaAudio3Config {
     fn default() -> Self {
         let defaults = AlibabaAudio3Config::default();
         Self {
-            experimental_enabled: defaults.experimental_enabled,
             endpoint_mode: None,
             region: None,
             endpoint: defaults.endpoint,
@@ -383,7 +364,6 @@ impl<'de> Deserialize<'de> for AlibabaAudio3Config {
             }
         });
         Ok(Self {
-            experimental_enabled: raw.experimental_enabled,
             endpoint_mode,
             region,
             endpoint: raw.endpoint,
@@ -493,11 +473,132 @@ struct RawConfig {
     hotkey: Option<RawHotkeyConfig>,
     audio: Option<RawAudioConfig>,
     whisper: Option<RawWhisperConfig>,
-    asr: Option<AsrConfig>,
+    asr: Option<RawAsrConfig>,
     output: Option<RawOutputConfig>,
     ime: Option<ImeConfig>,
     llm: Option<LlmConfig>,
     hud: Option<HudConfig>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+enum RawAsrProvider {
+    LocalCli,
+    AlibabaQwenRealtime,
+    AlibabaQwenAudio3,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(default)]
+struct RawAsrConfig {
+    provider: Option<RawAsrProvider>,
+    backend_command: String,
+    engine: String,
+    model: String,
+    language: Language,
+    connect_timeout_ms: u64,
+    finalize_timeout_ms: u64,
+    fallback_to_local: bool,
+    #[serde(rename = "alibaba")]
+    legacy_alibaba: LegacyAlibabaCredentialConfig,
+    alibaba_audio3: AlibabaAudio3Config,
+}
+
+impl Default for RawAsrConfig {
+    fn default() -> Self {
+        let defaults = AsrConfig::default();
+        Self {
+            provider: None,
+            backend_command: defaults.backend_command,
+            engine: defaults.engine,
+            model: defaults.model,
+            language: defaults.language,
+            connect_timeout_ms: defaults.connect_timeout_ms,
+            finalize_timeout_ms: defaults.finalize_timeout_ms,
+            fallback_to_local: defaults.fallback_to_local,
+            legacy_alibaba: LegacyAlibabaCredentialConfig::default(),
+            alibaba_audio3: defaults.alibaba_audio3,
+        }
+    }
+}
+
+impl RawAsrConfig {
+    fn into_config(mut self) -> AsrConfig {
+        let legacy_realtime_provider = self.provider == Some(RawAsrProvider::AlibabaQwenRealtime);
+        let plaintext_alibaba_credential_loaded =
+            !self.alibaba_audio3.api_key.is_empty() || !self.legacy_alibaba.api_key.is_empty();
+        if self.alibaba_audio3.api_key.is_empty() && !self.legacy_alibaba.api_key.is_empty() {
+            self.alibaba_audio3.api_key = self.legacy_alibaba.api_key.clone();
+        }
+        if legacy_realtime_provider {
+            migrate_legacy_realtime_route(&mut self.alibaba_audio3, &self.legacy_alibaba.endpoint);
+        }
+
+        AsrConfig {
+            provider: match self.provider {
+                None | Some(RawAsrProvider::LocalCli) => AsrProvider::LocalCli,
+                Some(RawAsrProvider::AlibabaQwenRealtime)
+                | Some(RawAsrProvider::AlibabaQwenAudio3) => AsrProvider::AlibabaQwenAudio3,
+            },
+            backend_command: self.backend_command,
+            engine: self.engine,
+            model: self.model,
+            language: self.language,
+            connect_timeout_ms: self.connect_timeout_ms,
+            finalize_timeout_ms: self.finalize_timeout_ms,
+            fallback_to_local: self.fallback_to_local,
+            plaintext_alibaba_credential_loaded,
+            alibaba_audio3: self.alibaba_audio3,
+        }
+    }
+}
+
+fn migrate_legacy_realtime_route(audio3: &mut AlibabaAudio3Config, endpoint: &str) {
+    const BEIJING_REALTIME_ENDPOINT: &str = "wss://dashscope.aliyuncs.com/api-ws/v1/realtime";
+    const SINGAPORE_REALTIME_ENDPOINT: &str =
+        "wss://dashscope-intl.aliyuncs.com/api-ws/v1/realtime";
+
+    match endpoint.trim() {
+        "" | BEIJING_REALTIME_ENDPOINT => {
+            audio3.endpoint_mode = Audio3EndpointMode::Regional;
+            audio3.region = Audio3Region::Beijing;
+            audio3.endpoint = AUDIO3_BEIJING_STREAMING_ENDPOINT.into();
+            audio3.native_endpoint = AUDIO3_BEIJING_NATIVE_ENDPOINT.into();
+        }
+        SINGAPORE_REALTIME_ENDPOINT => {
+            audio3.endpoint_mode = Audio3EndpointMode::Regional;
+            audio3.region = Audio3Region::Singapore;
+            audio3.endpoint = AUDIO3_SINGAPORE_STREAMING_ENDPOINT.into();
+            audio3.native_endpoint = AUDIO3_SINGAPORE_NATIVE_ENDPOINT.into();
+        }
+        custom => {
+            audio3.endpoint_mode = Audio3EndpointMode::Custom;
+            audio3.endpoint = custom.into();
+            let Ok(mut streaming) = Url::parse(custom) else {
+                audio3.native_endpoint = custom.into();
+                return;
+            };
+            if let Some(prefix) = streaming.path().strip_suffix("/realtime") {
+                streaming.set_path(&format!("{prefix}/inference"));
+            }
+            audio3.endpoint = streaming.to_string();
+
+            let mut native = streaming;
+            let native_scheme = if native.scheme() == "wss" {
+                "https"
+            } else {
+                "http"
+            };
+            if native.set_scheme(native_scheme).is_err() {
+                audio3.native_endpoint = custom.into();
+                return;
+            }
+            native.set_path("/api/v1/services/aigc/multimodal-generation/generation");
+            native.set_query(None);
+            native.set_fragment(None);
+            audio3.native_endpoint = native.to_string();
+        }
+    }
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -585,7 +686,7 @@ impl Default for Config {
                 pre_roll_ms: 500,
             },
             asr: AsrConfig {
-                provider: AsrProvider::LocalCli,
+                provider: AsrProvider::AlibabaQwenAudio3,
                 backend_command: "/usr/bin/voxtype".into(),
                 engine: "sensevoice".into(),
                 model: String::new(),
@@ -593,21 +694,8 @@ impl Default for Config {
                 connect_timeout_ms: 5_000,
                 finalize_timeout_ms: 8_000,
                 fallback_to_local: true,
-                alibaba: AlibabaRealtimeConfig {
-                    endpoint: "wss://dashscope.aliyuncs.com/api-ws/v1/realtime".into(),
-                    api_key: String::new(),
-                    model: "qwen3-asr-flash-realtime-2026-02-10".into(),
-                    turn_mode: AlibabaTurnMode::ServerVad,
-                    vad_threshold: 0.2,
-                    silence_duration_ms: 400,
-                    final_pass_enabled: false,
-                    final_pass_base_url: String::new(),
-                    final_pass_model: "qwen3-asr-flash-2026-02-10".into(),
-                    final_pass_timeout_ms: 20_000,
-                    final_pass_enable_itn: false,
-                },
+                plaintext_alibaba_credential_loaded: false,
                 alibaba_audio3: AlibabaAudio3Config {
-                    experimental_enabled: false,
                     endpoint_mode: Audio3EndpointMode::Regional,
                     region: Audio3Region::Beijing,
                     endpoint: AUDIO3_BEIJING_STREAMING_ENDPOINT.into(),
@@ -666,11 +754,6 @@ impl Default for Config {
 impl Default for AsrConfig {
     fn default() -> Self {
         Config::default().asr
-    }
-}
-impl Default for AlibabaRealtimeConfig {
-    fn default() -> Self {
-        Config::default().asr.alibaba
     }
 }
 impl Default for AlibabaAudio3Config {
@@ -776,58 +859,6 @@ impl Config {
             100,
             120_000,
         );
-        validate_url(
-            &mut fields,
-            "asr.alibaba.endpoint",
-            &self.asr.alibaba.endpoint,
-            &["ws", "wss"],
-            self.asr.provider != AsrProvider::AlibabaQwenRealtime,
-        );
-        validate_text(
-            &mut fields,
-            "asr.alibaba.model",
-            &self.asr.alibaba.model,
-            512,
-            self.asr.provider != AsrProvider::AlibabaQwenRealtime,
-        );
-        if !self.asr.alibaba.vad_threshold.is_finite()
-            || !(0.0..=1.0).contains(&self.asr.alibaba.vad_threshold)
-        {
-            fields.insert(
-                "asr.alibaba.vad_threshold".into(),
-                "must be finite and between 0 and 1".into(),
-            );
-        }
-        range(
-            &mut fields,
-            "asr.alibaba.silence_duration_ms",
-            self.asr.alibaba.silence_duration_ms,
-            50,
-            10_000,
-        );
-        // Empty means derive Alibaba's compatible HTTP endpoint from the realtime host.
-        validate_url(
-            &mut fields,
-            "asr.alibaba.final_pass_base_url",
-            &self.asr.alibaba.final_pass_base_url,
-            &["http", "https"],
-            true,
-        );
-        validate_text(
-            &mut fields,
-            "asr.alibaba.final_pass_model",
-            &self.asr.alibaba.final_pass_model,
-            512,
-            !self.asr.alibaba.final_pass_enabled,
-        );
-        range(
-            &mut fields,
-            "asr.alibaba.final_pass_timeout_ms",
-            self.asr.alibaba.final_pass_timeout_ms,
-            100,
-            120_000,
-        );
-
         if self
             .asr
             .alibaba_audio3
@@ -841,12 +872,6 @@ impl Config {
         }
 
         if self.asr.provider == AsrProvider::AlibabaQwenAudio3 {
-            if !self.asr.alibaba_audio3.experimental_enabled {
-                fields.insert(
-                    "asr.alibaba_audio3.experimental_enabled".into(),
-                    "must be true when the experimental provider is selected".into(),
-                );
-            }
             match self.asr.alibaba_audio3.endpoint_mode {
                 Audio3EndpointMode::Custom => {
                     validate_url(
@@ -1067,7 +1092,7 @@ impl Config {
             }
         }
         if let Some(asr) = raw.asr {
-            config.asr = asr;
+            config.asr = asr.into_config();
         } else {
             if raw.whisper.is_some() {
                 config.asr.engine = "whisper".into();
@@ -1153,6 +1178,11 @@ impl ConfigStore {
 
     pub fn save(&self, config: &Config, expected_revision: Option<&str>) -> Result<String> {
         config.validate()?;
+        if config.asr.plaintext_alibaba_credential_loaded {
+            anyhow::bail!(
+                "legacy plaintext Alibaba credential must be migrated through Voice Input Settings before saving configuration"
+            );
+        }
         let parent = self
             .path
             .parent()
@@ -1410,30 +1440,13 @@ impl AsrConfig {
     pub fn active_engine_label(&self) -> String {
         match self.provider {
             AsrProvider::LocalCli => self.engine.clone(),
-            AsrProvider::AlibabaQwenRealtime => {
-                if self.alibaba.final_pass_enabled {
-                    "qwen-realtime + qwen-flash".into()
-                } else {
-                    "qwen-realtime".into()
-                }
-            }
-            AsrProvider::AlibabaQwenAudio3 => "qwen-audio3 (experimental)".into(),
+            AsrProvider::AlibabaQwenAudio3 => "qwen-audio3".into(),
         }
     }
 
     pub fn active_model_label(&self) -> String {
         match self.provider {
             AsrProvider::LocalCli => self.model.clone(),
-            AsrProvider::AlibabaQwenRealtime => {
-                if self.alibaba.final_pass_enabled {
-                    format!(
-                        "{} -> {}",
-                        self.alibaba.model, self.alibaba.final_pass_model
-                    )
-                } else {
-                    self.alibaba.model.clone()
-                }
-            }
             AsrProvider::AlibabaQwenAudio3 => {
                 if self.alibaba_audio3.native_final_pass_mode != NativeFinalPassMode::StreamingOnly
                 {
@@ -1513,13 +1526,17 @@ mod tests {
     fn validation_reports_field_map() {
         let mut config = Config::default();
         config.audio.sample_rate = 1;
-        config.asr.alibaba.vad_threshold = f32::NAN;
+        config.asr.alibaba_audio3.speech_noise_threshold = Some(f32::NAN);
         config.llm.enabled = true;
         config.llm.api_base_url = "https://user:secret@example.com/v1".into();
         config.llm.model.clear();
         let error = config.validate().expect_err("invalid config");
         assert!(error.fields.contains_key("audio.sample_rate"));
-        assert!(error.fields.contains_key("asr.alibaba.vad_threshold"));
+        assert!(
+            error
+                .fields
+                .contains_key("asr.alibaba_audio3.speech_noise_threshold")
+        );
         assert!(error.fields.contains_key("llm.api_base_url"));
         assert!(error.fields.contains_key("llm.model"));
     }
@@ -1572,16 +1589,13 @@ mod tests {
     }
 
     #[test]
-    fn optional_derived_endpoints_and_backend_defaults_validate() {
+    fn remote_provider_and_backend_defaults_validate() {
         let mut config = Config::default();
-        config.asr.provider = super::AsrProvider::AlibabaQwenRealtime;
-        config.asr.alibaba.final_pass_enabled = true;
-        config.asr.alibaba.final_pass_base_url.clear();
         config.asr.engine.clear();
         config.output.xwayland_paste_keys.clear();
         config
             .validate()
-            .expect("derived final-pass URL and documented empty fallbacks are valid");
+            .expect("Audio3 and documented empty local defaults are valid");
 
         config.asr.backend_command.clear();
         let error = config
@@ -1658,9 +1672,9 @@ mod tests {
     }
 
     #[test]
-    fn audio3_defaults_are_additive_and_experimental() {
+    fn audio3_is_the_primary_provider_with_safe_defaults() {
         let config = Config::default();
-        assert!(!config.asr.alibaba_audio3.experimental_enabled);
+        assert_eq!(config.asr.provider, AsrProvider::AlibabaQwenAudio3);
         assert_eq!(
             config.asr.alibaba_audio3.endpoint_mode,
             Audio3EndpointMode::Regional
@@ -1710,32 +1724,27 @@ mod tests {
     }
 
     #[test]
-    fn audio3_selection_requires_gate_and_validates_only_when_selected() {
+    fn audio3_validates_only_when_selected() {
         let mut config = Config::default();
+        config.asr.provider = AsrProvider::LocalCli;
         config.asr.alibaba_audio3.endpoint_mode = Audio3EndpointMode::Custom;
         config.asr.alibaba_audio3.endpoint = "not a URL".into();
         config.asr.alibaba_audio3.model.clear();
         config
             .validate()
-            .expect("inactive experimental configuration remains compatible");
+            .expect("inactive Audio3 configuration remains compatible");
 
         config.asr.provider = AsrProvider::AlibabaQwenAudio3;
         let error = config
             .validate()
-            .expect_err("experimental gate is required");
-        assert!(
-            error
-                .fields
-                .contains_key("asr.alibaba_audio3.experimental_enabled")
-        );
+            .expect_err("active Audio3 fields are required");
         assert!(error.fields.contains_key("asr.alibaba_audio3.endpoint"));
         assert!(error.fields.contains_key("asr.alibaba_audio3.model"));
 
-        config.asr.alibaba_audio3.experimental_enabled = true;
         config.asr.alibaba_audio3.endpoint =
             "wss://dashscope.aliyuncs.com/api-ws/v1/inference".into();
         config.asr.alibaba_audio3.model = "qwen-audio-3.0-asr-flash-streaming".into();
-        config.validate().expect("gated provider configuration");
+        config.validate().expect("valid provider configuration");
 
         config.asr.alibaba_audio3.recognition_preset = Audio3RecognitionPreset::Custom;
         for invalid in [199, 6_001] {
@@ -1764,7 +1773,7 @@ mod tests {
     fn audio3_custom_threshold_and_control_interactions_are_validated_when_active() {
         let mut config = Config::default();
         config.asr.provider = AsrProvider::AlibabaQwenAudio3;
-        config.asr.alibaba_audio3.experimental_enabled = true;
+
         config.asr.alibaba_audio3.recognition_preset = Audio3RecognitionPreset::Custom;
 
         for valid in [-1.0, 0.0, 1.0] {
@@ -1819,7 +1828,7 @@ mod tests {
         ] {
             let mut config = Config::default();
             config.asr.provider = provider;
-            config.asr.alibaba_audio3.experimental_enabled = true;
+
             config.asr.alibaba_audio3.recognition_preset = preset;
             config.asr.alibaba_audio3.speech_noise_threshold = Some(threshold);
 
@@ -1839,6 +1848,7 @@ mod tests {
     #[test]
     fn inactive_provider_isolates_finite_audio3_range_and_combination_values() {
         let mut config = Config::default();
+        config.asr.provider = AsrProvider::LocalCli;
         config.asr.alibaba_audio3.recognition_preset = Audio3RecognitionPreset::Custom;
         config.asr.alibaba_audio3.max_sentence_silence_ms = 1;
         config.asr.alibaba_audio3.semantic_punctuation_enabled = true;
@@ -1868,13 +1878,14 @@ mod tests {
     #[test]
     fn audio3_native_timeout_is_validated_only_for_selected_enabled_final_pass() {
         let mut config = Config::default();
+        config.asr.provider = AsrProvider::LocalCli;
         config.asr.alibaba_audio3.native_timeout_ms = 0;
         config
             .validate()
             .expect("inactive Audio3 native timeout is ignored");
 
         config.asr.provider = AsrProvider::AlibabaQwenAudio3;
-        config.asr.alibaba_audio3.experimental_enabled = true;
+
         config
             .validate()
             .expect("disabled Audio3 final pass ignores its timeout");
@@ -1891,7 +1902,7 @@ mod tests {
     }
 
     #[test]
-    fn old_asr_config_deserializes_with_unchanged_defaults() {
+    fn old_realtime_provider_config_migrates_to_audio3_defaults() {
         let old = r#"
 provider = "alibaba-qwen-realtime"
 backend_command = "/usr/bin/voxtype"
@@ -1907,9 +1918,7 @@ endpoint = "wss://dashscope.aliyuncs.com/api-ws/v1/realtime"
 model = "legacy-model"
 "#;
         let asr: super::AsrConfig = toml::from_str(old).expect("old ASR config");
-        assert_eq!(asr.provider, AsrProvider::AlibabaQwenRealtime);
-        assert_eq!(asr.alibaba.model, "legacy-model");
-        assert!(!asr.alibaba_audio3.experimental_enabled);
+        assert_eq!(asr.provider, AsrProvider::AlibabaQwenAudio3);
         assert_eq!(
             asr.alibaba_audio3.model,
             "qwen-audio-3.0-asr-flash-streaming"
@@ -1931,10 +1940,151 @@ model = "legacy-model"
     }
 
     #[test]
-    fn audio3_config_without_native_gate_or_timeout_uses_new_defaults() {
+    fn existing_asr_section_without_provider_remains_local() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("config.toml");
+        fs::write(
+            &path,
+            r#"
+[asr]
+engine = "sensevoice"
+"#,
+        )
+        .unwrap();
+
+        let config = ConfigStore::new(path).load().unwrap().config;
+        assert_eq!(config.asr.provider, AsrProvider::LocalCli);
+    }
+
+    #[test]
+    fn config_store_migrates_legacy_realtime_routes_without_cross_region_redirects() {
+        for (endpoint, expected_region) in [
+            (
+                "wss://dashscope.aliyuncs.com/api-ws/v1/realtime",
+                Audio3Region::Beijing,
+            ),
+            (
+                "wss://dashscope-intl.aliyuncs.com/api-ws/v1/realtime",
+                Audio3Region::Singapore,
+            ),
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("config.toml");
+            fs::write(
+                &path,
+                format!(
+                    r#"
+[asr]
+provider = "alibaba-qwen-realtime"
+
+[asr.alibaba]
+endpoint = "{endpoint}"
+"#
+                ),
+            )
+            .unwrap();
+
+            let config = ConfigStore::new(path).load().unwrap().config;
+            assert_eq!(config.asr.provider, AsrProvider::AlibabaQwenAudio3);
+            assert_eq!(
+                config.asr.alibaba_audio3.endpoint_mode,
+                Audio3EndpointMode::Regional
+            );
+            assert_eq!(config.asr.alibaba_audio3.region, expected_region);
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("config.toml");
+        fs::write(
+            &path,
+            r#"
+[asr]
+provider = "alibaba-qwen-realtime"
+
+[asr.alibaba]
+endpoint = "ws://127.0.0.1:8123/proxy/realtime?tenant=one"
+"#,
+        )
+        .unwrap();
+        let config = ConfigStore::new(path).load().unwrap().config;
+        assert_eq!(
+            config.asr.alibaba_audio3.endpoint_mode,
+            Audio3EndpointMode::Custom
+        );
+        assert_eq!(
+            config.asr.alibaba_audio3.endpoint,
+            "ws://127.0.0.1:8123/proxy/inference?tenant=one"
+        );
+        assert_eq!(
+            config.asr.alibaba_audio3.native_endpoint,
+            "http://127.0.0.1:8123/api/v1/services/aigc/multimodal-generation/generation"
+        );
+    }
+
+    #[test]
+    fn config_store_migrates_legacy_realtime_provider_and_api_key() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("config.toml");
+        fs::write(
+            &path,
+            r#"
+[asr]
+provider = "alibaba-qwen-realtime"
+
+[asr.alibaba]
+api_key = "legacy-secret"
+"#,
+        )
+        .unwrap();
+
+        let store = ConfigStore::new(&path);
+        let config = store.load().unwrap().config;
+        assert_eq!(config.asr.provider, AsrProvider::AlibabaQwenAudio3);
+        assert_eq!(config.asr.alibaba_audio3.api_key, "legacy-secret");
+
+        let serialized = toml::to_string(&config).unwrap();
+        assert!(!serialized.contains("[asr.alibaba]"));
+        assert!(!serialized.contains("legacy-secret"));
+
+        let error = store
+            .save(&config, None)
+            .expect_err("generic saves must not discard an unmigrated credential");
+        assert!(error.to_string().contains("must be migrated"));
+        assert!(fs::read_to_string(path).unwrap().contains("legacy-secret"));
+    }
+
+    #[test]
+    fn generic_save_refuses_to_drop_plaintext_audio3_api_key() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("config.toml");
+        fs::write(
+            &path,
+            r#"
+[asr]
+provider = "alibaba-qwen-audio3"
+
+[asr.alibaba_audio3]
+api_key = "audio3-plaintext-secret"
+"#,
+        )
+        .unwrap();
+
+        let store = ConfigStore::new(&path);
+        let config = store.load().unwrap().config;
+        assert_eq!(config.asr.alibaba_audio3.api_key, "audio3-plaintext-secret");
+        assert!(store.save(&config, None).is_err());
+        assert!(
+            fs::read_to_string(path)
+                .unwrap()
+                .contains("audio3-plaintext-secret")
+        );
+    }
+
+    #[test]
+    fn audio3_config_ignores_removed_experimental_gate() {
         let audio3: super::AlibabaAudio3Config = toml::from_str(
             r#"
-experimental_enabled = true
+experimental_enabled = false
 endpoint = "wss://dashscope.aliyuncs.com/api-ws/v1/inference"
 model = "streaming-model"
 native_endpoint = "https://dashscope.aliyuncs.com/native"
@@ -1975,7 +2125,6 @@ finalize_timeout_ms = 8000
 fallback_to_local = true
 
 [asr.alibaba_audio3]
-experimental_enabled = true
 endpoint = "wss://dashscope.aliyuncs.com/api-ws/v1/inference"
 model = "qwen-audio-3.0-asr-flash-streaming"
 native_endpoint = "https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation"
@@ -2079,7 +2228,7 @@ native_timeout_ms = 20000
     fn named_audio3_preset_preserves_finite_dormant_raw_controls_in_config_json() {
         let mut config = Config::default();
         config.asr.provider = AsrProvider::AlibabaQwenAudio3;
-        config.asr.alibaba_audio3.experimental_enabled = true;
+
         config.asr.alibaba_audio3.recognition_preset = Audio3RecognitionPreset::Standard;
         config.asr.alibaba_audio3.max_sentence_silence_ms = 333;
         config.asr.alibaba_audio3.semantic_punctuation_enabled = true;
@@ -2272,7 +2421,7 @@ native_timeout_ms = 20000
     fn audio3_vocabulary_serializes_as_typed_entries_and_trims_only_for_identity() {
         let mut config = Config::default();
         config.asr.provider = AsrProvider::AlibabaQwenAudio3;
-        config.asr.alibaba_audio3.experimental_enabled = true;
+
         config.asr.alibaba_audio3.vocabulary = vec![
             Audio3VocabularyTerm {
                 term: " Voice Input ".into(),
@@ -2325,7 +2474,7 @@ native_timeout_ms = 20000
         ] {
             let mut config = Config::default();
             config.asr.provider = AsrProvider::AlibabaQwenAudio3;
-            config.asr.alibaba_audio3.experimental_enabled = true;
+
             config.asr.alibaba_audio3.vocabulary = vocabulary;
             let error = config.validate().expect_err("invalid vocabulary");
             assert_eq!(error.fields["asr.alibaba_audio3.vocabulary"], expected);
@@ -2333,7 +2482,7 @@ native_timeout_ms = 20000
 
         let mut config = Config::default();
         config.asr.provider = AsrProvider::AlibabaQwenAudio3;
-        config.asr.alibaba_audio3.experimental_enabled = true;
+
         config.asr.alibaba_audio3.vocabulary = (0..51)
             .map(|index| valid(&format!("term{index}"), 50))
             .collect();
@@ -2362,7 +2511,7 @@ native_timeout_ms = 20000
         const SENTINEL: &str = "private-vocabulary-sentinel";
         let mut config = Config::default();
         config.asr.provider = AsrProvider::AlibabaQwenAudio3;
-        config.asr.alibaba_audio3.experimental_enabled = true;
+
         config.asr.alibaba_audio3.vocabulary = vec![Audio3VocabularyTerm {
             term: format!("{SENTINEL}{}", "x".repeat(MAX_AUDIO3_VOCABULARY_BYTES)),
             weight: 1,
@@ -2375,11 +2524,7 @@ native_timeout_ms = 20000
         config.asr.provider = AsrProvider::LocalCli;
         config
             .validate()
-            .expect("legacy providers ignore Audio3-only vocabulary controls");
-        config.asr.provider = AsrProvider::AlibabaQwenRealtime;
-        config
-            .validate()
-            .expect("Alibaba realtime ignores Audio3-only vocabulary controls");
+            .expect("the local provider ignores Audio3-only vocabulary controls");
     }
 
     #[test]
@@ -2533,7 +2678,7 @@ native_timeout_ms = 20000
     fn regional_mode_ignores_dormant_custom_urls_while_custom_keeps_tls_rules() {
         let mut config = Config::default();
         config.asr.provider = AsrProvider::AlibabaQwenAudio3;
-        config.asr.alibaba_audio3.experimental_enabled = true;
+
         config.asr.alibaba_audio3.endpoint = "not a URL".into();
         config.asr.alibaba_audio3.native_endpoint = "also not a URL".into();
         config
@@ -2571,9 +2716,8 @@ native_timeout_ms = 20000
     }
 
     #[test]
-    fn serialization_omits_legacy_secrets() {
+    fn serialization_omits_secrets() {
         let mut config = Config::default();
-        config.asr.alibaba.api_key = "alibaba-secret".into();
         config.asr.alibaba_audio3.api_key = "audio3-secret".into();
         config.llm.api_key = "llm-secret".into();
         let toml = toml::to_string(&config).unwrap();

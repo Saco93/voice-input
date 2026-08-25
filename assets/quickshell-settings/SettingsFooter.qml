@@ -31,7 +31,6 @@ Rectangle {
                 visible: root.controller.globalError.length > 0
                 text: root.theme.tr(root.controller.globalError)
                 color: root.theme.error
-                font.family: root.theme.fontFamily
                 font.pixelSize: 11
                 font.weight: Font.ExtraBold
                 wrapMode: Text.WordWrap
@@ -43,7 +42,6 @@ Rectangle {
                 visible: root.controller.globalError.length === 0 && root.controller.statusMessage.length > 0
                 text: root.theme.tr(root.controller.statusMessage)
                 color: root.theme.success
-                font.family: root.theme.fontFamily
                 font.weight: Font.ExtraBold
                 font.pixelSize: 11
                 wrapMode: Text.WordWrap
@@ -54,7 +52,6 @@ Rectangle {
                 visible: root.controller.globalError.length === 0 && root.controller.statusMessage.length === 0
                 text: root.theme.tr(root.controller.saving ? "Saving configuration and restarting service…" : (root.controller.loading ? "Reloading configuration…" : (root.controller.testing ? "Testing LLM settings…" : (root.controller.dirty ? "Changes have not been saved." : "Configuration is up to date."))))
                 color: root.controller.dirty ? root.theme.warning : root.theme.subtle
-                font.family: root.theme.fontFamily
                 font.weight: Font.ExtraBold
                 font.pixelSize: 11
             }

@@ -333,9 +333,8 @@ fn settings_get(store: &ConfigStore) -> std::result::Result<Value, ProtocolError
         "credentials": credential_statuses,
         "choices": {
             "hotkey.mode": ["hold", "toggle"],
-            "asr.provider": ["local-cli", "alibaba-qwen-realtime", "alibaba-qwen-audio3"],
+            "asr.provider": ["alibaba-qwen-audio3", "local-cli"],
             "asr.language": ["english", "simplified-chinese", "traditional-chinese", "japanese", "korean"],
-            "asr.alibaba.turn_mode": ["server-vad", "manual"],
             "asr.alibaba_audio3.endpoint_mode": ["regional", "custom"],
             "asr.alibaba_audio3.region": ["beijing", "singapore"],
             "asr.alibaba_audio3.recognition_preset": ["standard", "low-latency-dictation", "long-form", "custom"],
@@ -395,7 +394,10 @@ fn settings_save(
     }
 
     let legacy_values = BTreeMap::from([
-        (ALIBABA_CREDENTIAL_ID, loaded.config.asr.alibaba.api_key),
+        (
+            ALIBABA_CREDENTIAL_ID,
+            loaded.config.asr.alibaba_audio3.api_key,
+        ),
         (OPENROUTER_CREDENTIAL_ID, loaded.config.llm.api_key),
     ]);
     let mut updated = BTreeMap::new();
@@ -417,8 +419,10 @@ fn settings_save(
         let replacement = action
             .filter(|action| action.action == "replace")
             .and_then(|action| action.value.as_deref());
-        let value_to_protect =
-            (!configured && !legacy.is_empty()).then_some(replacement.unwrap_or(legacy));
+        let protected_by_credential_store =
+            configured && (legacy.is_empty() || credentials::decrypt(id).is_ok());
+        let value_to_protect = (!legacy.is_empty() && !protected_by_credential_store)
+            .then_some(replacement.unwrap_or(legacy));
         if let Some(value) = value_to_protect {
             credentials::replace(id, value).map_err(|_| ProtocolError {
                 code: "credential_write_failed",
@@ -810,7 +814,7 @@ mod tests {
         assert_eq!(response["result"]["config"]["audio"]["sample_rate"], 16_000);
         assert_eq!(
             response["result"]["choices"]["asr.provider"],
-            json!(["local-cli", "alibaba-qwen-realtime", "alibaba-qwen-audio3"])
+            json!(["alibaba-qwen-audio3", "local-cli"])
         );
         assert_eq!(
             response["result"]["choices"]["asr.alibaba_audio3.endpoint_mode"],
@@ -831,7 +835,6 @@ mod tests {
         assert_eq!(
             response["result"]["config"]["asr"]["alibaba_audio3"],
             json!({
-                "experimental_enabled": false,
                 "endpoint_mode": "regional",
                 "region": "beijing",
                 "endpoint": "wss://dashscope.aliyuncs.com/api-ws/v1/inference",
@@ -904,14 +907,13 @@ mod tests {
     }
 
     #[test]
-    fn audio3_save_round_trip_requires_and_preserves_explicit_gate() {
+    fn audio3_save_round_trip_preserves_provider_settings() {
         let temp = tempfile::tempdir().unwrap();
         let store = ConfigStore::new(temp.path().join("config.toml"));
         let loaded = store.load().unwrap();
         let mut config = serde_json::to_value(loaded.config).unwrap();
         config["asr"]["provider"] = json!("alibaba-qwen-audio3");
         config["asr"]["alibaba_audio3"] = json!({
-            "experimental_enabled": true,
             "endpoint_mode": "custom",
             "region": "singapore",
             "endpoint": "wss://audio3.example.test/stream?opaque=one",
@@ -960,7 +962,6 @@ mod tests {
             saved.asr.provider,
             crate::config::AsrProvider::AlibabaQwenAudio3
         );
-        assert!(saved.asr.alibaba_audio3.experimental_enabled);
         assert_eq!(
             saved.asr.alibaba_audio3.endpoint_mode,
             crate::config::Audio3EndpointMode::Custom
@@ -1002,7 +1003,6 @@ mod tests {
         let loaded = store.load().unwrap();
         let mut config = serde_json::to_value(&loaded.config).unwrap();
         config["asr"]["provider"] = json!("alibaba-qwen-audio3");
-        config["asr"]["alibaba_audio3"]["experimental_enabled"] = json!(true);
         config["asr"]["alibaba_audio3"]["endpoint_mode"] = json!("regional");
         config["asr"]["alibaba_audio3"]["region"] = json!("singapore");
         config["asr"]["alibaba_audio3"]["workspace_id"] = json!("ignored-json-route-sentinel");
@@ -1056,7 +1056,6 @@ mod tests {
         let loaded = store.load().unwrap();
         let mut config = serde_json::to_value(&loaded.config).unwrap();
         config["asr"]["provider"] = json!("alibaba-qwen-audio3");
-        config["asr"]["alibaba_audio3"]["experimental_enabled"] = json!(true);
         config["asr"]["alibaba_audio3"]["recognition_preset"] = json!("standard");
         config["asr"]["alibaba_audio3"]["max_sentence_silence_ms"] = json!(1);
         config["asr"]["alibaba_audio3"]["semantic_punctuation_enabled"] = json!(true);
@@ -1150,7 +1149,6 @@ mod tests {
         let loaded = store.load().unwrap();
         let mut config = serde_json::to_value(&loaded.config).unwrap();
         config["asr"]["provider"] = json!("alibaba-qwen-audio3");
-        config["asr"]["alibaba_audio3"]["experimental_enabled"] = json!(true);
         config["asr"]["alibaba_audio3"]["vocabulary"] = json!([
             {"term": SENTINEL, "weight": 1},
             {"term": format!(" {SENTINEL} "), "weight": 2}
@@ -1176,36 +1174,6 @@ mod tests {
             "entry 2 duplicates an earlier entry after trimming"
         );
         assert!(!response.to_string().contains(SENTINEL));
-    }
-
-    #[test]
-    fn audio3_save_is_rejected_when_experimental_gate_is_false() {
-        let temp = tempfile::tempdir().unwrap();
-        let store = ConfigStore::new(temp.path().join("config.toml"));
-        let loaded = store.load().unwrap();
-        let mut config = serde_json::to_value(loaded.config).unwrap();
-        config["asr"]["provider"] = json!("alibaba-qwen-audio3");
-        let request = json!({
-            "version": 1,
-            "id": 4,
-            "method": "settings.save",
-            "params": {
-                "revision": loaded.revision,
-                "config": config,
-                "credentials": {},
-                "restart": false
-            }
-        });
-        let response: Value =
-            serde_json::from_slice(&handle_line(request.to_string().as_bytes(), &store)).unwrap();
-
-        assert_eq!(response["ok"], false);
-        assert_eq!(response["error"]["code"], "validation_failed");
-        assert_eq!(
-            response["error"]["fields"]["asr.alibaba_audio3.experimental_enabled"],
-            "must be true when the experimental provider is selected"
-        );
-        assert!(!store.path().exists());
     }
 
     #[test]

@@ -7,15 +7,11 @@ use std::{
 use anyhow::{Context, Result, bail};
 
 use crate::{
-    config::{AlibabaTurnMode, AsrProvider, Config, HotkeyMode},
+    config::{AsrProvider, Config, HotkeyMode},
     paths,
 };
 
 pub fn run_model_wizard(config: &mut Config) -> Result<()> {
-    if config.asr.provider == AsrProvider::AlibabaQwenAudio3 {
-        bail!("model setup is unavailable for the configured ASR provider");
-    }
-
     println!("Voice Input model setup");
     println!();
     println!("Select language:");
@@ -44,22 +40,21 @@ pub fn run_model_wizard(config: &mut Config) -> Result<()> {
 
     println!();
     println!("ASR provider:");
-    println!("  1. local-cli              (current /usr/bin/voxtype backend)");
-    println!("  2. alibaba-qwen-realtime  (true streaming partials over WebSocket)");
+    println!("  1. alibaba-qwen-audio3  (streaming recognition over WebSocket)");
+    println!("  2. local-cli            (/usr/bin/voxtype backend)");
     print!(
         "Provider [{}]: ",
         match config.asr.provider {
+            AsrProvider::AlibabaQwenAudio3 => "alibaba-qwen-audio3",
             AsrProvider::LocalCli => "local-cli",
-            AsrProvider::AlibabaQwenRealtime => "alibaba-qwen-realtime",
-            AsrProvider::AlibabaQwenAudio3 => unreachable!("provider was rejected above"),
         }
     );
     io::stdout().flush().ok();
     let provider = read_line()?;
     match provider.trim() {
         "" => {}
-        "1" | "local-cli" => config.asr.provider = AsrProvider::LocalCli,
-        "2" | "alibaba-qwen-realtime" => config.asr.provider = AsrProvider::AlibabaQwenRealtime,
+        "1" | "alibaba-qwen-audio3" => config.asr.provider = AsrProvider::AlibabaQwenAudio3,
+        "2" | "local-cli" => config.asr.provider = AsrProvider::LocalCli,
         value => bail!("unknown ASR provider `{value}`"),
     }
 
@@ -95,44 +90,8 @@ pub fn run_model_wizard(config: &mut Config) -> Result<()> {
                 config.asr.model = model.trim().to_string();
             }
         }
-        AsrProvider::AlibabaQwenRealtime => {
-            print!("Alibaba model [{}]: ", config.asr.alibaba.model);
-            io::stdout().flush().ok();
-            let model = read_line()?;
-            if !model.trim().is_empty() {
-                config.asr.alibaba.model = model.trim().to_string();
-            }
-
-            print!("Endpoint [{}]: ", config.asr.alibaba.endpoint);
-            io::stdout().flush().ok();
-            let endpoint = read_line()?;
-            if !endpoint.trim().is_empty() {
-                config.asr.alibaba.endpoint = endpoint.trim().to_string();
-            }
-
-            println!("Turn mode:");
-            println!("  1. server-vad  (recommended default)");
-            println!("  2. manual      (commit on stop)");
-            print!(
-                "Turn mode [{}]: ",
-                match config.asr.alibaba.turn_mode {
-                    AlibabaTurnMode::ServerVad => "server-vad",
-                    AlibabaTurnMode::Manual => "manual",
-                }
-            );
-            io::stdout().flush().ok();
-            let turn_mode = read_line()?;
-            match turn_mode.trim() {
-                "" => {}
-                "1" | "server-vad" => {
-                    config.asr.alibaba.turn_mode = AlibabaTurnMode::ServerVad;
-                }
-                "2" | "manual" => {
-                    config.asr.alibaba.turn_mode = AlibabaTurnMode::Manual;
-                }
-                value => bail!("unknown turn mode `{value}`"),
-            }
-
+        AsrProvider::AlibabaQwenAudio3 => {
+            println!("Configure the Alibaba API key and Audio3 options in Voice Input Settings.");
             print!(
                 "Fallback to local CLI on remote failure [{}] (y/n): ",
                 if config.asr.fallback_to_local {
@@ -150,7 +109,6 @@ pub fn run_model_wizard(config: &mut Config) -> Result<()> {
                 value => bail!("unknown fallback choice `{value}`"),
             }
         }
-        AsrProvider::AlibabaQwenAudio3 => unreachable!("provider was rejected above"),
     }
 
     config.save()?;
@@ -261,18 +219,10 @@ pub fn install_systemd_unit() -> Result<()> {
 
     let hud_template = fs::read_to_string(asset_dir.join("voice-input-hud.service"))
         .context("failed to load Voice Input HUD service template")?;
-    let hud_rendered = hud_template
-        .replace(
-            "@VOICE_INPUT_QUICKSHELL_DIR@",
-            &asset_dir.join("quickshell").display().to_string(),
-        )
-        .replace(
-            "@VOICE_INPUT_FONT_PATH@",
-            &asset_dir
-                .join("fonts/NotoSansSC-Variable.ttf")
-                .display()
-                .to_string(),
-        );
+    let hud_rendered = hud_template.replace(
+        "@VOICE_INPUT_QUICKSHELL_DIR@",
+        &asset_dir.join("quickshell").display().to_string(),
+    );
     let hud_target = unit_dir.join("voice-input-hud.service");
     fs::write(&hud_target, hud_rendered)
         .with_context(|| format!("failed to write {}", hud_target.display()))?;

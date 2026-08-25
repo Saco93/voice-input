@@ -30,7 +30,6 @@ GridLayout {
         Label {
             text: root.theme.tr(root.label)
             color: root.theme.foreground
-            font.family: root.theme.fontFamily
             font.pixelSize: 12
             font.weight: Font.ExtraBold
             wrapMode: Text.WordWrap
@@ -41,7 +40,6 @@ GridLayout {
             visible: root.help.length > 0
             text: root.theme.tr(root.help)
             color: root.theme.subtle
-            font.family: root.theme.fontFamily
             font.weight: Font.ExtraBold
             font.pixelSize: 11
             lineHeight: 1.15
@@ -70,7 +68,6 @@ GridLayout {
                 wrapMode: TextEdit.Wrap
                 color: root.theme.foreground
                 placeholderTextColor: root.theme.subtle
-                font.family: root.theme.fontFamily
                 font.weight: Font.ExtraBold
                 Accessible.name: root.theme.tr(root.label)
                 Accessible.description: root.theme.tr(root.help)
@@ -96,7 +93,6 @@ GridLayout {
             visible: root.error.length > 0
             text: root.theme.tr(root.error)
             color: root.theme.error
-            font.family: root.theme.fontFamily
             font.weight: Font.ExtraBold
             font.pixelSize: 11
             wrapMode: Text.WordWrap

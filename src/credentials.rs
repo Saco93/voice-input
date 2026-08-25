@@ -22,13 +22,11 @@ pub struct CredentialStatus {
 }
 
 pub fn apply_runtime_credentials(config: &mut Config) -> Result<()> {
-    let alibaba_api_key = resolve(
+    config.asr.alibaba_audio3.api_key = resolve(
         ALIBABA_CREDENTIAL_ID,
         "VOICE_INPUT_ALIBABA_API_KEY",
-        &config.asr.alibaba.api_key,
+        &config.asr.alibaba_audio3.api_key,
     )?;
-    config.asr.alibaba.api_key = alibaba_api_key.clone();
-    config.asr.alibaba_audio3.api_key = alibaba_api_key;
     config.llm.api_key = resolve(
         OPENROUTER_CREDENTIAL_ID,
         "VOICE_INPUT_OPENROUTER_API_KEY",

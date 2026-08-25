@@ -218,12 +218,11 @@ fn press_key_chord(chord: &str, target: &OutputTarget) -> Result<()> {
         return press_key_chord_via_xdotool(chord);
     }
 
-    let shortcut = hyprland_shortcut(chord)?;
-    eprintln!("voice-input output: hyprctl sendshortcut {shortcut}");
+    let dispatcher = hyprland_shortcut(chord)?;
+    eprintln!("voice-input output: hyprctl dispatch {dispatcher}");
     let mut command = hyprctl_command();
     command
-        .args(["dispatch", "sendshortcut"])
-        .arg(shortcut)
+        .args(["dispatch", &dispatcher])
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     let output = spawn_and_wait(
@@ -261,7 +260,12 @@ fn hyprland_shortcut(chord: &str) -> Result<String> {
             _ => bail!("unknown paste key modifier `{modifier}`"),
         })
         .collect::<Result<Vec<_>>>()?;
-    Ok(format!("{},{key},activewindow", modifiers.join(" ")))
+    let modifiers = serde_json::to_string(&modifiers.join(" "))
+        .context("failed to encode paste key modifiers")?;
+    let key = serde_json::to_string(key).context("failed to encode paste key")?;
+    Ok(format!(
+        "hl.dsp.send_shortcut({{ mods = {modifiers}, key = {key}, window = \"activewindow\" }})"
+    ))
 }
 
 fn press_key_chord_via_xdotool(chord: &str) -> Result<()> {
@@ -1301,11 +1305,11 @@ mod tests {
     fn wayland_paste_shortcut_uses_hyprland_dispatch_syntax() {
         assert_eq!(
             hyprland_shortcut("shift+Insert").unwrap(),
-            "SHIFT,Insert,activewindow"
+            "hl.dsp.send_shortcut({ mods = \"SHIFT\", key = \"Insert\", window = \"activewindow\" })"
         );
         assert_eq!(
             hyprland_shortcut("ctrl+alt+v").unwrap(),
-            "CTRL ALT,v,activewindow"
+            "hl.dsp.send_shortcut({ mods = \"CTRL ALT\", key = \"v\", window = \"activewindow\" })"
         );
         assert!(hyprland_shortcut("").is_err());
         assert!(hyprland_shortcut("hyper+v").is_err());

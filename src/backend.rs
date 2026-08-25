@@ -1,7 +1,5 @@
 mod local_cli;
 mod qwen_audio3;
-mod qwen_batch;
-mod qwen_realtime;
 mod text;
 
 use std::{
@@ -24,7 +22,6 @@ use crate::{
 };
 
 pub(crate) use qwen_audio3::transcribe_full_audio as transcribe_qwen_audio3_full_audio;
-pub use qwen_batch::transcribe_full_audio as transcribe_alibaba_full_audio;
 pub use text::apply_script_conversion;
 
 #[derive(Debug, Clone, Copy)]
@@ -74,14 +71,11 @@ pub enum AsrEvent {
     /// Confirms that a nonempty terminology context was included in a
     /// successfully written Audio3 run-task request. Contains no term text.
     SessionContextSent,
-    SpeechStarted,
-    SpeechStopped,
     RealtimeRestarting,
     RealtimeRestarted,
     /// Atomically invalidates every transcript derived from the previous
     /// authoritative streaming attempt.
     TranscriptReset,
-    RealtimeTranscriptDelayed,
     AudioDeliveryCompleted {
         packet_count: u64,
         sample_count: u64,
@@ -138,7 +132,6 @@ pub trait AsrBackend: Send + Sync {
 pub fn build(config: &Config) -> Box<dyn AsrBackend> {
     match config.asr.provider {
         AsrProvider::LocalCli => Box::new(local_cli::LocalCliBackend::new()),
-        AsrProvider::AlibabaQwenRealtime => Box::new(qwen_realtime::QwenRealtimeBackend::new()),
         AsrProvider::AlibabaQwenAudio3 => Box::new(qwen_audio3::QwenAudio3Backend::new()),
     }
 }

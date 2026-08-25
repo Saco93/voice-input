@@ -38,7 +38,6 @@ Rectangle {
         Label {
             text: root.theme.tr("Voice Input")
             color: root.theme.foreground
-            font.family: root.theme.fontFamily
             font.pixelSize: 16
             font.weight: Font.Black
             Layout.fillWidth: true
@@ -78,7 +77,6 @@ Rectangle {
                     Text {
                         text: root.theme.tr(modelData.title)
                         color: parent.parent.highlighted ? root.theme.foreground : root.theme.subtle
-                        font.family: root.theme.fontFamily
                         font.pixelSize: 12
                         font.weight: parent.parent.highlighted ? Font.Black : Font.Bold
                         elide: Text.ElideRight
@@ -89,7 +87,6 @@ Rectangle {
                         visible: errorCount > 0
                         text: String(errorCount)
                         color: root.theme.error
-                        font.family: root.theme.fontFamily
                         font.pixelSize: 11
                         font.weight: Font.Black
                     }
@@ -130,7 +127,6 @@ Rectangle {
                 Label {
                     text: root.theme.tr("Local service")
                     color: root.theme.foreground
-                    font.family: root.theme.fontFamily
                     font.pixelSize: 11
                     font.weight: Font.ExtraBold
                     Layout.fillWidth: true
@@ -139,7 +135,6 @@ Rectangle {
                 Label {
                     text: root.serviceSummary
                     color: root.serviceRunning === false ? root.theme.error : root.theme.subtle
-                    font.family: root.theme.fontFamily
                     font.weight: Font.ExtraBold
                     font.pixelSize: 11
                     elide: Text.ElideRight

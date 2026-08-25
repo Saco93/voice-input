@@ -25,7 +25,6 @@ Item {
             visible: root.description.length > 0
             text: root.theme.tr(root.description)
             color: root.theme.subtle
-            font.family: root.theme.fontFamily
             font.weight: Font.ExtraBold
             font.pixelSize: 12
             lineHeight: 1.25

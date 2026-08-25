@@ -11,8 +11,8 @@ This document tracks the next Qwen-Audio-3 improvements for Voice Input. Update 
 
 ## Guardrails
 
-- Preserve `alibaba-qwen-realtime`, `alibaba-qwen-audio3`, and `local-cli` provider behavior unless a task explicitly changes it.
-- Keep experimental capabilities behind explicit configuration and retain safe defaults.
+- Preserve `alibaba-qwen-audio3` primary-provider behavior and `local-cli` provider/fallback behavior unless a task explicitly changes them.
+- Keep optional remote controls explicit and retain safe defaults.
 - Never include audio, credentials, endpoints, window/application data, prompt context, or normal recognized/refined text in diagnostics or routine logs. Bounded upstream error fields may be recorded verbatim for operational accuracy.
 - Add deterministic protocol and policy tests before live-provider validation.
 - Use official Alibaba Cloud documentation as the source of truth; record any API ambiguity or provider behavior discovered during implementation.
