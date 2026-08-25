@@ -2076,13 +2076,9 @@ impl Pcm16LeDecoder {
             bytes = remaining;
         }
 
-        let mut pairs = bytes.chunks_exact(2);
-        samples.extend(
-            pairs
-                .by_ref()
-                .map(|pair| i16::from_le_bytes([pair[0], pair[1]])),
-        );
-        self.carry = pairs.remainder().first().copied();
+        let (pairs, remainder) = bytes.as_chunks::<2>();
+        samples.extend(pairs.iter().map(|pair| i16::from_le_bytes(*pair)));
+        self.carry = remainder.first().copied();
     }
 }
 

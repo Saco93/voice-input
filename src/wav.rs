@@ -149,9 +149,11 @@ fn parse_pcm16_wav(
         bail!("WAV is missing the format chunk");
     }
     let data = data.ok_or_else(|| anyhow!("WAV is missing the data chunk"))?;
-    Ok(data
-        .chunks_exact(2)
-        .map(|sample| i16::from_le_bytes([sample[0], sample[1]]))
+    let (samples, remainder) = data.as_chunks::<2>();
+    debug_assert!(remainder.is_empty());
+    Ok(samples
+        .iter()
+        .map(|sample| i16::from_le_bytes(*sample))
         .collect())
 }
 
