@@ -490,12 +490,8 @@ PanelWindow {
             return (panel.width - width) / 2 + store.hudOffsetX;
         }
         y: panel.height - height - Math.max(0, store.hudMarginBottom + store.hudOffsetY)
-        // A fixed, modest corner radius keeps the rectangular text viewport
-        // fully inside the capsule at any height: twelve pixels below the top
-        // edge the curved corner is only about one pixel inset, far less than
-        // the twenty-pixel text margins. A pill radius (height / 2) let the
-        // top and bottom text rows escape past the curved border instead.
-        radius: 14
+        // Mirror the effective Hyprland window rounding, as Omarchy Shell does.
+        radius: store.cornerRadius
         color: Qt.alpha(store.themeBackground, 0.96)
         border.width: 1
         border.color: Qt.alpha(store.themeMuted, 0.5)

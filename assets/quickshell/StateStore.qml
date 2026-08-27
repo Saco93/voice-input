@@ -75,6 +75,7 @@ QtObject {
     readonly property color themeOutputting: themePalette.outputting
     readonly property color themeWarning: themePalette.warning
     readonly property color themeError: themePalette.error
+    property int cornerRadius: 0
     property var snapshot: ({
         "phase": "idle",
         "transcript": "",
@@ -111,6 +112,8 @@ QtObject {
     property Timer waveformReconnectTimer
     property FileView themeFile
     property Timer themeRefreshTimer
+    property Process roundingProcess
+    property Timer roundingRefreshTimer
     // Status and transcript remain in the atomically replaced state file.
     // FileView change notifications do not reliably follow inode replacement,
     // so use bounded polling: lower frequency while idle and the original
@@ -306,8 +309,24 @@ QtObject {
             if (JSON.stringify(next) !== JSON.stringify(themePalette)) {
                 themePalette = next;
                 console.info("Voice Input HUD theme accent:", next.accent);
+                roundingRefreshTimer.restart();
             }
         } catch (error) {
+        }
+    }
+
+    function refreshRounding() {
+        roundingProcess.running = true;
+    }
+
+    function applyRoundingJson(source) {
+        try {
+            const parsed = JSON.parse(source || "{}");
+            const value = Number(parsed.int);
+            if (Number.isFinite(value) && value >= 0)
+                cornerRadius = value;
+        } catch (error) {
+            // Preserve the previous value when Hyprland or hyprctl is unavailable.
         }
     }
 
@@ -454,7 +473,10 @@ QtObject {
         waveformSocket = waveformSocketComponent.createObject(root);
     }
 
-    Component.onCompleted: connectWaveform()
+    Component.onCompleted: {
+        connectWaveform();
+        refreshRounding();
+    }
 
     waveformSocketComponent: Component {
         Socket {
@@ -502,6 +524,23 @@ QtObject {
         running: true
         triggeredOnStart: true
         onTriggered: root.refreshTheme()
+    }
+
+    roundingProcess: Process {
+        command: ["hyprctl", "-j", "getoption", "decoration:rounding"]
+
+        stdout: StdioCollector {
+            waitForEnd: true
+            onStreamFinished: root.applyRoundingJson(text)
+        }
+    }
+
+    // Hyprland applies theme-driven rounding asynchronously. Match Omarchy
+    // Shell's short delay before reading the effective compositor value.
+    roundingRefreshTimer: Timer {
+        interval: 200
+        repeat: false
+        onTriggered: root.refreshRounding()
     }
 
     stateFile: FileView {
