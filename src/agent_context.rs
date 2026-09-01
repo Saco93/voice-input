@@ -434,20 +434,27 @@ fn focused_kitty_agent(kitty_pid: u32) -> Result<Option<FocusedAgentProcess>> {
 
     let payload: Value = serde_json::from_slice(&output.stdout)
         .context("failed to parse Kitty remote-control response")?;
-    let Some(os_windows) = payload.as_array() else {
-        return Ok(None);
-    };
+    Ok(focused_kitty_agent_from_payload(&payload))
+}
 
+fn focused_kitty_agent_from_payload(payload: &Value) -> Option<FocusedAgentProcess> {
+    let os_windows = payload.as_array()?;
     for os_window in os_windows {
+        if !os_window["is_focused"].as_bool().unwrap_or(false) {
+            continue;
+        }
         let Some(tabs) = os_window["tabs"].as_array() else {
             continue;
         };
         for tab in tabs {
+            if !tab["is_active"].as_bool().unwrap_or(false) {
+                continue;
+            }
             let Some(windows) = tab["windows"].as_array() else {
                 continue;
             };
             for window in windows {
-                if !window["is_focused"].as_bool().unwrap_or(false) {
+                if !window["is_active"].as_bool().unwrap_or(false) {
                     continue;
                 }
                 let Some(processes) = window["foreground_processes"].as_array() else {
@@ -472,13 +479,13 @@ fn focused_kitty_agent(kitty_pid: u32) -> Result<Option<FocusedAgentProcess>> {
                         "codex" => AgentKind::Codex,
                         _ => continue,
                     };
-                    return Ok(Some(FocusedAgentProcess { kind, pid }));
+                    return Some(FocusedAgentProcess { kind, pid });
                 }
             }
         }
     }
 
-    Ok(None)
+    None
 }
 
 #[derive(Deserialize)]
@@ -1308,8 +1315,9 @@ mod tests {
     use super::{
         AgentKind, AgentSessionLocator, AgentTerminologySnapshot, MAX_AUDIO3_SESSION_CONTEXT_CHARS,
         MAX_REFINEMENT_TERMINOLOGY_CHARS, MAX_REFINEMENT_TERMINOLOGY_COUNT, PiRegistry, cap_text,
-        current_pi_published_reference, extract_terminology, latest_codex_assistant,
-        latest_pi_assistant, latest_pi_reference, sanitize_reference, start_terminology_capture,
+        current_pi_published_reference, extract_terminology, focused_kitty_agent_from_payload,
+        latest_codex_assistant, latest_pi_assistant, latest_pi_reference, sanitize_reference,
+        start_terminology_capture,
     };
 
     #[test]
@@ -1597,6 +1605,72 @@ mod tests {
                 .is_none()
         );
         assert!(started.elapsed() < std::time::Duration::from_millis(100));
+    }
+
+    #[test]
+    fn kitty_agent_comes_from_focused_os_window_active_tab_and_pane() {
+        let payload = json!([
+            {
+                "is_focused": false,
+                "tabs": [{
+                    "is_active": true,
+                    "windows": [{
+                        "is_active": true,
+                        "foreground_processes": [{"pid": 101, "cmdline": ["pi"]}]
+                    }]
+                }]
+            },
+            {
+                "is_focused": true,
+                "tabs": [
+                    {
+                        "is_active": false,
+                        "windows": [{
+                            "is_active": true,
+                            "is_focused": true,
+                            "foreground_processes": [{"pid": 202, "cmdline": ["pi"]}]
+                        }]
+                    },
+                    {
+                        "is_active": true,
+                        "windows": [
+                            {
+                                "is_active": false,
+                                "foreground_processes": [{"pid": 303, "cmdline": ["pi"]}]
+                            },
+                            {
+                                "is_active": true,
+                                "foreground_processes": [{
+                                    "pid": 404,
+                                    "cmdline": ["/opt/pi/bin/pi", "--session", "active"]
+                                }]
+                            }
+                        ]
+                    }
+                ]
+            }
+        ]);
+
+        let agent = focused_kitty_agent_from_payload(&payload).unwrap();
+        assert_eq!(agent.kind, AgentKind::Pi);
+        assert_eq!(agent.pid, 404);
+    }
+
+    #[test]
+    fn kitty_agent_lookup_fails_closed_without_active_hierarchy() {
+        let payload = json!([{
+            "is_focused": true,
+            "tabs": [{
+                "is_active": false,
+                "windows": [{
+                    "is_active": true,
+                    "is_focused": true,
+                    "foreground_processes": [{"pid": 202, "cmdline": ["pi"]}]
+                }]
+            }]
+        }]);
+
+        assert!(focused_kitty_agent_from_payload(&payload).is_none());
     }
 
     #[test]
