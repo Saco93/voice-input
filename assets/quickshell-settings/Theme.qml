@@ -7,7 +7,7 @@ QtObject {
 
     id: root
 
-    readonly property string themePath: Quickshell.env("HOME") + "/.config/omarchy/current/theme/colors.toml"
+    readonly property string themePath: Quickshell.env("HOME") + "/.local/state/omarchy/current/theme/colors.toml"
     // Safe, high-contrast defaults are retained if the Omarchy theme is missing
     // or is being replaced while this window is open.
     property var palette: ({
@@ -54,12 +54,12 @@ QtObject {
                 "accent": readColor(source, "accent", palette.accent),
                 "foreground": readColor(source, "foreground", palette.foreground),
                 "background": readColor(source, "background", palette.background),
-                "surface": readColor(source, "surface", palette.surface),
-                "elevated": readColor(source, "elevated", palette.elevated),
-                "muted": readColor(source, "color8", palette.muted),
-                "error": readColor(source, "color1", palette.error),
-                "success": readColor(source, "color2", palette.success),
-                "warning": readColor(source, "color3", palette.warning)
+                "surface": readColor(source, "lighter_background", palette.surface),
+                "elevated": readColor(source, "selection", palette.elevated),
+                "muted": readColor(source, "dark_foreground", palette.muted),
+                "error": readColor(source, "red", palette.error),
+                "success": readColor(source, "green", palette.success),
+                "warning": readColor(source, "yellow", palette.warning)
             };
         } catch (error) {
         }
