@@ -65,13 +65,6 @@ function captureSnapshot(ctx: ExtensionContext): RegistrySnapshot | undefined {
 export default function (pi: ExtensionAPI) {
   const instanceId = randomUUID();
   const processState = globalThis as typeof globalThis & Record<symbol, unknown>;
-  if (processState[REGISTRY_OWNER_KEY]) {
-    // Embedded AgentSessions reload normal extensions in the same Pi process.
-    // The first activation belongs to the interactive parent session; child
-    // activations must not replace its process-scoped registry.
-    return;
-  }
-  processState[REGISTRY_OWNER_KEY] = { instanceId } satisfies RegistryOwner;
 
   const runtime = process.env.XDG_RUNTIME_DIR;
   const directory = runtime ? join(runtime, "voice-input", "agent-sessions") : undefined;
@@ -84,6 +77,17 @@ export default function (pi: ExtensionAPI) {
   let stopped = true;
   let pendingWrite: Promise<void> = Promise.resolve();
   let cachedStartTicks: number | undefined;
+
+  function claimProcessRegistry(ctx: ExtensionContext): boolean {
+    if (ctx.mode !== "tui") return false;
+    const owner = processState[REGISTRY_OWNER_KEY] as RegistryOwner | undefined;
+    if (owner) return owner.instanceId === instanceId;
+
+    // The interactive parent session starts before embedded AgentSessions, so
+    // delayed ownership keeps child activations from replacing its registry.
+    processState[REGISTRY_OWNER_KEY] = { instanceId } satisfies RegistryOwner;
+    return true;
+  }
 
   function ownsProcessRegistry(): boolean {
     const owner = processState[REGISTRY_OWNER_KEY] as RegistryOwner | undefined;
@@ -205,7 +209,7 @@ export default function (pi: ExtensionAPI) {
   }
 
   pi.on("session_start", async (_event, ctx) => {
-    if (!ownsProcessRegistry()) return;
+    if (!claimProcessRegistry(ctx)) return;
     generation += 1;
     stopped = false;
     currentContext = ctx;
@@ -216,10 +220,6 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("before_agent_start", async (_event, ctx) => {
-    await refresh(ctx);
-  });
-
-  pi.on("agent_end", async (_event, ctx) => {
     await refresh(ctx);
   });
 
