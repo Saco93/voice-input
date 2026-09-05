@@ -53,6 +53,9 @@ manage_fcitx5 = true
 force_ascii_before_output = true
 
 [llm]
+# Empty preserves the model default: GPT OSS Medium, Qwen Off.
+reasoning_effort = ""
+credential_id = "openrouter-api-key"
 enabled = false
 api_base_url = "https://api.openai.com/v1"
 model = ""

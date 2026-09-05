@@ -122,6 +122,8 @@ QtObject {
             },
             "llm": {
                 "enabled": false,
+                "credential_id": "openrouter-api-key",
+                "reasoning_effort": "",
                 "api_base_url": "https://api.openai.com/v1",
                 "model": "",
                 "timeout_ms": 15000,
@@ -554,7 +556,8 @@ QtObject {
             return ;
 
         testing = true;
-        const entered = openrouterCredential;
+        const credentialId = config.llm.credential_id || "openrouter-api-key";
+        const entered = credentialId === "alibaba-api-key" ? alibabaCredential : openrouterCredential;
         const id = send("llm.test", {
             "llm": config.llm,
             "credential": entered.length > 0 ? {
@@ -565,10 +568,14 @@ QtObject {
             }
         }, false);
         // As with Save, never retain an entered secret after it has been sent.
-        if (id >= 0)
-            openrouterCredential = "";
-        else
+        if (id >= 0) {
+            if (credentialId === "alibaba-api-key")
+                alibabaCredential = "";
+            else
+                openrouterCredential = "";
+        } else {
             testing = false;
+        }
     }
 
     function applyBackendFields(fields) {

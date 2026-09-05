@@ -535,6 +535,7 @@ fn llm_test(
         .map_err(|_| error("config_read_failed", "configuration could not be loaded"))?
         .config;
     config.llm = params.llm;
+    config.validate().map_err(validation_error)?;
     config.llm.api_key = match params.credential.source.as_str() {
         "entered" => params
             .credential
@@ -542,7 +543,7 @@ fn llm_test(
             .filter(|value| !value.is_empty())
             .ok_or_else(|| error("invalid_params", "entered credential value is required"))?,
         "store" if params.credential.value.is_none() => {
-            credentials::decrypt(OPENROUTER_CREDENTIAL_ID).map_err(|_| {
+            credentials::decrypt(&config.llm.credential_id).map_err(|_| {
                 error(
                     "credential_read_failed",
                     "stored credential could not be read",

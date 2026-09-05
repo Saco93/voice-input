@@ -301,6 +301,17 @@ fn refine_once(
             { "role": "user", "content": user_content }
         ]
     });
+    match config.llm.model.as_str() {
+        "qwen3.8-27b" => {
+            let effort = config.llm.effective_reasoning_effort();
+            body["enable_thinking"] = json!(effort != "none");
+            body["reasoning_effort"] = json!(effort);
+        }
+        "openai/gpt-oss-120b" => {
+            body["reasoning"] = json!({ "effort": config.llm.effective_reasoning_effort() });
+        }
+        _ => {}
+    }
     if let Some(sort) = openrouter_provider_sort(config) {
         body["provider"] = json!({ "sort": sort });
     }
@@ -664,6 +675,58 @@ mod tests {
             normalize_refined_output(RefinementCategory::Default, "正式文本。"),
             "正式文本。"
         );
+    }
+
+    #[test]
+    fn refinement_sends_supported_reasoning_levels_and_preserves_defaults() {
+        for (model, efforts) in [
+            ("qwen3.8-27b", vec!["", "none", "low", "medium", "xhigh"]),
+            ("openai/gpt-oss-120b", vec!["", "low", "medium", "high"]),
+            ("custom-model", vec![""]),
+        ] {
+            for effort in efforts {
+                let (endpoint, requests, server) = mock_server(vec![MockResponse {
+                    status: 200,
+                    body: r#"{"choices":[{"finish_reason":"stop","message":{"content":"Check the API."}}]}"#,
+                    delay_ms: 0,
+                }]);
+                let mut config = test_config(endpoint, 5_000);
+                config.llm.model = model.into();
+                config.llm.reasoning_effort = effort.into();
+                let output = super::maybe_refine(
+                    &config,
+                    "um check the API",
+                    RefinementCategory::Default,
+                    None,
+                    None,
+                )
+                .unwrap();
+                server.join().unwrap();
+                assert_eq!(output, "Check the API.");
+                let requests = requests.lock().unwrap();
+                let body: serde_json::Value = serde_json::from_str(&requests[0]).unwrap();
+                assert_eq!(body["model"], model);
+                match model {
+                    "qwen3.8-27b" => {
+                        let expected = if effort.is_empty() { "none" } else { effort };
+                        assert_eq!(body["enable_thinking"], expected != "none");
+                        assert_eq!(body["reasoning_effort"], expected);
+                        assert!(body.get("reasoning").is_none());
+                    }
+                    "openai/gpt-oss-120b" => {
+                        let expected = if effort.is_empty() { "medium" } else { effort };
+                        assert_eq!(body["reasoning"]["effort"], expected);
+                        assert!(body.get("enable_thinking").is_none());
+                        assert!(body.get("reasoning_effort").is_none());
+                    }
+                    _ => {
+                        assert!(body.get("reasoning").is_none());
+                        assert!(body.get("enable_thinking").is_none());
+                        assert!(body.get("reasoning_effort").is_none());
+                    }
+                }
+            }
+        }
     }
 
     #[test]

@@ -27,11 +27,15 @@ pub fn apply_runtime_credentials(config: &mut Config) -> Result<()> {
         "VOICE_INPUT_ALIBABA_API_KEY",
         &config.asr.alibaba_audio3.api_key,
     )?;
-    config.llm.api_key = resolve(
-        OPENROUTER_CREDENTIAL_ID,
-        "VOICE_INPUT_OPENROUTER_API_KEY",
-        &config.llm.api_key,
-    )?;
+    config.llm.api_key = match config.llm.credential_id.as_str() {
+        ALIBABA_CREDENTIAL_ID => config.asr.alibaba_audio3.api_key.clone(),
+        OPENROUTER_CREDENTIAL_ID => resolve(
+            OPENROUTER_CREDENTIAL_ID,
+            "VOICE_INPUT_OPENROUTER_API_KEY",
+            &config.llm.api_key,
+        )?,
+        _ => bail!("unsupported LLM credential ID"),
+    };
     Ok(())
 }
 

@@ -432,6 +432,8 @@ pub struct ImeConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct LlmConfig {
+    pub reasoning_effort: String,
+    pub credential_id: String,
     pub enabled: bool,
     pub api_base_url: String,
     #[serde(default, skip_serializing)]
@@ -729,6 +731,8 @@ impl Default for Config {
                 force_ascii_before_output: true,
             },
             llm: LlmConfig {
+                reasoning_effort: String::new(),
+                credential_id: "openrouter-api-key".into(),
                 enabled: false,
                 api_base_url: "https://api.openai.com/v1".into(),
                 api_key: String::new(),
@@ -761,6 +765,19 @@ impl Default for AlibabaAudio3Config {
         Config::default().asr.alibaba_audio3
     }
 }
+impl LlmConfig {
+    pub fn effective_reasoning_effort(&self) -> &str {
+        if !self.reasoning_effort.is_empty() {
+            return &self.reasoning_effort;
+        }
+        match self.model.as_str() {
+            "qwen3.8-27b" => "none",
+            "openai/gpt-oss-120b" => "medium",
+            _ => "",
+        }
+    }
+}
+
 impl Default for LlmConfig {
     fn default() -> Self {
         Config::default().llm
@@ -978,6 +995,34 @@ impl Config {
             256,
             true,
         );
+
+        if !matches!(
+            self.llm.credential_id.as_str(),
+            "openrouter-api-key" | "alibaba-api-key"
+        ) {
+            fields.insert(
+                "llm.credential_id".into(),
+                "must select an OpenRouter or Alibaba credential".into(),
+            );
+        }
+
+        let valid_reasoning = match self.llm.model.as_str() {
+            "qwen3.8-27b" => matches!(
+                self.llm.effective_reasoning_effort(),
+                "none" | "low" | "medium" | "xhigh"
+            ),
+            "openai/gpt-oss-120b" => matches!(
+                self.llm.effective_reasoning_effort(),
+                "low" | "medium" | "high"
+            ),
+            _ => self.llm.reasoning_effort.is_empty(),
+        };
+        if !valid_reasoning {
+            fields.insert(
+                "llm.reasoning_effort".into(),
+                "unsupported reasoning level for this model".into(),
+            );
+        }
 
         validate_url(
             &mut fields,
@@ -2713,6 +2758,64 @@ native_timeout_ms = 20000
         config
             .validate()
             .expect("custom loopback plaintext remains available for tests");
+    }
+
+    #[test]
+    fn reasoning_levels_round_trip_and_reject_unsupported_model_combinations() {
+        for (model, supported, default_effort) in [
+            (
+                "qwen3.8-27b",
+                vec!["", "none", "low", "medium", "xhigh"],
+                "none",
+            ),
+            (
+                "openai/gpt-oss-120b",
+                vec!["", "low", "medium", "high"],
+                "medium",
+            ),
+            ("custom-model", vec![""], ""),
+        ] {
+            let mut config = Config::default();
+            config.llm.model = model.into();
+            assert_eq!(config.llm.effective_reasoning_effort(), default_effort);
+            for effort in ["", "none", "low", "medium", "high", "xhigh", "invalid"] {
+                config.llm.reasoning_effort = effort.into();
+                if supported.contains(&effort) {
+                    assert!(config.validate().is_ok(), "{model}: {effort}");
+                    let serialized = toml::to_string(&config.llm).unwrap();
+                    let reloaded: super::LlmConfig = toml::from_str(&serialized).unwrap();
+                    assert_eq!(reloaded.reasoning_effort, effort);
+                } else {
+                    assert!(
+                        config
+                            .validate()
+                            .unwrap_err()
+                            .fields
+                            .contains_key("llm.reasoning_effort")
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn llm_credential_defaults_preserve_existing_configs_and_reject_unknown_ids() {
+        let legacy: super::LlmConfig = toml::from_str("model = 'openai/gpt-oss-120b'").unwrap();
+        assert_eq!(legacy.credential_id, "openrouter-api-key");
+        let mut config = Config::default();
+        config.llm.credential_id = "alibaba-api-key".into();
+        assert!(config.validate().is_ok());
+        let serialized = toml::to_string(&config.llm).unwrap();
+        let reloaded: super::LlmConfig = toml::from_str(&serialized).unwrap();
+        assert_eq!(reloaded.credential_id, "alibaba-api-key");
+        config.llm.credential_id = "unknown-key".into();
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .fields
+                .contains_key("llm.credential_id")
+        );
     }
 
     #[test]
