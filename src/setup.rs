@@ -146,6 +146,8 @@ pub fn print_hyprland_snippet() -> Result<()> {
     println!("unbind = , F10");
     println!("binddp = , F8, Cancel voice input, exec, voice-input record cancel");
     println!("binddp = , F10, Restart active voice input, exec, voice-input record restart");
+    println!("# Non-focusable transcription history; select and paste with the mouse.");
+    println!("bindd = CTRL, F9, Voice input history, exec, voice-input history");
     println!("#");
     match config.hotkey.mode {
         HotkeyMode::Hold => {

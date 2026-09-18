@@ -1,12 +1,13 @@
 use std::path::PathBuf;
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
     Daemon,
     Record(RecordAction),
     Hud(HudCommand),
+    History(HistoryCommand),
     Status(StatusOptions),
     Diagnostics(DiagnosticsOptions),
     Config(ConfigOptions),
@@ -26,6 +27,13 @@ pub enum RecordAction {
     Toggle,
     Cancel,
     Restart,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HistoryCommand {
+    Show,
+    List,
+    Paste(u64),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -119,6 +127,7 @@ pub fn parse() -> Result<Command> {
         "daemon" => require_no_args(args, "daemon").map(|()| Command::Daemon),
         "record" => parse_record(args.collect()),
         "hud" => parse_hud(args.collect()),
+        "history" => parse_history(args.collect()),
         "status" => parse_status(args.collect()),
         "diagnostics" => parse_diagnostics(args.collect()),
         "config" => parse_config(args.collect()),
@@ -161,6 +170,24 @@ fn parse_record(args: Vec<String>) -> Result<Command> {
     };
 
     Ok(Command::Record(action))
+}
+
+fn parse_history(args: Vec<String>) -> Result<Command> {
+    let action = match args.as_slice() {
+        [] => HistoryCommand::Show,
+        [action] if action == "list" => HistoryCommand::List,
+        [action, id] if action == "paste" => {
+            let id = id
+                .parse::<u64>()
+                .context("history entry ID must be a positive integer")?;
+            if id == 0 {
+                bail!("history entry ID must be a positive integer");
+            }
+            HistoryCommand::Paste(id)
+        }
+        _ => bail!("expected `history`, `history list`, or `history paste <id>`"),
+    };
+    Ok(Command::History(action))
 }
 
 fn parse_hud(args: Vec<String>) -> Result<Command> {
@@ -377,6 +404,9 @@ USAGE:
   voice-input hud move <left|right|up|down> [amount]
   voice-input hud position <bottom-center|bottom-left|bottom-right>
   voice-input hud <center|reset>
+  voice-input history
+  voice-input history list
+  voice-input history paste <id>
   voice-input status [--follow] [--extended] [--format text|json]
   voice-input diagnostics [--format text|json]
   voice-input config [--format text|json]
@@ -385,6 +415,13 @@ USAGE:
   voice-input asr test --file <wav-path>
   voice-input asr stream-test --file <wav-path>
   voice-input llm test
+
+HISTORY:
+  `voice-input history` toggles a non-focusable history panel. Select with the mouse,
+  then click Paste to send the text to the currently focused application.
+  Completed transcriptions are kept in $XDG_RUNTIME_DIR/voice-input/history.json
+  until the runtime directory is removed (normally at logout or reboot).
+  `history list` prints newest-first JSON; `history paste <id>` reuses an entry without deleting it.
 
 COMPATIBILITY:
   `voice-input record start` / `voice-input record stop` are intended for Hyprland `bind` / `bindr`.
@@ -410,6 +447,34 @@ mod tests {
         assert!(parse_setup(strings(&["systemd", "extra"])).is_err());
         assert!(parse_asr(strings(&["test", "--file", "sample.wav", "extra"])).is_err());
         assert!(parse_asr(strings(&["stream-test", "--file", "sample.wav", "extra"])).is_err());
+    }
+
+    #[test]
+    fn history_commands_are_typed_and_reject_invalid_ids_or_extra_arguments() {
+        assert_eq!(
+            parse_history(strings(&[])).unwrap(),
+            Command::History(HistoryCommand::Show)
+        );
+        assert_eq!(
+            parse_history(strings(&["list"])).unwrap(),
+            Command::History(HistoryCommand::List)
+        );
+        assert_eq!(
+            parse_history(strings(&["paste", "42"])).unwrap(),
+            Command::History(HistoryCommand::Paste(42))
+        );
+        for args in [
+            vec!["paste"],
+            vec!["paste", "0"],
+            vec!["paste", "-1"],
+            vec!["paste", "nope"],
+            vec!["paste", "1", "extra"],
+            vec!["list", "extra"],
+            vec!["unknown"],
+        ] {
+            assert!(parse_history(strings(&args)).is_err());
+        }
+        assert!(help_text().contains("voice-input history paste <id>"));
     }
 
     #[test]

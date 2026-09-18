@@ -24,7 +24,7 @@ use crate::{
         SelectedResult, StageStatus,
     },
     focused_window::{self, RefinementCategory},
-    llm, output, paths,
+    history, llm, output, paths,
     state::{Phase, Snapshot, StateHandle},
     wav,
     waveform::{
@@ -478,6 +478,12 @@ fn handle_control(
     let Some(head) = parts.first().copied() else {
         bail!("empty control command");
     };
+    if head == "history-paste" {
+        // Never queue a manual paste behind transcription/refinement: by then
+        // the user may be working in a different application. Report busy to
+        // the picker without changing recording state or diagnostics.
+        return handle_history_paste(server, &parts[1..]);
+    }
     // Log receipt before waiting for the daemon mutex. This distinguishes a
     // compositor/keybinding miss from a request queued behind finalization.
     let is_recording_control = matches!(head, "start" | "stop" | "toggle" | "cancel" | "restart");
@@ -586,6 +592,24 @@ fn handle_control(
         eprintln!("voice-input control: entered idle generation {next_generation}");
     }
     result
+}
+
+fn handle_history_paste(server: &ControlServer, args: &[&str]) -> Result<String> {
+    let [id] = args else {
+        bail!("expected `history-paste <id>`");
+    };
+    let id = id
+        .parse::<u64>()
+        .context("invalid transcription history entry ID")?;
+    let daemon = server
+        .daemon
+        .try_lock()
+        .map_err(|_| anyhow!("Voice Input is busy; try pasting the history entry again"))?;
+    let entry = history::get(id)?;
+    // A replay is not a recording and never inherits its output type or focus.
+    // emit_text resolves the current window and restores the existing clipboard.
+    output::emit_text(&daemon.config, &entry.text, None)?;
+    Ok("ok\n".to_owned())
 }
 
 fn handle_hud_control(daemon: &mut Daemon, args: &[&str]) -> Result<String> {
@@ -1884,6 +1908,10 @@ impl Daemon {
             snapshot.output_mode = None;
             snapshot.output_driver = None;
         })?;
+
+        // Preserve every completed result before any delivery attempt. A
+        // successful paste command does not prove an editable field received it.
+        history::record(&final_transcript)?;
 
         let emit_report =
             match output::emit_text(&self.config, &final_transcript, output_target_hint) {

@@ -7,6 +7,7 @@ mod credentials;
 mod daemon;
 mod diagnostics;
 mod focused_window;
+mod history;
 mod http_client;
 mod llm;
 mod output;

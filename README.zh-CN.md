@@ -80,6 +80,7 @@ source = ~/.local/share/voice-input/omarchy-hyprland-snippet.conf
 F8                 取消当前 dictation
 F9                 开始/结束 dictation
 F10                丢弃并重新开始正在录制的 dictation（idle 时忽略）
+Ctrl+F9            打开或关闭转写历史
 Super+Ctrl+Alt+…   移动或重置 HUD
 ```
 
@@ -97,6 +98,12 @@ voice-input record cancel
 voice-input status
 systemctl --user status voice-input.service voice-input-hud.service
 ```
+
+## 临时转写历史
+
+按 **Ctrl+F9**，或运行 `voice-input history`，打开历史列表。如需自定义快捷键，修改 Hyprland 中执行 `voice-input history` 的绑定即可。使用鼠标选择记录、查看全文，再点击“粘贴”。列表始终不获取键盘焦点，文字会发送到那一刻当前聚焦的应用，不记录或恢复任何窗口或 tab。粘贴失败后，记录仍然保留，可以再次尝试。
+
+每次完成非空转写后，程序会先保存记录，再尝试自动粘贴，无论粘贴是否成功都保留结果。历史只保存最终文本和完成时间，位于仅当前用户可访问的 `$XDG_RUNTIME_DIR/voice-input/history.json`。重启 Voice Input 服务不会清空历史；运行时目录被清理时，通常是退出登录或重启电脑时，历史随之清空。浏览记录不使用剪贴板；重新粘贴沿用现有的临时剪贴板写入和恢复流程，不会再次调用 ASR 或 LLM。`voice-input history list` 按时间倒序输出 JSON；`voice-input history paste <id>` 重新粘贴指定记录，但不删除记录。这些命令会暴露转写内容，不应用于支持诊断报告。
 
 ## 安全的支持诊断信息
 

@@ -80,6 +80,7 @@ The default controls are:
 F8                 Cancel the current dictation
 F9                 Toggle dictation
 F10                Discard and restart active dictation (ignored while idle)
+Ctrl+F9            Open/close transcription history
 Super+Ctrl+Alt+…   Move/reset the HUD
 ```
 
@@ -99,6 +100,12 @@ systemctl --user status voice-input.service voice-input-hud.service
 ```
 
 Settings → **Refinement** offers **GPT OSS 120B (OpenRouter)**, **Qwen3.8 27B (Alibaba Beijing)**, and **Custom** model choices. Presets select the model, API endpoint, and stored credential together. Qwen3.8 27B uses the Beijing Alibaba credential. The Reasoning level selector offers Off/Low/Medium/XHigh for Qwen and Low/Medium/High for GPT OSS; GPT OSS requires reasoning. Existing configurations retain Qwen Off and GPT OSS Medium. Unknown custom models use their provider default. Custom retains editable model, endpoint, and credential selection. **Test LLM** tests the draft without saving; **Save** applies the selection. Existing configurations continue to use their current model and OpenRouter credential.
+
+## Temporary transcription history
+
+Press **Ctrl+F9**, or run `voice-input history`, to open the history panel. To customize the shortcut, edit the Hyprland binding that runs `voice-input history`. Select a record with the mouse, review its full text, and click **Paste**. The panel never takes keyboard focus: delivery uses the application focused at that moment, without remembering or restoring any window or tab. A failed paste keeps the record available for another attempt.
+
+Every nonempty completed transcription is saved before automatic paste, independently of paste success. Only final text and completion time are retained, in the private `$XDG_RUNTIME_DIR/voice-input/history.json` file. History survives a Voice Input service restart, but is removed with the runtime directory, normally at logout or reboot. Browsing history does not touch the clipboard; replay uses the existing temporary clipboard paste and restoration. No additional ASR or LLM request is made. `voice-input history list` prints newest-first JSON; `voice-input history paste <id>` replays one entry without deleting it. These commands expose transcript text and are not support-diagnostics output.
 
 ## Safe support diagnostics
 

@@ -15,14 +15,14 @@ use anyhow::{Context, Result, anyhow, bail};
 use crate::{
     args::{
         AsrCommand, AsrStreamTestOptions, AsrTestOptions, Command as ParsedCommand, ConfigOptions,
-        DiagnosticsOptions, HudCommand, HudMoveDirection, HudPositionCommand, LlmCommand,
-        OutputFormat, SetupCommand,
+        DiagnosticsOptions, HistoryCommand, HudCommand, HudMoveDirection, HudPositionCommand,
+        LlmCommand, OutputFormat, SetupCommand,
     },
     backend::{self, AsrBackend, AsrControl, AsrEvent, AsrSessionHandle, AudioSpec},
     config::{AsrProvider, Config},
     daemon,
     diagnostics::SupportPayload,
-    focused_window, llm, output, paths, setup,
+    focused_window, history, llm, output, paths, setup,
     state::Snapshot,
     wav,
 };
@@ -46,6 +46,7 @@ pub fn run() -> Result<()> {
             print!("{response}");
             Ok(())
         }
+        ParsedCommand::History(command) => run_history(command),
         ParsedCommand::Status(options) => run_status(options),
         ParsedCommand::Diagnostics(options) => print_diagnostics(options),
         ParsedCommand::Config(options) => print_config(options),
@@ -212,6 +213,57 @@ fn open_settings() -> Result<()> {
         .stderr(Stdio::null())
         .spawn()
         .context("failed to launch Quickshell settings UI")?;
+    Ok(())
+}
+
+fn run_history(command: HistoryCommand) -> Result<()> {
+    match command {
+        HistoryCommand::Show => open_history(),
+        HistoryCommand::List => {
+            println!("{}", serde_json::to_string(&history::list()?)?);
+            Ok(())
+        }
+        HistoryCommand::Paste(id) => {
+            let response = daemon::send_control_command(&format!("history-paste {id}"))?;
+            if let Some(message) = response.strip_prefix("error: ") {
+                bail!("{}", message.trim_end());
+            }
+            if response.trim() != "ok" {
+                bail!("daemon did not acknowledge the history paste");
+            }
+            print!("{response}");
+            Ok(())
+        }
+    }
+}
+
+fn open_history() -> Result<()> {
+    let history_dir = paths::quickshell_history_path()?;
+    let toggled = Command::new("/usr/bin/qs")
+        .arg("--path")
+        .arg(&history_dir)
+        .args(["ipc", "call", "voiceInputHistory", "toggle"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false);
+    if toggled {
+        return Ok(());
+    }
+
+    let status = Command::new("/usr/bin/qs")
+        .args(["--daemonize", "--no-duplicate", "--path"])
+        .arg(history_dir)
+        .env("VOICE_INPUT_BIN", paths::current_executable()?)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .status()
+        .context("failed to launch Quickshell history UI")?;
+    if !status.success() {
+        bail!("Quickshell history UI failed to start");
+    }
     Ok(())
 }
 

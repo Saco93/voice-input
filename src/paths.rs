@@ -19,6 +19,10 @@ pub fn runtime_dir() -> Result<PathBuf> {
     Ok(base.join("voice-input"))
 }
 
+pub fn history_path() -> Result<PathBuf> {
+    Ok(runtime_dir()?.join("history.json"))
+}
+
 pub fn control_socket_path() -> Result<PathBuf> {
     Ok(runtime_dir()?.join("control.sock"))
 }
@@ -56,6 +60,10 @@ pub fn asset_dir() -> Result<PathBuf> {
 
 pub fn quickshell_settings_path() -> Result<PathBuf> {
     Ok(asset_dir()?.join("quickshell-settings"))
+}
+
+pub fn quickshell_history_path() -> Result<PathBuf> {
+    Ok(quickshell_settings_path()?.join("history.qml"))
 }
 
 pub fn waybar_snippet_path() -> Result<PathBuf> {
