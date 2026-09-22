@@ -891,7 +891,11 @@ impl SafeConfigSummary {
 impl Default for SafeConfigSummary {
     fn default() -> Self {
         let config = Config::default();
-        Self::from_config(&config)
+        Self {
+            // Older summaries omitted routing fields and used shared domains.
+            endpoint_mode: Audio3EndpointMode::Regional,
+            ..Self::from_config(&config)
+        }
     }
 }
 
@@ -1488,6 +1492,19 @@ mod tests {
             session.final_pass.reason,
             Some(FinalPassReason::MissingCompletion)
         );
+    }
+
+    #[test]
+    fn workspace_ids_and_generated_hosts_never_enter_support_diagnostics() {
+        let mut config = Config::default();
+        config.asr.alibaba_audio3.workspace_id = "llm-private-workspace".into();
+        let payload = SupportPayload::new(&config, None);
+        let encoded = serde_json::to_string(&payload).unwrap();
+        assert!(encoded.contains("\"endpoint_mode\":\"workspace\""));
+        for forbidden in ["llm-private-workspace", "workspace_id", "maas.aliyuncs.com"] {
+            assert!(!encoded.contains(forbidden));
+            assert!(!payload.format_text().contains(forbidden));
+        }
     }
 
     #[test]

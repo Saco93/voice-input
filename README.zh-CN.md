@@ -66,7 +66,7 @@ git pull --ff-only && make enable-service
 voice-input settings
 ```
 
-Qwen-Audio-3 是默认的 ASR provider。请填写 Alibaba 凭据，按需保留或关闭本地 fallback，并按需启用 LLM 或 Agent context。凭据通过标准的 systemd 用户 credential store 加密保存。
+Qwen-Audio-3 是默认的 ASR provider。首次配置时，请保留**业务空间专属**端点模式，选择**北京**或**新加坡**，并从 Alibaba 控制台复制真实的 **Workspace ID**，不要填写完整 URL。请填写与区域、业务空间匹配且具有所选模型权限的 Alibaba API key。Rust 后端会生成 Streaming、Native 和 Alibaba Qwen 文本整理所需的三个 API 地址，无需手动编辑 URL。请按需保留或关闭本地 fallback，并按需启用 LLM 或 Agent context。凭据仍通过标准的 systemd 用户 credential store 加密保存。
 
 加载 Hyprland 快捷键：
 
@@ -99,6 +99,8 @@ voice-input status
 systemctl --user status voice-input.service voice-input-hud.service
 ```
 
+Settings 的文本整理选项提供 **GPT OSS 120B（OpenRouter）**、**Qwen3.8 27B（阿里云北京）**和**自定义**。选择 Alibaba Qwen 预设后，`llm.endpoint_mode` 会设为 `alibaba-workspace`，并共用 Audio3 的区域、Workspace ID 和加密 Alibaba 凭据。Rust 后端会生成 OpenAI-compatible HTTP 基础地址，不会修改未生效的自定义 `api_base_url`。OpenRouter 使用独立的 `custom` 端点模式。选择自定义模型会保留当前端点模式；如需编辑独立 URL，请将端点模式切换为自定义。公开示例仍默认关闭 LLM，并使用 `endpoint_mode = "custom"`；现有配置会保留原模型、端点和凭据，直到用户明确选择其他预设或路由。
+
 ## 临时转写历史
 
 按 **Ctrl+F9**，或运行 `voice-input history`，打开历史列表。如需自定义快捷键，修改 Hyprland 中执行 `voice-input history` 的绑定即可。使用鼠标选择记录、查看全文，再点击“粘贴”。列表始终不获取键盘焦点，文字会发送到那一刻当前聚焦的应用，不记录或恢复任何窗口或 tab。粘贴失败后，记录仍然保留，可以再次尝试。
@@ -115,13 +117,15 @@ systemctl --user status voice-input.service voice-input-hud.service
 
 Qwen-Audio-3 是默认的远程 provider，也是主要的识别路径。本地 CLI 仍可由用户明确选择，并且可以在远程识别失败后提供备用识别。请在 Settings 中配置加密的 Alibaba 凭据和 Audio3 选项。详细流程和选项参考请查看 Wiki 的[架构](https://github.com/Saco93/voice-input/wiki/Architecture.zh-CN)与[配置参考](https://github.com/Saco93/voice-input/wiki/Configuration.zh-CN)。
 
-**端点模式**默认使用**区域路由**，默认区域为**北京**，也可以选择**新加坡**。区域路由会为所选区域使用固定且经过审核的流式主机和原生主机。**自定义**模式会原样使用已配置的流式 URL 和原生 URL，包括路径、端口和 query 字节。
+新配置的**端点模式**默认使用**业务空间专属**（`workspace`），默认区域为**北京**（`beijing`），`workspace_id` 初始为空，也可以选择**新加坡**（`singapore`）。这两个区域是 Voice Input 当前为 Audio3 提供的选项，不代表整个阿里云百炼只提供两个区域。填写控制台中的 Workspace ID 后，Rust 后端会根据区域和 ID 生成使用业务空间专属域名的流式 URL 和原生 URL。**区域路由**（`regional`）保留所选区域的旧版共享域名组合。**自定义**（`custom`）会原样使用已配置的流式 URL 和原生 URL，包括路径、端口和 query 字节。业务空间专属和区域路由模式均保留未生效的 `endpoint` 和 `native_endpoint` 字符串。
 
-迁移过程会区分字段是否存在。未包含 `endpoint_mode` 的配置只有在两个旧 URL 与北京标准组合完全相同时，才会迁移到北京区域路由；只有在两个 URL 与新加坡标准组合完全相同时，才会迁移到新加坡区域路由。混合组合、非标准主机、回环端点、代理，以及带有自定义路径、端口或 query 的配置都会迁移到自定义模式，并逐字节保留两个 URL 字符串。明确配置的端点模式具有优先级；明确配置的区域也具有优先级，缺少区域字段时默认使用北京。程序还会保留处于非活动状态的原始 URL。
+首次启动时，程序可以加载 Workspace ID 为空的模板，让用户打开 Settings 完成配置。保存正在使用的业务空间专属配置前，必须填写有效 ID；Settings 会拒绝无效 ID，以及误填到 ID 字段中的完整 URL。运行时缺少有效 ID 就不会向业务空间专属域名发送请求。使用该域名的 Alibaba 文本整理也遵循相同要求。
+
+现有配置文件会保留原有路由，直到用户明确切换到业务空间专属模式并填写 ID。迁移过程会区分字段是否存在。未包含 `endpoint_mode` 的配置只有在两个旧 URL 与北京标准组合完全相同时，才会迁移到北京区域路由；只有在两个 URL 与新加坡标准组合完全相同时，才会迁移到新加坡区域路由。混合组合、非标准主机、回环端点、代理，以及带有自定义路径、端口或 query 的配置都会迁移到自定义模式，并逐字节保留两个 URL 字符串。明确配置的端点模式具有优先级；明确配置的区域也具有优先级，缺少区域字段时默认使用北京。程序还会保留处于非活动状态的原始 URL。
 
 旧的 `alibaba-qwen-realtime` 选择会迁移为 Qwen-Audio-3。标准北京和新加坡实时端点会保留原区域；自定义路由会继续使用同一 origin，并在自定义模式下把流式路径从 `/realtime` 改为 `/inference`，同时在同一 origin 上推导 Native 路径，请在 Settings 中确认代理专用路径。普通配置写入不会丢弃明文 Alibaba key；打开 Settings 并保存一次即可将它迁移到加密凭据存储。
 
-Alibaba API key 受区域范围约束。更改区域后，用户可能需要替换加密的 Alibaba 凭据。Voice Input 绝不会探测其他区域，也不会自动迁移 key。支持选择新加坡区域并不表示已经实现完整功能一致性；每个模型、控制项组合以及语言或词汇表场景仍需完成经过授权的在线验证。
+Alibaba API key 必须与所选区域和业务空间匹配，并具有所选模型的权限。更改区域或业务空间后，用户可能需要替换加密的 Alibaba 凭据。Voice Input 绝不会探测其他区域，也不会自动迁移 key。支持选择新加坡区域并不表示已经实现完整功能一致性；每个模型、控制项组合以及语言或词汇表场景仍需完成经过授权的在线验证。本次业务空间专属域名变更未进行真实 API 测试。
 
 流式模型负责提供实时文本。用户启用 Session 术语，并且听写开始时聚焦的是经过验证的 Pi 或 Codex session 时，`run-task` 还会接收最多 400 个字符且低频优先的本地脱敏 Session Context 术语；程序不会发送 `continue-task`。如果在发送 `finish-task` 前发生一次可恢复的传输中断，Voice Input 会创建新的 Audio3 task，使旧 task 的 transcript 失效，并且以 4 倍实时速度从头重放保留的 PCM，同时继续录音。保留的 PCM 必须包含完整前缀，其上限取配置的最大录音时长、300 秒和 10 MiB PCM 三者中的最小值；超过上限会停用重连，不会改为保留或重放不完整的前缀。第二次中断或发送 `finish-task` 后的中断会使用现有的 Native 或本地完整音频恢复。**语言提示**和**流式 heartbeat** 是两个相互独立的选用设置，默认均为关闭。启用语言提示后，程序会把现有语言选项发送给 Audio3：英语使用 `en`；简体中文和繁体中文使用 `zh,en`；日语使用 `ja,en`；韩语使用 `ko,en`。中文、日语和韩语的额外英语提示用于保留英语混合识别；关闭该开关会保留服务商的自动检测行为。启用流式 heartbeat 后，只要程序继续发送格式正确的音频帧，它就能使长时间静音的按键说话 session 保持连接。
 
@@ -140,7 +144,7 @@ voice-input asr stream-test --file sample.wav  # WebSocket 流式识别
 voice-input asr test --file sample.wav         # 原生完整音频识别
 ```
 
-两个命令都要求当前配置已经选择 Qwen-Audio-3。远程测试会把指定音频发送到解析后的区域路由或完全按原值使用的自定义 Alibaba 端点，并且可能产生 API 费用。
+两个命令都要求当前配置已经选择 Qwen-Audio-3。远程测试会把指定音频发送到解析后的业务空间专属地址、区域路由或完全按原值使用的自定义 Alibaba 端点，并且可能产生 API 费用。
 
 ## 主要能力
 
@@ -173,7 +177,7 @@ voice-input asr test --file sample.wav         # 原生完整音频识别
 
 ## 隐私
 
-远程 Qwen-Audio-3 识别会把音频发送到所选的区域路由或完全按原值使用的自定义 Alibaba 端点。LLM refinement 会把 transcript 和粗粒度的目标风格（coding agent 结构化 Markdown、`instant-messaging` 或默认风格）通过 system prompt 发送到配置的 provider。只有在用户明确启用 Session 术语时，Voice Input 才会捕获听写开始时聚焦的 Pi 或 Codex session，在本地对其最近一条已完成的 assistant message 进行脱敏和截断，使用 Jieba 分词并去重，再按照出现次数从少到多排列。Audio3 Streaming 和 Refine 会接收这份不可变快照各自受限的视图；两类请求都不会包含 Agent source message、频次数据、窗口标题、进程 ID 或原始桌面元数据。公开示例配置默认关闭远程 refinement 和 Session 术语。Voice Input 不收集遥测或分析数据。
+远程 Qwen-Audio-3 识别会把音频发送到所选的业务空间专属地址、区域路由或完全按原值使用的自定义 Alibaba 端点。LLM refinement 会把 transcript 和粗粒度的目标风格（coding agent 结构化 Markdown、`instant-messaging` 或默认风格）通过 system prompt 发送到配置的 provider。只有在用户明确启用 Session 术语时，Voice Input 才会捕获听写开始时聚焦的 Pi 或 Codex session，在本地对其最近一条已完成的 assistant message 进行脱敏和截断，使用 Jieba 分词并去重，再按照出现次数从少到多排列。Audio3 Streaming 和 Refine 会接收这份不可变快照各自受限的视图；两类请求都不会包含 Agent source message、频次数据、窗口标题、进程 ID 或原始桌面元数据。公开示例配置默认关闭远程 refinement 和 Session 术语。Voice Input 不收集遥测或分析数据。
 
 ## 项目状态
 

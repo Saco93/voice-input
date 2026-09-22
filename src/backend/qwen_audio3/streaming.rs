@@ -1092,7 +1092,7 @@ fn websocket_request_for_config(
     audio3: &AlibabaAudio3Config,
     api_key: &str,
 ) -> Result<tungstenite::http::Request<()>> {
-    let endpoints = audio3.resolve_endpoints();
+    let endpoints = audio3.resolve_endpoints()?;
     websocket_request(endpoints.streaming(), api_key)
 }
 
@@ -3528,8 +3528,35 @@ mod tests {
     }
 
     #[test]
+    fn workspace_websocket_request_uses_generated_host_and_bearer_auth() {
+        let mut audio3 = AlibabaAudio3Config {
+            workspace_id: "llm-test".into(),
+            ..Default::default()
+        };
+        for (region, id) in [
+            (Audio3Region::Beijing, "cn-beijing"),
+            (Audio3Region::Singapore, "ap-southeast-1"),
+        ] {
+            audio3.region = region;
+            let request = websocket_request_for_config(&audio3, "test-key").unwrap();
+            assert_eq!(
+                request.uri().to_string(),
+                format!("wss://llm-test.{id}.maas.aliyuncs.com/api-ws/v1/inference")
+            );
+            assert_eq!(
+                request.headers()["host"],
+                format!("llm-test.{id}.maas.aliyuncs.com")
+            );
+            assert_eq!(request.headers()["authorization"], "Bearer test-key");
+        }
+        audio3.workspace_id.clear();
+        assert!(websocket_request_for_config(&audio3, "test-key").is_err());
+    }
+
+    #[test]
     fn production_websocket_request_seam_uses_resolved_target() {
         let mut audio3 = AlibabaAudio3Config {
+            endpoint_mode: Audio3EndpointMode::Regional,
             region: Audio3Region::Singapore,
             ..AlibabaAudio3Config::default()
         };

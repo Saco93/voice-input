@@ -7,6 +7,9 @@ SettingsPage {
 
     required property SettingsController controller
     property alias advancedExpanded: speechAdvanced.expanded
+    readonly property bool alibabaAsr: controller.value("asr.provider", "alibaba-qwen-audio3") === "alibaba-qwen-audio3"
+    readonly property string endpointMode: controller.value("asr.alibaba_audio3.endpoint_mode", "workspace")
+    readonly property bool workspaceRouting: (alibabaAsr && endpointMode === "workspace") || (controller.value("llm.enabled", false) && controller.value("llm.endpoint_mode", "custom") === "alibaba-workspace")
 
     title: "Speech"
     description: "Configure audio capture and speech recognition."
@@ -144,10 +147,10 @@ SettingsPage {
         }
 
         SectionCard {
-            visible: root.controller.value("asr.provider", "alibaba-qwen-audio3") === "alibaba-qwen-audio3" || root.controller.errorFor("credentials.alibaba-api-key").length > 0
+            visible: root.alibabaAsr || root.workspaceRouting || root.controller.errorFor("credentials.alibaba-api-key").length > 0
             theme: root.theme
             title: "Alibaba credential"
-            description: "Used by Qwen-Audio-3."
+            description: "Shared by Qwen-Audio-3 and Alibaba refinement."
 
             SettingTextField {
                 theme: root.theme
@@ -168,6 +171,41 @@ SettingsPage {
         }
 
         SectionCard {
+            visible: root.workspaceRouting || (root.alibabaAsr && root.endpointMode === "regional") || root.controller.errorFor("asr.alibaba_audio3.region").length > 0 || root.controller.errorFor("asr.alibaba_audio3.workspace_id").length > 0
+            theme: root.theme
+            title: "Alibaba routing"
+            description: "Region and Workspace ID are shared by workspace speech recognition and Alibaba refinement."
+
+            SettingCombo {
+                theme: root.theme
+                label: "Region"
+                value: root.controller.value("asr.alibaba_audio3.region", "beijing")
+                labels: ["Beijing", "Singapore"]
+                values: ["beijing", "singapore"]
+                help: "The API key and workspace must belong to this region. A region/key mismatch causes authentication failures; Voice Input never switches regions automatically. Check model availability in the selected region."
+                error: root.controller.errorFor("asr.alibaba_audio3.region")
+                enabled: !root.controller.busy
+                onSelected: (value) => {
+                    return root.controller.setValue("asr.alibaba_audio3.region", value);
+                }
+            }
+
+            SettingTextField {
+                visible: root.workspaceRouting || root.controller.errorFor("asr.alibaba_audio3.workspace_id").length > 0
+                theme: root.theme
+                label: "Workspace ID"
+                value: root.controller.value("asr.alibaba_audio3.workspace_id", "")
+                help: "Required for workspace routing. Copy the Workspace ID from Alibaba Model Studio in the selected region, not a URL, hostname, or API key."
+                error: root.controller.errorFor("asr.alibaba_audio3.workspace_id")
+                enabled: !root.controller.busy
+                onEdited: (value) => {
+                    return root.controller.setValue("asr.alibaba_audio3.workspace_id", value);
+                }
+            }
+
+        }
+
+        SectionCard {
             visible: root.controller.value("asr.provider", "alibaba-qwen-audio3") === "alibaba-qwen-audio3" || root.controller.hasErrorPrefix("asr.alibaba_audio3.") || root.controller.audio3VocabularyDirty
             theme: root.theme
             title: "Qwen-Audio-3"
@@ -176,29 +214,14 @@ SettingsPage {
             SettingCombo {
                 theme: root.theme
                 label: "Endpoint mode"
-                value: root.controller.value("asr.alibaba_audio3.endpoint_mode", "regional")
-                labels: ["Regional", "Custom"]
-                values: ["regional", "custom"]
-                help: "Regional routing uses the fixed reviewed Alibaba host for the selected region. Custom keeps the exact streaming and native endpoints in Advanced settings."
+                value: root.endpointMode
+                labels: ["Workspace (default)", "Regional", "Custom"]
+                values: ["workspace", "regional", "custom"]
+                help: "Workspace routing uses the shared Region and Workspace ID. Regional keeps the legacy shared regional hosts. Custom uses the exact streaming and native endpoints in Advanced; those URLs are ignored in other modes."
                 error: root.controller.errorFor("asr.alibaba_audio3.endpoint_mode")
                 enabled: !root.controller.busy
                 onSelected: (value) => {
                     return root.controller.setValue("asr.alibaba_audio3.endpoint_mode", value);
-                }
-            }
-
-            SettingCombo {
-                visible: root.controller.value("asr.alibaba_audio3.endpoint_mode", "regional") === "regional" || root.controller.errorFor("asr.alibaba_audio3.region").length > 0
-                theme: root.theme
-                label: "Region"
-                value: root.controller.value("asr.alibaba_audio3.region", "beijing")
-                labels: ["Beijing", "Singapore"]
-                values: ["beijing", "singapore"]
-                help: "Select the region that owns the configured Alibaba API key. Singapore controls still require scenario-specific live validation."
-                error: root.controller.errorFor("asr.alibaba_audio3.region")
-                enabled: !root.controller.busy
-                onSelected: (value) => {
-                    return root.controller.setValue("asr.alibaba_audio3.region", value);
                 }
             }
 
@@ -360,7 +383,7 @@ SettingsPage {
                 showDivider: audio3NativeCard.visible
 
                 SettingTextField {
-                    visible: root.controller.value("asr.alibaba_audio3.endpoint_mode", "regional") === "custom" || root.controller.errorFor("asr.alibaba_audio3.endpoint").length > 0
+                    visible: root.endpointMode === "custom"
                     theme: root.theme
                     label: "Streaming endpoint"
                     value: root.controller.value("asr.alibaba_audio3.endpoint", "")
@@ -464,7 +487,7 @@ SettingsPage {
                 showDivider: false
 
                 SettingTextField {
-                    visible: root.controller.value("asr.alibaba_audio3.endpoint_mode", "regional") === "custom" || root.controller.errorFor("asr.alibaba_audio3.native_endpoint").length > 0
+                    visible: root.endpointMode === "custom"
                     theme: root.theme
                     label: "Native endpoint"
                     value: root.controller.value("asr.alibaba_audio3.native_endpoint", "")

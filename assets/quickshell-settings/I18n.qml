@@ -112,6 +112,15 @@ QtObject {
         "Backend default": "使用后端默认值",
         "Alibaba credential": "Alibaba 凭据",
         "Used by Qwen-Audio-3.": "供 Qwen-Audio-3 使用。",
+        "Shared by Qwen-Audio-3 and Alibaba refinement.": "供 Qwen-Audio-3 和 Alibaba 文本优化共同使用。",
+        "Alibaba routing": "阿里云接入设置",
+        "Region and Workspace ID are shared by workspace speech recognition and Alibaba refinement.": "使用业务空间专属域名的语音识别和 Alibaba 文本优化共用区域和 Workspace ID。",
+        "Workspace (default)": "业务空间专属（默认）",
+        "Alibaba workspace": "阿里云业务空间",
+        "Workspace ID": "Workspace ID（业务空间 ID）",
+        "Workspace routing uses the shared Region and Workspace ID. Regional keeps the legacy shared regional hosts. Custom uses the exact streaming and native endpoints in Advanced; those URLs are ignored in other modes.": "业务空间专属模式使用共用的区域和 Workspace ID。区域路由保留旧的共享域名。自定义模式使用高级设置中的完整流式和原生地址；其他模式不会使用这两个地址。",
+        "The API key and workspace must belong to this region. A region/key mismatch causes authentication failures; Voice Input never switches regions automatically. Check model availability in the selected region.": "API key 和业务空间必须属于所选区域，否则会导致鉴权失败。语音输入不会自动切换区域，请确认所选区域提供所需模型。",
+        "Required for workspace routing. Copy the Workspace ID from Alibaba Model Studio in the selected region, not a URL, hostname, or API key.": "使用业务空间专属域名时必填。请从阿里云百炼所选区域复制 Workspace ID，不要填写 URL、域名或 API key。",
         "Replace Alibaba API key": "替换 Alibaba API key",
         "Enter a new credential": "输入新凭据",
         "API keys are region-scoped; Voice Input never probes another region or migrates a key automatically.": "API key 受区域范围约束；语音输入绝不会探测其他区域，也不会自动迁移 key。",
@@ -195,6 +204,10 @@ QtObject {
         "GPT OSS supports Low, Medium, and High; reasoning cannot be turned off.": "GPT OSS 支持低、中、高推理级别，无法关闭推理。",
         "This custom model uses the provider's default reasoning settings.": "此自定义模型使用提供商默认的推理设置。",
         "Select a model preset or configure a custom model.": "选择模型预设或配置自定义模型。",
+        "Select a model preset or configure a custom model. Qwen uses the shared Alibaba region; verify model availability before choosing Singapore.": "选择模型预设或配置自定义模型。Qwen 使用共用的阿里云区域；选择新加坡前，请确认该区域提供所需模型。",
+        "Alibaba workspace uses Region and Workspace ID in Speech > Alibaba routing. Custom uses the API base URL in Advanced; that URL is kept but ignored in workspace mode.": "阿里云业务空间模式使用“语音识别 → 阿里云接入设置”中的区域和 Workspace ID。自定义模式使用高级设置中的 API 基础 URL；业务空间模式会保留但不使用该 URL。",
+        "The API key must match the region and workspace selected in Speech; a mismatch causes authentication failures.": "API key 必须与语音识别页面所选的区域和业务空间匹配，否则会导致鉴权失败。",
+        "Use the API key for the region of the custom endpoint.": "请使用自定义地址所属区域的 API key。",
         "API credential": "API 凭据",
         "Alibaba": "阿里云",
         "Provider default": "使用提供商默认值",
@@ -206,6 +219,7 @@ QtObject {
         "At dictation start, locally extract rare-first terminology for Audio3 Session Context and Refine.": "开始听写时，在本地提取低频优先的术语，并将其分别用于 Audio3 Session Context 和 Refine。",
         "Test refinement": "测试文本优化",
         "Test the current LLM draft and credential without saving it.": "无需保存即可测试当前 LLM 设置草稿和凭据。",
+        "Test the current LLM draft, shared Alibaba region and Workspace ID, and credential without saving.": "无需保存即可测试当前 LLM 设置草稿、共用的阿里云区域和 Workspace ID，以及凭据。",
         "Testing…": "正在测试…",
         "Test LLM": "测试 LLM",
         "Endpoint, timeout, provider ordering, and context limits.": "设置端点、超时、提供商顺序和上下文限制。",
@@ -321,6 +335,9 @@ QtObject {
         "params must be an empty object": "params 必须是空对象",
         "configuration could not be saved": "无法保存配置",
         "is required": "必填",
+        "is required; copy the Workspace ID from the Alibaba console": "必填；请从阿里云控制台复制 Workspace ID",
+        "must be a single ID of at most 63 letters, digits or internal hyphens, not a URL or hostname": "必须是由字母、数字及中间的连字符组成的单个 ID，最长 63 个字符；不能填写 URL 或域名",
+        "must select the Alibaba credential for workspace routing": "使用业务空间专属域名时，必须选择 Alibaba 凭据",
         "must not contain control characters": "不得包含控制字符",
         "must be a valid URL": "必须是有效的 URL",
         "must not contain embedded credentials": "不得包含嵌入式凭据",
@@ -387,9 +404,9 @@ QtObject {
         if (match)
             return root.tr(match[1]) + "。留空将保持不变。";
 
-        match = source.match(/^(.*)\. Blank uses the stored credential\.$/);
+        match = source.match(/^(.*)\. Blank uses the stored credential\.(.*)$/);
         if (match)
-            return root.tr(match[1]) + "。留空将使用已存储的凭据。";
+            return root.tr(match[1]) + "。留空将使用已存储的凭据。" + root.tr(match[2].trim());
 
         match = source.match(/^Settings backend exited \(code (.+)\)\.$/);
         if (match)

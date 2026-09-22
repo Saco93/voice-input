@@ -89,8 +89,9 @@ QtObject {
                 "finalize_timeout_ms": 8000,
                 "fallback_to_local": true,
                 "alibaba_audio3": {
-                    "endpoint_mode": "regional",
+                    "endpoint_mode": "workspace",
                     "region": "beijing",
+                    "workspace_id": "",
                     "endpoint": "wss://dashscope.aliyuncs.com/api-ws/v1/inference",
                     "model": "qwen-audio-3.0-asr-flash-streaming",
                     "language_hints_enabled": false,
@@ -124,6 +125,7 @@ QtObject {
                 "enabled": false,
                 "credential_id": "openrouter-api-key",
                 "reasoning_effort": "",
+                "endpoint_mode": "custom",
                 "api_base_url": "https://api.openai.com/v1",
                 "model": "",
                 "timeout_ms": 15000,
@@ -330,7 +332,7 @@ QtObject {
     }
 
     function fieldNeedsAdvanced(path) {
-        const audio3Advanced = path.indexOf("asr.alibaba_audio3.") === 0 && path !== "asr.alibaba_audio3.endpoint_mode" && path !== "asr.alibaba_audio3.region" && path !== "asr.alibaba_audio3.language_hints_enabled" && path !== "asr.alibaba_audio3.heartbeat_enabled" && path !== "asr.alibaba_audio3.recognition_preset" && path !== "asr.alibaba_audio3.vocabulary" && path !== "asr.alibaba_audio3.native_final_pass_mode";
+        const audio3Advanced = path.indexOf("asr.alibaba_audio3.") === 0 && path !== "asr.alibaba_audio3.endpoint_mode" && path !== "asr.alibaba_audio3.region" && path !== "asr.alibaba_audio3.workspace_id" && path !== "asr.alibaba_audio3.language_hints_enabled" && path !== "asr.alibaba_audio3.heartbeat_enabled" && path !== "asr.alibaba_audio3.recognition_preset" && path !== "asr.alibaba_audio3.vocabulary" && path !== "asr.alibaba_audio3.native_final_pass_mode";
         return path === "audio.sample_rate" || path === "audio.partial_interval_ms" || path === "audio.pre_roll_ms" || path === "asr.connect_timeout_ms" || path === "asr.finalize_timeout_ms" || audio3Advanced || path === "llm.api_base_url" || path === "llm.timeout_ms" || path === "llm.provider_sort" || path === "llm.agent_context_max_chars" || path === "output.type_delay_ms" || path === "output.pre_type_delay_ms" || path === "output.paste_keys" || path === "output.prefer_paste_for_xwayland" || path === "output.xwayland_paste_keys" || path === "hud.margin_bottom" || path === "hud.height" || path === "hud.offset_x" || path === "hud.offset_y" || path === "hud.nudge_step";
     }
 
@@ -560,6 +562,7 @@ QtObject {
         const entered = credentialId === "alibaba-api-key" ? alibabaCredential : openrouterCredential;
         const id = send("llm.test", {
             "llm": config.llm,
+            "alibaba_audio3": config.asr.alibaba_audio3,
             "credential": entered.length > 0 ? {
                 "source": "entered",
                 "value": entered

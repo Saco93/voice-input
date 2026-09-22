@@ -9,6 +9,7 @@ SettingsPage {
     property alias advancedExpanded: refinementAdvanced.expanded
     property bool customModel: false
     readonly property string credentialId: controller.value("llm.credential_id", "openrouter-api-key")
+    readonly property string endpointMode: controller.value("llm.endpoint_mode", "custom")
     readonly property string currentModel: controller.value("llm.model", "")
     readonly property bool qwenModel: currentModel === "qwen3.8-27b"
     readonly property bool gptOssModel: currentModel === "openai/gpt-oss-120b"
@@ -21,10 +22,10 @@ SettingsPage {
 
         const model = controller.value("llm.model", "");
         const endpoint = controller.value("llm.api_base_url", "").replace(/\/+$/, "");
-        if (model === "openai/gpt-oss-120b" && endpoint === "https://openrouter.ai/api/v1" && credentialId === "openrouter-api-key")
+        if (model === "openai/gpt-oss-120b" && endpointMode === "custom" && endpoint === "https://openrouter.ai/api/v1" && credentialId === "openrouter-api-key")
             return "gpt-oss-120b";
 
-        if (model === "qwen3.8-27b" && endpoint === "https://dashscope.aliyuncs.com/compatible-mode/v1" && credentialId === "alibaba-api-key")
+        if (model === "qwen3.8-27b" && credentialId === "alibaba-api-key" && (endpointMode === "alibaba-workspace" || (endpointMode === "custom" && endpoint === "https://dashscope.aliyuncs.com/compatible-mode/v1")))
             return "qwen3.8-27b";
 
         return "custom";
@@ -37,7 +38,10 @@ SettingsPage {
 
         const qwen = preset === "qwen3.8-27b";
         setModel(qwen ? "qwen3.8-27b" : "openai/gpt-oss-120b");
-        controller.setValue("llm.api_base_url", qwen ? "https://dashscope.aliyuncs.com/compatible-mode/v1" : "https://openrouter.ai/api/v1");
+        controller.setValue("llm.endpoint_mode", qwen ? "alibaba-workspace" : "custom");
+        if (!qwen)
+            controller.setValue("llm.api_base_url", "https://openrouter.ai/api/v1");
+
         controller.setValue("llm.credential_id", qwen ? "alibaba-api-key" : "openrouter-api-key");
     }
 
@@ -73,7 +77,7 @@ SettingsPage {
                 value: root.modelPreset
                 labels: ["GPT OSS 120B (OpenRouter)", "Qwen3.8 27B (Alibaba Beijing)", "Custom"]
                 values: ["gpt-oss-120b", "qwen3.8-27b", "custom"]
-                help: "Select a model preset or configure a custom model."
+                help: "Select a model preset or configure a custom model. Qwen uses the shared Alibaba region; verify model availability before choosing Singapore."
                 enabled: !root.controller.busy
                 onSelected: (value) => {
                     return root.selectModelPreset(value);
@@ -90,6 +94,23 @@ SettingsPage {
                 enabled: !root.controller.busy
                 onEdited: (value) => {
                     return root.setModel(value);
+                }
+            }
+
+            SettingCombo {
+                theme: root.theme
+                label: "Endpoint mode"
+                value: root.endpointMode
+                labels: ["Custom", "Alibaba workspace"]
+                values: ["custom", "alibaba-workspace"]
+                help: "Alibaba workspace uses Region and Workspace ID in Speech > Alibaba routing. Custom uses the API base URL in Advanced; that URL is kept but ignored in workspace mode."
+                error: root.controller.errorFor("llm.endpoint_mode")
+                enabled: !root.controller.busy
+                onSelected: (value) => {
+                    root.controller.setValue("llm.endpoint_mode", value);
+                    if (value === "alibaba-workspace")
+                        root.controller.setValue("llm.credential_id", "alibaba-api-key");
+
                 }
             }
 
@@ -132,7 +153,7 @@ SettingsPage {
                 theme: root.theme
                 label: root.credentialId === "alibaba-api-key" ? "Replace Alibaba API key" : "Replace OpenRouter API key"
                 value: root.credentialId === "alibaba-api-key" ? root.controller.alibabaCredential : root.controller.openrouterCredential
-                help: root.controller.credentialLabel(root.credentialId) + ". Blank uses the stored credential."
+                help: root.controller.credentialLabel(root.credentialId) + ". Blank uses the stored credential." + (root.credentialId === "alibaba-api-key" ? (root.endpointMode === "alibaba-workspace" ? " The API key must match the region and workspace selected in Speech; a mismatch causes authentication failures." : " Use the API key for the region of the custom endpoint.") : "")
                 password: true
                 placeholderText: "Enter a new credential"
                 error: root.controller.errorFor("credentials." + root.credentialId)
@@ -169,7 +190,7 @@ SettingsPage {
         SectionCard {
             theme: root.theme
             title: "Test refinement"
-            description: "Test the current LLM draft and credential without saving it."
+            description: "Test the current LLM draft, shared Alibaba region and Workspace ID, and credential without saving."
 
             AppButton {
                 theme: root.theme
@@ -194,6 +215,7 @@ SettingsPage {
                 title: "Provider settings"
 
                 SettingTextField {
+                    visible: root.endpointMode === "custom"
                     theme: root.theme
                     label: "API base URL"
                     value: root.controller.value("llm.api_base_url", "")

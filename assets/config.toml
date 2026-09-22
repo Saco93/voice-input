@@ -23,8 +23,12 @@ finalize_timeout_ms = 8000
 fallback_to_local = true
 
 [asr.alibaba_audio3]
-endpoint_mode = "regional"
+endpoint_mode = "workspace"
 region = "beijing"
+# Copy the real Workspace ID from the Alibaba console; do not paste a URL.
+# Required before saving or using an active workspace route.
+workspace_id = ""
+# Legacy URL retained unchanged; dormant in workspace/regional modes.
 endpoint = "wss://dashscope.aliyuncs.com/api-ws/v1/inference"
 model = "qwen-audio-3.0-asr-flash-streaming"
 language_hints_enabled = false
@@ -34,6 +38,7 @@ max_sentence_silence_ms = 800
 semantic_punctuation_enabled = false
 multi_threshold_mode_enabled = false
 vocabulary = []
+# Dormant in workspace/regional modes; workspace URLs are backend-derived.
 native_endpoint = "https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation"
 native_model = "qwen-audio-3.0-asr-flash"
 native_final_pass_mode = "streaming-only"
@@ -53,6 +58,9 @@ manage_fcitx5 = true
 force_ascii_before_output = true
 
 [llm]
+# Alibaba Qwen preset uses "alibaba-workspace", sharing ASR region/Workspace ID
+# and the Alibaba credential; the backend derives its OpenAI-compatible base.
+endpoint_mode = "custom"
 # Empty preserves the model default: GPT OSS Medium, Qwen Off.
 reasoning_effort = ""
 credential_id = "openrouter-api-key"

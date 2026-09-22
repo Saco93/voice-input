@@ -2,7 +2,7 @@
 
 Research date: 2026-08-05
 
-This document records provider-facing decisions for Milestone 2 before runtime implementation. It uses current official Alibaba Cloud Model Studio documentation as the source of truth. No provider request was made during this research.
+This document records provider-facing decisions for Milestone 2 before runtime implementation, with subsequent implementation results and the workspace-routing follow-up below. It uses official Alibaba Cloud Model Studio documentation as the source of truth. No provider request was made during the original research or the workspace-routing change; historical Regional canaries are recorded separately.
 
 ## Scope
 
@@ -89,11 +89,21 @@ The parser borrows transcript text only long enough to apply the existing 16 KiB
 
 Duplicate-final suppression and correction replacement remain blocked unless Alibaba publishes a stable revision-identity contract or an implementation is proven correct even when IDs and ranges are reused or revised. A finite live capture can validate parser compatibility and reveal counterexamples, but it cannot establish an undocumented identity guarantee. Reconnect and replay remain Milestone 3 and will not be implemented here.
 
-## Regional and custom endpoints
+## Workspace, regional, and custom endpoints
 
-Both Audio3 model variants are available in Beijing and Singapore with unchanged model IDs. Voice Input intentionally exposes only two routing modes: Regional and Custom.
+Both Audio3 model variants are available in Beijing and Singapore with unchanged model IDs. Voice Input now offers Workspace, Regional, and Custom routing. Beijing and Singapore are the choices exposed for current Audio3 support, not an exhaustive list of Alibaba Model Studio regions.
 
-### Fixed reviewed endpoint matrix
+### Workspace-routing follow-up
+
+New configurations default to `asr.alibaba_audio3.endpoint_mode = "workspace"`, `region = "beijing"`, and `workspace_id = ""`. The user selects Beijing or Singapore and copies the real Workspace ID from the Alibaba console instead of editing URLs. The Rust backend derives three workspace-domain addresses: the Audio3 Streaming WebSocket URL, the Audio3 Native HTTP URL, and the OpenAI-compatible HTTP base for Alibaba Qwen refinement. The example's `endpoint` and `native_endpoint` retain their previous defaults as dormant values; no tenant-specific URL replaces the legacy constants.
+
+The public example keeps LLM disabled and uses `llm.endpoint_mode = "custom"`. Selecting the Alibaba Qwen UI preset switches LLM to `alibaba-workspace`, sharing Audio3's region, Workspace ID, and encrypted Alibaba credential. The backend-derived HTTP base does not overwrite the dormant custom `llm.api_base_url`. OpenRouter and custom endpoint routing remain independent of the workspace route. Selecting a Custom model preserves the selected endpoint mode, and existing LLM configurations retain their previous route until explicitly changed.
+
+A blank first-run template can load so the setup UI works. Settings requires a valid Workspace ID before saving an active workspace route and rejects invalid IDs or full URLs supplied as IDs. Runtime does not send a workspace API request without a valid ID. The key must match the region and workspace and have grants for the selected models. Credential encryption is unchanged. No live API test was run for this follow-up.
+
+### Legacy shared-domain endpoint matrix
+
+This reviewed matrix remains the Regional mode's historical shared-domain routing, not the new Workspace default.
 
 | API | Beijing | Singapore |
 | --- | --- | --- |
@@ -102,22 +112,23 @@ Both Audio3 model variants are available in Beijing and Singapore with unchanged
 
 ### Configuration and migration decisions
 
-- Regional selects only the fixed reviewed Streaming and Native pair for Beijing or Singapore.
+- Workspace is the default for new configurations only; existing file configurations retain their former routing until the user explicitly switches mode and supplies a valid Workspace ID.
+- Regional selects only the fixed reviewed shared-domain Streaming and Native pair for Beijing or Singapore.
 - Custom uses the configured Streaming and Native URL strings exactly.
-- Existing exact Beijing pairs migrate to Regional Beijing.
-- Existing exact Singapore pairs migrate to Regional Singapore.
+- When `endpoint_mode` is absent, existing exact Beijing pairs migrate to Regional Beijing.
+- When `endpoint_mode` is absent, existing exact Singapore pairs migrate to Regional Singapore.
 - Any mixed pair, noncanonical host, loopback endpoint, proxy, custom path, port, query, or otherwise changed pair migrates to Custom and remains byte-for-byte preserved.
-- Region input is matched to constants and is never concatenated into a host.
+- Region input selects a fixed supported region; workspace addresses are derived from that selection and the validated Workspace ID, not an arbitrary user-supplied host.
 - Explicit endpoint mode and region values take precedence over inferred migration values.
-- Dormant custom URLs remain preserved in Regional mode.
+- Dormant custom URLs remain preserved in Workspace and Regional modes.
 
-API keys are region-scoped. Voice Input retains one encrypted Alibaba credential, warns that changing region may require replacing it, and never probes another region or migrates a key automatically.
+Voice Input retains one encrypted Alibaba credential. Changing region or workspace may require replacing the key; Voice Input never probes another region or migrates a key automatically.
 
-### Deterministic implementation state
+### Legacy Milestone 2 implementation and validation
 
-Milestone 2 item 7 is implemented and validated locally without network access:
+Before the workspace-routing follow-up, Milestone 2 item 7 was implemented and validated locally without network access:
 
-- kebab-case `regional`/`custom` endpoint modes and `beijing`/`singapore` regions use Regional Beijing for new configurations;
+- kebab-case `regional`/`custom` endpoint modes and `beijing`/`singapore` regions used Regional Beijing for new configurations;
 - presence-aware migration recognizes only the two exact canonical pairs; all other pairs remain Custom byte-for-byte;
 - one pure, infallible typed resolver selects the fixed reviewed constants for both APIs or returns the exact Custom values;
 - production WebSocket and Native requests use the resolved target, while authorization, request bodies, response sanitization, redirect behavior, models, and controls remain unchanged;
@@ -135,7 +146,7 @@ Official pages do not provide a complete per-region matrix for language hints, h
 - recognition preset/config migration and an effective-control resolver;
 - exact request-envelope fields for confirmed VAD controls;
 - bounded timestamp parsing and aggregate-only diagnostics;
-- regional/custom endpoint migration and pure endpoint resolution;
+- workspace/regional/custom endpoint resolution and migration that preserves existing routes;
 - safe settings controls and privacy regression tests.
 
 ### Block pending evidence
@@ -152,7 +163,9 @@ Completed within the bounded scope documented in [`qwen-audio3-milestone2-evalua
 
 - Low-latency and Long-form field combinations and observable segmentation effects across a private pause/noise corpus;
 - aggregate-only parser compatibility observation for live partial/final timestamp metadata, without retaining sentence IDs or inferring a revision identity contract;
-- Beijing Regional Streaming and Native canaries.
+- Beijing Regional Streaming and Native canaries (historical shared-domain tests; not validation of the new workspace routes).
+
+No live API test was run for the workspace-routing follow-up.
 
 Still requires a matching scoped credential and separate authorization:
 

@@ -12,7 +12,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::{
-    config::{Config, ConfigStore, LlmConfig, RevisionConflict, ValidationError},
+    config::{
+        AlibabaAudio3Config, Config, ConfigStore, LlmConfig, LlmEndpointMode, RevisionConflict,
+        ValidationError,
+    },
     credentials::{self, ALIBABA_CREDENTIAL_ID, OPENROUTER_CREDENTIAL_ID},
     llm, paths,
     state::{Phase, Snapshot},
@@ -71,6 +74,8 @@ struct CredentialAction {
 #[serde(deny_unknown_fields)]
 struct LlmTestParams {
     llm: LlmConfig,
+    #[serde(default)]
+    alibaba_audio3: Option<AlibabaAudio3Config>,
     credential: TestCredential,
 }
 
@@ -335,7 +340,8 @@ fn settings_get(store: &ConfigStore) -> std::result::Result<Value, ProtocolError
             "hotkey.mode": ["hold", "toggle"],
             "asr.provider": ["alibaba-qwen-audio3", "local-cli"],
             "asr.language": ["english", "simplified-chinese", "traditional-chinese", "japanese", "korean"],
-            "asr.alibaba_audio3.endpoint_mode": ["regional", "custom"],
+            "asr.alibaba_audio3.endpoint_mode": ["workspace", "regional", "custom"],
+            "llm.endpoint_mode": ["custom", "alibaba-workspace"],
             "asr.alibaba_audio3.region": ["beijing", "singapore"],
             "asr.alibaba_audio3.recognition_preset": ["standard", "low-latency-dictation", "long-form", "custom"],
             "asr.alibaba_audio3.native_final_pass_mode": ["streaming-only", "adaptive", "always"],
@@ -365,6 +371,9 @@ fn settings_save(
         )
     })?;
     config.validate().map_err(validation_error)?;
+    config
+        .validate_workspace_selection()
+        .map_err(validation_error)?;
 
     let loaded = store
         .load()
@@ -530,12 +539,12 @@ fn llm_test(
     store: &ConfigStore,
     params: LlmTestParams,
 ) -> std::result::Result<Value, ProtocolError> {
-    let mut config = store
+    let saved = store
         .load()
         .map_err(|_| error("config_read_failed", "configuration could not be loaded"))?
         .config;
-    config.llm = params.llm;
-    config.validate().map_err(validation_error)?;
+    let mut config =
+        llm_test_config(saved, params.llm, params.alibaba_audio3).map_err(validation_error)?;
     config.llm.api_key = match params.credential.source.as_str() {
         "entered" => params
             .credential
@@ -556,6 +565,23 @@ fn llm_test(
     llm::test_connectivity(&config)
         .map_err(|_| error("connectivity_failed", "LLM connectivity test failed"))?;
     Ok(json!({"connected": true}))
+}
+
+fn llm_test_config(
+    mut config: Config,
+    llm: LlmConfig,
+    audio3: Option<AlibabaAudio3Config>,
+) -> std::result::Result<Config, ValidationError> {
+    config.llm = llm;
+    if let Some(audio3) = audio3 {
+        config.asr.alibaba_audio3 = audio3;
+    }
+    config.validate()?;
+    // Testing an independent LLM must not require completed ASR setup.
+    if config.llm.enabled && config.llm.endpoint_mode == LlmEndpointMode::AlibabaWorkspace {
+        config.validate_workspace_selection()?;
+    }
+    Ok(config)
 }
 
 fn require_empty_object(params: &Value) -> std::result::Result<(), ProtocolError> {
@@ -819,7 +845,7 @@ mod tests {
         );
         assert_eq!(
             response["result"]["choices"]["asr.alibaba_audio3.endpoint_mode"],
-            json!(["regional", "custom"])
+            json!(["workspace", "regional", "custom"])
         );
         assert_eq!(
             response["result"]["choices"]["asr.alibaba_audio3.region"],
@@ -836,8 +862,9 @@ mod tests {
         assert_eq!(
             response["result"]["config"]["asr"]["alibaba_audio3"],
             json!({
-                "endpoint_mode": "regional",
+                "endpoint_mode": "workspace",
                 "region": "beijing",
+                "workspace_id": "",
                 "endpoint": "wss://dashscope.aliyuncs.com/api-ws/v1/inference",
                 "model": "qwen-audio-3.0-asr-flash-streaming",
                 "language_hints_enabled": false,
@@ -857,14 +884,14 @@ mod tests {
     }
 
     #[test]
-    fn settings_get_migrates_exact_pairs_and_omits_removed_route_identifier() {
+    fn settings_get_migrates_exact_pairs_without_activating_legacy_workspace_id() {
         let temp = tempfile::tempdir().unwrap();
         let store = ConfigStore::new(temp.path().join("config.toml"));
         let source = toml::to_string_pretty(&Config::default())
             .unwrap()
             .replace(
-                "endpoint_mode = \"regional\"\nregion = \"beijing\"\n",
-                "workspace_id = \"ignored-route-sentinel\"\n",
+                "endpoint_mode = \"workspace\"\nregion = \"beijing\"\nworkspace_id = \"\"\n",
+                "workspace_id = \"llm-legacy\"\n",
             )
             .replace(
                 "wss://dashscope.aliyuncs.com/api-ws/v1/inference",
@@ -883,8 +910,7 @@ mod tests {
         let audio3 = &response["result"]["config"]["asr"]["alibaba_audio3"];
         assert_eq!(audio3["endpoint_mode"], "regional");
         assert_eq!(audio3["region"], "singapore");
-        assert!(audio3.get("workspace_id").is_none());
-        assert!(!response.to_string().contains("ignored-route-sentinel"));
+        assert_eq!(audio3["workspace_id"], "llm-legacy");
 
         let save = json!({
             "version": 1,
@@ -901,9 +927,115 @@ mod tests {
             serde_json::from_slice(&handle_line(save.to_string().as_bytes(), &store)).unwrap();
         assert_eq!(saved["ok"], true);
         assert!(
-            !fs::read_to_string(store.path())
+            fs::read_to_string(store.path())
                 .unwrap()
-                .contains("workspace_id")
+                .contains("workspace_id = \"llm-legacy\"")
+        );
+    }
+
+    #[test]
+    fn workspace_settings_reject_incomplete_selection_and_round_trip_all_routes() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = ConfigStore::new(temp.path().join("config.toml"));
+        let loaded = store.load().unwrap();
+        let mut config = serde_json::to_value(&loaded.config).unwrap();
+        config["llm"]["enabled"] = json!(true);
+        config["llm"]["model"] = json!("test-model");
+        config["llm"]["credential_id"] = json!("alibaba-api-key");
+        config["llm"]["endpoint_mode"] = json!("alibaba-workspace");
+        let request = |config: &Value| {
+            json!({
+                "version": 1, "id": 40, "method": "settings.save",
+                "params": {"revision": loaded.revision, "config": config, "credentials": {}, "restart": false}
+            })
+        };
+        for id in [
+            "",
+            "https://private.invalid",
+            "private.invalid",
+            "private/id",
+        ] {
+            config["asr"]["alibaba_audio3"]["workspace_id"] = json!(id);
+            let response: Value = serde_json::from_slice(&handle_line(
+                request(&config).to_string().as_bytes(),
+                &store,
+            ))
+            .unwrap();
+            assert_eq!(response["ok"], false);
+            assert!(
+                response["error"]["fields"]
+                    .get("asr.alibaba_audio3.workspace_id")
+                    .is_some()
+            );
+            assert!(!store.path().exists());
+            if !id.is_empty() {
+                assert!(!response.to_string().contains(id));
+            }
+        }
+        config["asr"]["alibaba_audio3"]["workspace_id"] = json!("llm-test");
+        config["asr"]["alibaba_audio3"]["region"] = json!("singapore");
+        let response: Value = serde_json::from_slice(&handle_line(
+            request(&config).to_string().as_bytes(),
+            &store,
+        ))
+        .unwrap();
+        assert_eq!(response["ok"], true, "{response}");
+        let saved = store.load().unwrap().config;
+        assert_eq!(saved.asr.alibaba_audio3.workspace_id, "llm-test");
+        let endpoints = saved.asr.alibaba_audio3.resolve_endpoints().unwrap();
+        assert!(
+            endpoints
+                .streaming()
+                .starts_with("wss://llm-test.ap-southeast-1.maas.aliyuncs.com/")
+        );
+        assert!(
+            endpoints
+                .native()
+                .starts_with("https://llm-test.ap-southeast-1.maas.aliyuncs.com/")
+        );
+        assert_eq!(
+            saved.resolve_llm_base_url().unwrap(),
+            "https://llm-test.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1"
+        );
+    }
+
+    #[test]
+    fn llm_test_uses_unsaved_workspace_selection_without_rewriting_custom_urls() {
+        let mut saved = Config::default();
+        saved.asr.alibaba_audio3.workspace_id = "llm-saved".into();
+        let mut draft = saved.clone();
+        draft.asr.alibaba_audio3.region = crate::config::Audio3Region::Singapore;
+        draft.asr.alibaba_audio3.workspace_id = "llm-draft".into();
+        draft.llm.enabled = true;
+        draft.llm.model = "test-model".into();
+        draft.llm.credential_id = "alibaba-api-key".into();
+        draft.llm.endpoint_mode = crate::config::LlmEndpointMode::AlibabaWorkspace;
+        let params: super::LlmTestParams = serde_json::from_value(json!({
+            "llm": draft.llm, "alibaba_audio3": draft.asr.alibaba_audio3,
+            "credential": {"source": "store"}
+        }))
+        .unwrap();
+        let test =
+            super::llm_test_config(saved.clone(), params.llm, params.alibaba_audio3).unwrap();
+        assert_eq!(
+            test.resolve_llm_base_url().unwrap(),
+            "https://llm-draft.ap-southeast-1.maas.aliyuncs.com/compatible-mode/v1"
+        );
+        assert_eq!(saved.asr.alibaba_audio3.workspace_id, "llm-saved");
+        assert_eq!(test.llm.api_base_url, saved.llm.api_base_url);
+        draft.asr.alibaba_audio3.workspace_id.clear();
+        assert!(
+            super::llm_test_config(saved, draft.llm.clone(), Some(draft.asr.alibaba_audio3))
+                .unwrap_err()
+                .fields
+                .contains_key("asr.alibaba_audio3.workspace_id")
+        );
+        draft.llm.endpoint_mode = crate::config::LlmEndpointMode::Custom;
+        draft.llm.api_base_url = "https://custom.example/v1".into();
+        let custom = super::llm_test_config(Config::default(), draft.llm, None).unwrap();
+        assert_eq!(
+            custom.resolve_llm_base_url().unwrap(),
+            "https://custom.example/v1"
         );
     }
 
@@ -917,6 +1049,7 @@ mod tests {
         config["asr"]["alibaba_audio3"] = json!({
             "endpoint_mode": "custom",
             "region": "singapore",
+            "workspace_id": "",
             "endpoint": "wss://audio3.example.test/stream?opaque=one",
             "model": "audio3-stream-test",
             "language_hints_enabled": true,
@@ -972,11 +1105,21 @@ mod tests {
             crate::config::Audio3Region::Singapore
         );
         assert_eq!(
-            saved.asr.alibaba_audio3.resolve_endpoints().streaming(),
+            saved
+                .asr
+                .alibaba_audio3
+                .resolve_endpoints()
+                .unwrap()
+                .streaming(),
             "wss://audio3.example.test/stream?opaque=one"
         );
         assert_eq!(
-            saved.asr.alibaba_audio3.resolve_endpoints().native(),
+            saved
+                .asr
+                .alibaba_audio3
+                .resolve_endpoints()
+                .unwrap()
+                .native(),
             "https://audio3.example.test/native?opaque=two"
         );
         assert!(saved.asr.alibaba_audio3.language_hints_enabled);
@@ -1031,21 +1174,19 @@ mod tests {
             saved["result"]["config"]["asr"]["alibaba_audio3"]["endpoint"],
             "dormant streaming bytes"
         );
-        assert!(
-            saved["result"]["config"]["asr"]["alibaba_audio3"]
-                .get("workspace_id")
-                .is_none()
+        assert_eq!(
+            saved["result"]["config"]["asr"]["alibaba_audio3"]["workspace_id"],
+            "ignored-json-route-sentinel"
         );
-        assert!(!saved.to_string().contains("ignored-json-route-sentinel"));
         assert!(
-            !fs::read_to_string(store.path())
+            fs::read_to_string(store.path())
                 .unwrap()
                 .contains("ignored-json-route-sentinel")
         );
 
         let loaded = store.load().unwrap().config.asr.alibaba_audio3;
         assert_eq!(
-            loaded.resolve_endpoints().native(),
+            loaded.resolve_endpoints().unwrap().native(),
             crate::config::AUDIO3_SINGAPORE_NATIVE_ENDPOINT
         );
     }
@@ -1057,6 +1198,7 @@ mod tests {
         let loaded = store.load().unwrap();
         let mut config = serde_json::to_value(&loaded.config).unwrap();
         config["asr"]["provider"] = json!("alibaba-qwen-audio3");
+        config["asr"]["alibaba_audio3"]["workspace_id"] = json!("llm-test");
         config["asr"]["alibaba_audio3"]["recognition_preset"] = json!("standard");
         config["asr"]["alibaba_audio3"]["max_sentence_silence_ms"] = json!(1);
         config["asr"]["alibaba_audio3"]["semantic_punctuation_enabled"] = json!(true);
@@ -1181,7 +1323,8 @@ mod tests {
     fn save_round_trip_returns_current_revision_and_config() {
         let temp = tempfile::tempdir().unwrap();
         let store = ConfigStore::new(temp.path().join("config.toml"));
-        let loaded = store.load().unwrap();
+        let mut loaded = store.load().unwrap();
+        loaded.config.asr.alibaba_audio3.workspace_id = "llm-test".into();
         let request = json!({
             "version": 1,
             "id": 4,

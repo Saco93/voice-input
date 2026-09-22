@@ -20,7 +20,7 @@ pub(crate) fn transcribe_full_audio(config: &Config, wav_path: &Path) -> Result<
         bail!("Qwen-Audio-3 native ASR requires a configured credential");
     }
 
-    let endpoints = audio3.resolve_endpoints();
+    let endpoints = audio3.resolve_endpoints()?;
     let wav_bytes = read_bounded_wav(wav_path)?;
     let body = request_body(
         &audio3.native_model,
@@ -294,6 +294,15 @@ mod tests {
             );
             assert!(!format!("{error:#}").contains(SENTINEL));
         }
+    }
+
+    #[test]
+    fn native_workspace_requires_id_before_reading_or_sending_audio() {
+        let mut config = Config::default();
+        config.asr.alibaba_audio3.api_key = "test-key".into();
+        let temp = tempfile::tempdir().unwrap();
+        let error = transcribe_full_audio(&config, &temp.path().join("missing.wav")).unwrap_err();
+        assert!(error.to_string().contains("workspace ID is required"));
     }
 
     #[test]

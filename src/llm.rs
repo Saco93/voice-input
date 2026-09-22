@@ -7,7 +7,7 @@ use url::Url;
 
 use crate::{
     agent_context::{AgentKind, AgentTerminologySnapshot},
-    config::Config,
+    config::{Config, LlmEndpointMode},
     focused_window::RefinementCategory,
     http_client,
 };
@@ -264,6 +264,13 @@ fn refinement_system_prompt(
     }
 }
 
+fn refinement_endpoint(config: &Config) -> Result<String> {
+    Ok(format!(
+        "{}/chat/completions",
+        config.resolve_llm_base_url()?.trim_end_matches('/')
+    ))
+}
+
 fn refine_once(
     config: &Config,
     transcript: &str,
@@ -272,10 +279,7 @@ fn refine_once(
     reference: Option<&AgentTerminologySnapshot>,
     deadline: Instant,
 ) -> std::result::Result<String, RefineAttemptError> {
-    let endpoint = format!(
-        "{}/chat/completions",
-        config.llm.api_base_url.trim_end_matches('/')
-    );
+    let endpoint = refinement_endpoint(config).map_err(RefineAttemptError::Transport)?;
     let normalized_transcript = reference
         .map(|reference| reference.normalize_technical_terms(transcript))
         .unwrap_or_else(|| transcript.to_string());
@@ -409,7 +413,7 @@ fn is_emoji(character: char) -> bool {
 
 fn openrouter_provider_sort(config: &Config) -> Option<&str> {
     let sort = config.llm.provider_sort.trim();
-    if sort.is_empty() {
+    if sort.is_empty() || config.llm.endpoint_mode != LlmEndpointMode::Custom {
         return None;
     }
     let host = Url::parse(config.llm.api_base_url.trim())
@@ -805,12 +809,43 @@ mod tests {
     }
 
     #[test]
+    fn production_refinement_endpoint_uses_workspace_selection_and_preserves_custom_url() {
+        let mut config = Config::default();
+        config.llm.credential_id = "alibaba-api-key".into();
+        config.llm.endpoint_mode = crate::config::LlmEndpointMode::AlibabaWorkspace;
+        config.asr.alibaba_audio3.workspace_id = "llm-test".into();
+        for (region, id) in [
+            (crate::config::Audio3Region::Beijing, "cn-beijing"),
+            (crate::config::Audio3Region::Singapore, "ap-southeast-1"),
+        ] {
+            config.asr.alibaba_audio3.region = region;
+            assert_eq!(
+                super::refinement_endpoint(&config).unwrap(),
+                format!(
+                    "https://llm-test.{id}.maas.aliyuncs.com/compatible-mode/v1/chat/completions"
+                )
+            );
+        }
+        config.asr.alibaba_audio3.workspace_id.clear();
+        assert!(super::refinement_endpoint(&config).is_err());
+        config.llm.endpoint_mode = crate::config::LlmEndpointMode::Custom;
+        config.llm.api_base_url = "https://custom.example/proxy/v1/".into();
+        assert_eq!(
+            super::refinement_endpoint(&config).unwrap(),
+            "https://custom.example/proxy/v1/chat/completions"
+        );
+    }
+
+    #[test]
     fn applies_provider_sort_only_to_openrouter() {
         let mut config = Config::default();
         config.llm.provider_sort = "latency".into();
         config.llm.api_base_url = "https://openrouter.ai/api/v1".into();
         assert_eq!(openrouter_provider_sort(&config), Some("latency"));
 
+        config.llm.endpoint_mode = crate::config::LlmEndpointMode::AlibabaWorkspace;
+        assert_eq!(openrouter_provider_sort(&config), None);
+        config.llm.endpoint_mode = crate::config::LlmEndpointMode::Custom;
         config.llm.api_base_url = "https://api.openai.com/v1".into();
         assert_eq!(openrouter_provider_sort(&config), None);
     }
