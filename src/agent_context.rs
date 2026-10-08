@@ -25,9 +25,8 @@ use crate::{
 
 const MAX_SESSION_SCAN_BYTES: u64 = 8 * 1024 * 1024;
 const KITTY_QUERY_TIMEOUT_SECS: &str = "1";
-const MAX_REFINEMENT_TERMINOLOGY_COUNT: usize = 96;
-const MAX_REFINEMENT_TERMINOLOGY_CHARS: usize = 1_500;
-const MAX_AUDIO3_SESSION_CONTEXT_CHARS: usize = 400;
+const MAX_CONTEXT_TURNS: usize = 5;
+const MAX_AUDIO3_TURN_CHARS: usize = 400;
 const MAX_SNAPSHOT_TERMINOLOGY_COUNT: usize = 4_096;
 const MAX_SNAPSHOT_TERMINOLOGY_CHARS: usize = 48_000;
 const MAX_TERM_CHARS: usize = 96;
@@ -75,6 +74,8 @@ struct TerminologyTerm {
 pub struct AgentTerminologySnapshot {
     pub agent: AgentKind,
     terms: Vec<TerminologyTerm>,
+    audio3_messages: Vec<Value>,
+    candidate_count: usize,
     pub source_char_count: usize,
     pub extraction_elapsed: Duration,
 }
@@ -85,76 +86,43 @@ pub struct SelectedTerminology {
 }
 
 pub struct Audio3SessionContext {
-    pub text: String,
+    pub messages: Vec<Value>,
 }
 
 impl AgentTerminologySnapshot {
     pub fn select_for_refinement(&self) -> SelectedTerminology {
-        let mut terms = Vec::new();
-        let mut char_count = 0_usize;
-        for term in &self.terms {
-            if terms.len() >= MAX_REFINEMENT_TERMINOLOGY_COUNT {
-                break;
-            }
-            let term_chars = term.text.chars().count();
-            if char_count.saturating_add(term_chars) > MAX_REFINEMENT_TERMINOLOGY_CHARS {
-                continue;
-            }
-            char_count += term_chars;
-            terms.push(term.text.clone());
+        // These are the union of the exact terms sent in the ASR turns. The
+        // five shared 400-character turn budgets already bound this list.
+        SelectedTerminology {
+            terms: self.terms.iter().map(|term| term.text.clone()).collect(),
+            char_count: self
+                .terms
+                .iter()
+                .map(|term| term.text.chars().count())
+                .sum(),
         }
-        SelectedTerminology { terms, char_count }
     }
 
     pub fn select_for_audio3(&self) -> Option<Audio3SessionContext> {
-        let mut selected = Vec::new();
-        let mut char_count = 0_usize;
-        for term in &self.terms {
-            let separator_chars = usize::from(!selected.is_empty());
-            let term_chars = term.text.chars().count();
-            if char_count
-                .saturating_add(separator_chars)
-                .saturating_add(term_chars)
-                > MAX_AUDIO3_SESSION_CONTEXT_CHARS
-            {
-                continue;
-            }
-            char_count += separator_chars + term_chars;
-            selected.push(term.text.as_str());
-        }
-        if selected.is_empty() {
-            return None;
-        }
-        Some(Audio3SessionContext {
-            text: selected.join("\n"),
+        (!self.audio3_messages.is_empty()).then(|| Audio3SessionContext {
+            messages: self.audio3_messages.clone(),
         })
     }
 
     pub fn candidate_count(&self) -> usize {
-        self.terms.len()
+        self.candidate_count
     }
 
     /// Restores exact spellings for high-confidence technical variants using
     /// only this operation's dynamic terminology snapshot. No terms persist
     /// across Voice Input sessions.
     pub fn normalize_technical_terms(&self, text: &str) -> String {
-        let mut selected_count = 0_usize;
-        let mut selected_chars = 0_usize;
-        let mut canonical_terms = Vec::new();
-        for term in &self.terms {
-            if selected_count >= MAX_REFINEMENT_TERMINOLOGY_COUNT {
-                break;
-            }
-            let term_chars = term.text.chars().count();
-            if selected_chars.saturating_add(term_chars) > MAX_REFINEMENT_TERMINOLOGY_CHARS {
-                continue;
-            }
-            selected_count += 1;
-            selected_chars += term_chars;
-            if term.normalization_eligible {
-                canonical_terms.push(term.text.clone());
-            }
-        }
+        let canonical_terms = self
+            .terms
+            .iter()
+            .filter(|term| term.normalization_eligible)
+            .map(|term| term.text.clone())
+            .collect::<Vec<_>>();
         normalize_dynamic_technical_terms(text, &canonical_terms)
     }
 
@@ -168,21 +136,36 @@ impl AgentTerminologySnapshot {
 
     #[cfg(test)]
     pub(crate) fn from_terms(agent: AgentKind, terms: &[&str]) -> Arc<Self> {
-        Arc::new(Self {
-            agent,
-            terms: terms
-                .iter()
-                .enumerate()
-                .map(|(candidate_order, term)| TerminologyTerm {
-                    text: (*term).to_string(),
-                    frequency: 1,
-                    candidate_order,
-                    normalization_eligible: true,
-                })
-                .collect(),
-            source_char_count: terms.iter().map(|term| term.chars().count()).sum(),
-            extraction_elapsed: Duration::ZERO,
-        })
+        let candidates = terms
+            .iter()
+            .enumerate()
+            .map(|(candidate_order, term)| TerminologyTerm {
+                text: (*term).to_string(),
+                frequency: 1,
+                candidate_order,
+                normalization_eligible: true,
+            })
+            .collect();
+        Arc::new(
+            snapshot_from_candidates(
+                agent,
+                vec![(candidates, Vec::new())],
+                terms.iter().map(|term| term.chars().count()).sum(),
+            )
+            .unwrap(),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_turns(agent: AgentKind, turns: &[(&str, &str)]) -> Arc<Self> {
+        let source = turns
+            .iter()
+            .map(|(user, assistant)| ConversationTurn {
+                user: (*user).into(),
+                assistant: (*assistant).into(),
+            })
+            .collect::<Vec<_>>();
+        Arc::new(build_snapshot(agent, &source, MAX_AGENT_CONTEXT_CHARS).unwrap())
     }
 }
 
@@ -309,7 +292,7 @@ pub fn start_terminology_capture(
     if !window.class().eq_ignore_ascii_case("kitty") {
         return Ok(None);
     }
-    // Freeze both the focused agent session and its latest completed source
+    // Freeze both the focused agent session and its recent conversation turns
     // before launching the segmentation worker. A later Kitty tab switch or
     // assistant response cannot change this Voice Input operation's snapshot.
     let Some(focused_agent) = capture_focused_agent(&window)? else {
@@ -351,7 +334,9 @@ pub fn start_terminology_capture(
     Ok(Some(capture))
 }
 
-fn load_source(locator: &AgentSessionLocator) -> Result<Option<(AgentKind, String)>> {
+fn load_source(
+    locator: &AgentSessionLocator,
+) -> Result<Option<(AgentKind, Vec<ConversationTurn>)>> {
     if process_start_ticks(locator.pid)? != locator.process_start_ticks {
         return Ok(None);
     }
@@ -366,45 +351,132 @@ fn load_source(locator: &AgentSessionLocator) -> Result<Option<(AgentKind, Strin
         return Ok(None);
     }
 
-    let text = match locator.kind {
-        AgentKind::Pi => {
-            let published_reference = current_pi_published_reference(locator)?;
-            latest_pi_reference(
-                &locator.session_path,
-                &locator.session_id,
-                published_reference.as_deref(),
-            )?
-        }
-        AgentKind::Codex => latest_codex_assistant(&locator.session_path, &locator.session_id)?,
+    let turns = match locator.kind {
+        // Only the extension knows the active branch after a Pi tree switch.
+        // Never substitute the physical JSONL tail for an empty publication.
+        AgentKind::Pi => current_pi_published_turns(locator)?,
+        AgentKind::Codex => recent_codex_turns(&locator.session_path, &locator.session_id)?,
     };
-    Ok(text.map(|text| (locator.kind, text)))
+    Ok(turns
+        .filter(|turns| !turns.is_empty())
+        .map(|turns| (locator.kind, turns)))
+}
+
+#[derive(Clone, Deserialize, Default, PartialEq, Eq)]
+struct ConversationTurn {
+    user: String,
+    #[serde(default)]
+    assistant: String,
 }
 
 fn build_snapshot(
     agent: AgentKind,
-    source: &str,
+    source: &[ConversationTurn],
     max_chars: usize,
 ) -> Option<AgentTerminologySnapshot> {
-    let text = sanitize_reference(
-        source,
-        max_chars.clamp(MIN_AGENT_CONTEXT_CHARS, MAX_AGENT_CONTEXT_CHARS),
-    );
-    if text.trim().is_empty() {
+    let source = &source[source.len().saturating_sub(MAX_CONTEXT_TURNS)..];
+    let message_count = source
+        .iter()
+        .flat_map(|turn| [&turn.user, &turn.assistant])
+        .filter(|text| !text.trim().is_empty())
+        .count();
+    if message_count == 0 {
         return None;
     }
-
+    // Keep the configured source budget for the entire snapshot, distributed
+    // across messages so an oversized answer cannot erase other turns/roles.
+    let message_budget =
+        max_chars.clamp(MIN_AGENT_CONTEXT_CHARS, MAX_AGENT_CONTEXT_CHARS) / message_count;
     let started = Instant::now();
-    let terms = extract_terminology(&text);
-    let extraction_elapsed = started.elapsed();
+    let mut source_char_count = 0;
+    let mut candidates = Vec::new();
+    for turn in source {
+        let user = sanitize_reference(&turn.user, message_budget);
+        let assistant = sanitize_reference(&turn.assistant, message_budget);
+        source_char_count += user.chars().count() + assistant.chars().count();
+        candidates.push((extract_terminology(&user), extract_terminology(&assistant)));
+    }
+    let mut snapshot = snapshot_from_candidates(agent, candidates, source_char_count)?;
+    snapshot.extraction_elapsed = started.elapsed();
+    Some(snapshot)
+}
+
+fn snapshot_from_candidates(
+    agent: AgentKind,
+    candidates: Vec<(Vec<TerminologyTerm>, Vec<TerminologyTerm>)>,
+    source_char_count: usize,
+) -> Option<AgentTerminologySnapshot> {
+    let mut terms: Vec<TerminologyTerm> = Vec::new();
+    let mut seen: HashMap<String, usize> = HashMap::new();
+    let mut audio3_messages = Vec::new();
+    let mut candidate_count = 0;
+    for (user, assistant) in candidates
+        .into_iter()
+        .rev()
+        .take(MAX_CONTEXT_TURNS)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+    {
+        candidate_count += user.len() + assistant.len();
+        let mut selected = [Vec::new(), Vec::new()];
+        let mut char_count = 0;
+        // Alternate between the two rare-first lists. Both roles get space;
+        // either role may use the remainder when the other's list runs out.
+        for index in 0..user.len().max(assistant.len()) {
+            for (role, candidates) in [&user, &assistant].into_iter().enumerate() {
+                let Some(term) = candidates.get(index) else {
+                    continue;
+                };
+                let cost = term.text.chars().count() + usize::from(!selected[role].is_empty());
+                if char_count + cost <= MAX_AUDIO3_TURN_CHARS {
+                    char_count += cost;
+                    selected[role].push(term);
+                }
+            }
+        }
+        if selected.iter().all(Vec::is_empty) {
+            continue;
+        }
+        // An empty user glossary still anchors an assistant-only glossary to
+        // its own turn (e.g. the user said only "好"). Never reassign its role.
+        for (role, role_terms) in selected.into_iter().enumerate() {
+            if role == 1 && role_terms.is_empty() {
+                continue;
+            }
+            let text = role_terms
+                .iter()
+                .map(|term| term.text.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            audio3_messages.push(serde_json::json!({
+                "role": if role == 0 { "user" } else { "assistant" },
+                "content": [{
+                    "type": if role == 0 { "input_text" } else { "text" },
+                    "text": text,
+                }],
+            }));
+            for term in role_terms {
+                let key = term.text.to_lowercase();
+                if let Some(&index) = seen.get(&key) {
+                    terms[index].normalization_eligible |= term.normalization_eligible;
+                } else {
+                    seen.insert(key, terms.len());
+                    terms.push(term.clone());
+                }
+            }
+        }
+    }
     if terms.is_empty() {
         return None;
     }
-
     Some(AgentTerminologySnapshot {
         agent,
         terms,
-        source_char_count: text.chars().count(),
-        extraction_elapsed,
+        audio3_messages,
+        candidate_count,
+        source_char_count,
+        extraction_elapsed: Duration::ZERO,
     })
 }
 
@@ -496,7 +568,7 @@ struct PiRegistry {
     session_id: String,
     session_file: PathBuf,
     #[serde(default)]
-    latest_completed_assistant_message: Option<String>,
+    recent_turns: Option<Vec<ConversationTurn>>,
 }
 
 fn resolve_pi_session(pid: u32) -> Result<Option<AgentSessionLocator>> {
@@ -620,7 +692,9 @@ fn resolve_codex_session(pid: u32) -> Result<Option<AgentSessionLocator>> {
     }))
 }
 
-fn current_pi_published_reference(locator: &AgentSessionLocator) -> Result<Option<String>> {
+fn current_pi_published_turns(
+    locator: &AgentSessionLocator,
+) -> Result<Option<Vec<ConversationTurn>>> {
     let Some(registry_path) = &locator.pi_registry_path else {
         return Ok(None);
     };
@@ -647,91 +721,158 @@ fn current_pi_published_reference(locator: &AgentSessionLocator) -> Result<Optio
     if session_path != locator.session_path {
         return Ok(None);
     }
-    Ok(registry.latest_completed_assistant_message)
-}
-
-fn latest_pi_reference(
-    path: &Path,
-    session_id: &str,
-    published_reference: Option<&str>,
-) -> Result<Option<String>> {
-    if let Some(text) = published_reference {
-        return Ok(Some(text.to_string()));
-    }
-    latest_pi_assistant(path, session_id)
-}
-
-fn latest_pi_assistant(path: &Path, session_id: &str) -> Result<Option<String>> {
-    let values = tail_json_lines(path, MAX_SESSION_SCAN_BYTES)?;
-    if values.is_empty() {
+    let Some(mut turns) = registry.recent_turns else {
+        eprintln!("voice-input agent context: reload Pi to publish recent conversation turns");
         return Ok(None);
-    }
-    let header = first_json_line(path)?;
-    if header["id"].as_str() != Some(session_id) {
-        return Ok(None);
-    }
-
-    let mut entries = HashMap::new();
-    let mut leaf_id = None;
-    for value in values {
-        let Some(id) = value["id"].as_str() else {
-            continue;
-        };
-        leaf_id = Some(id.to_string());
-        entries.insert(id.to_string(), value);
-    }
-
-    let mut current = leaf_id;
-    while let Some(id) = current {
-        let Some(entry) = entries.get(&id) else {
-            return Ok(None);
-        };
-        if entry["type"] == "message"
-            && entry["message"]["role"] == "assistant"
-            && entry["message"]["stopReason"].as_str() == Some("stop")
-        {
-            let text = extract_text_blocks(&entry["message"]["content"]);
-            if !text.trim().is_empty() {
-                return Ok(Some(text));
-            }
-        }
-        current = entry["parentId"].as_str().map(ToOwned::to_owned);
-    }
-
-    Ok(None)
+    };
+    turns.drain(..turns.len().saturating_sub(MAX_CONTEXT_TURNS));
+    Ok(Some(turns))
 }
 
-fn latest_codex_assistant(path: &Path, session_id: &str) -> Result<Option<String>> {
+fn recent_codex_turns(path: &Path, session_id: &str) -> Result<Option<Vec<ConversationTurn>>> {
     let header = first_json_line(path)?;
     if header["payload"]["id"].as_str() != Some(session_id) {
         return Ok(None);
     }
-
     let values = tail_json_lines(path, MAX_SESSION_SCAN_BYTES)?;
-    for value in values.iter().rev() {
-        if value["type"] == "response_item"
-            && value["payload"]["type"] == "message"
-            && value["payload"]["role"] == "assistant"
-            && value["payload"]["phase"] == "final_answer"
+    Ok(Some(codex_turns(&values)))
+}
+
+fn codex_turns(values: &[Value]) -> Vec<ConversationTurn> {
+    let mut turns: Vec<ConversationTurn> = Vec::new();
+    let mut current: Option<usize> = None;
+    let mut task_open = false;
+    let mut task_id = None;
+    let mut explicit_user = false;
+    for value in values {
+        let payload = &value["payload"];
+        if value["type"] == "event_msg" && payload["type"] == "task_started" {
+            // A task boundary prevents a tail-orphan answer from being paired
+            // with the previous user's request.
+            current = None;
+            task_open = true;
+            task_id = payload["turn_id"].as_str();
+            explicit_user = false;
+            continue;
+        }
+        if value["type"] == "event_msg" && payload["type"] == "thread_rolled_back" {
+            if let Some(count) = payload["num_turns"].as_u64() {
+                turns.truncate(
+                    turns
+                        .len()
+                        .saturating_sub(count.min(usize::MAX as u64) as usize),
+                );
+            }
+            current = None;
+            task_open = false;
+            task_id = None;
+            explicit_user = false;
+            continue;
+        }
+        let event_user = if value["type"] == "event_msg" && payload["type"] == "user_message" {
+            payload["message"].as_str().map(ToOwned::to_owned)
+        } else if value["type"] == "event_msg"
+            && payload["type"] == "item_completed"
+            && payload["item"]["type"] == "UserMessage"
         {
-            let text = extract_output_text_blocks(&value["payload"]["content"]);
+            Some(extract_text_blocks(&payload["item"]["content"]))
+        } else {
+            None
+        };
+        let is_explicit = event_user.is_some();
+        let user = event_user.or_else(|| {
+            if value["type"] == "response_item"
+                && payload["type"] == "message"
+                && payload["role"] == "user"
+                && !explicit_user
+            {
+                codex_user_text(payload)
+            } else {
+                None
+            }
+        });
+        if let Some(user) = user {
+            if current.is_none() || (!task_open && (!is_explicit || explicit_user)) {
+                turns.push(ConversationTurn::default());
+                current = Some(turns.len() - 1);
+            }
+            // Codex persists both a response_item and a user event for the
+            // same input. The explicit event replaces the fallback; it does
+            // not consume an extra context round.
+            turns[current.expect("user starts a turn")].user = user;
+            explicit_user |= is_explicit;
+            continue;
+        }
+        if value["type"] == "response_item"
+            && payload["type"] == "message"
+            && payload["role"] == "assistant"
+            && payload["phase"] == "final_answer"
+            && let Some(index) = current
+        {
+            let text = extract_output_text_blocks(&payload["content"]);
             if !text.trim().is_empty() {
-                return Ok(Some(text));
+                let assistant = &mut turns[index].assistant;
+                if !assistant.is_empty() {
+                    assistant.push('\n');
+                }
+                assistant.push_str(&text);
             }
         }
-    }
-
-    for value in values.iter().rev() {
-        if value["type"] == "event_msg"
-            && value["payload"]["type"] == "task_complete"
-            && let Some(text) = value["payload"]["last_agent_message"].as_str()
-            && !text.trim().is_empty()
-        {
-            return Ok(Some(text.to_string()));
+        if value["type"] == "event_msg" && payload["type"] == "task_complete" {
+            if task_id
+                .zip(payload["turn_id"].as_str())
+                .is_some_and(|(active, completed)| active != completed)
+            {
+                continue;
+            }
+            if let Some(index) = current
+                && turns[index].assistant.is_empty()
+                && let Some(text) = payload["last_agent_message"].as_str()
+            {
+                turns[index].assistant = text.to_string();
+            }
+            current = None;
+            task_open = false;
+            task_id = None;
+            explicit_user = false;
         }
     }
+    turns.drain(..turns.len().saturating_sub(MAX_CONTEXT_TURNS));
+    turns
+}
 
-    Ok(None)
+fn codex_user_text(payload: &Value) -> Option<String> {
+    let content = payload["content"].as_array()?;
+    let kinds =
+        payload["internal_chat_message_metadata_passthrough"]["content_item_kinds"].as_array();
+    let text = content
+        .iter()
+        .enumerate()
+        .filter(|(index, block)| {
+            block["type"] == "input_text"
+                && kinds.is_none_or(|kinds| {
+                    kinds.get(*index).and_then(Value::as_str) == Some("user.text")
+                })
+        })
+        .filter_map(|(_, block)| block["text"].as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let trimmed = text.trim();
+    // Legacy sessions predate per-block provenance. Their bootstrap messages
+    // have these explicit wrappers; they are not user conversation rounds.
+    if trimmed.is_empty()
+        || (kinds.is_none()
+            && [
+                "# AGENTS.md instructions for ",
+                "<environment_context>",
+                "<permissions instructions>",
+            ]
+            .iter()
+            .any(|prefix| trimmed.starts_with(prefix)))
+    {
+        return None;
+    }
+    Some(text)
 }
 
 fn extract_text_blocks(content: &Value) -> String {
@@ -1313,54 +1454,34 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        AgentKind, AgentSessionLocator, AgentTerminologySnapshot, MAX_AUDIO3_SESSION_CONTEXT_CHARS,
-        MAX_REFINEMENT_TERMINOLOGY_CHARS, MAX_REFINEMENT_TERMINOLOGY_COUNT, PiRegistry, cap_text,
-        current_pi_published_reference, extract_terminology, focused_kitty_agent_from_payload,
-        latest_codex_assistant, latest_pi_assistant, latest_pi_reference, sanitize_reference,
+        AgentKind, AgentSessionLocator, AgentTerminologySnapshot, ConversationTurn,
+        MAX_AUDIO3_TURN_CHARS, MAX_CONTEXT_TURNS, PiRegistry, build_snapshot, cap_text,
+        current_pi_published_turns, extract_terminology, focused_kitty_agent_from_payload,
+        recent_codex_turns, sanitize_reference, snapshot_from_candidates,
         start_terminology_capture,
     };
 
     #[test]
-    fn reads_latest_pi_assistant_on_active_branch() {
-        let mut file = tempfile::NamedTempFile::new().unwrap();
-        for value in [
-            json!({"type":"session","version":3,"id":"session-1","cwd":"/tmp"}),
-            json!({"type":"message","id":"u1","parentId":null,"message":{"role":"user","content":"one"}}),
-            json!({"type":"message","id":"a1","parentId":"u1","message":{"role":"assistant","stopReason":"stop","content":[{"type":"text","text":"first"}]}}),
-            json!({"type":"message","id":"u2","parentId":"a1","message":{"role":"user","content":"two"}}),
-            json!({"type":"message","id":"a2","parentId":"u2","message":{"role":"assistant","stopReason":"stop","content":[{"type":"text","text":"latest"},{"type":"toolCall","name":"x"}]}}),
-            json!({"type":"custom","id":"c1","parentId":"a2","data":{}}),
-        ] {
-            writeln!(file, "{value}").unwrap();
-        }
-        assert_eq!(
-            latest_pi_assistant(file.path(), "session-1").unwrap(),
-            Some("latest".into())
-        );
-    }
-
-    #[test]
-    fn parses_pi_registry_with_published_reference() {
+    fn parses_pi_registry_with_active_branch_turns() {
         let registry: PiRegistry = serde_json::from_value(json!({
             "version": 2,
             "pid": 123,
             "process_start_ticks": 456,
             "session_id": "session-1",
             "session_file": "/tmp/session.jsonl",
-            "latest_completed_assistant_message": "latest active-branch answer"
+            "recent_turns": [{"user":"UserModel", "assistant":"AssistantModel"}]
         }))
         .unwrap();
-        assert_eq!(
-            registry.latest_completed_assistant_message.as_deref(),
-            Some("latest active-branch answer")
-        );
+        let turns = registry.recent_turns.unwrap();
+        assert_eq!(turns[0].user, "UserModel");
+        assert_eq!(turns[0].assistant, "AssistantModel");
     }
 
     #[test]
-    fn refreshes_pi_reference_after_session_capture() {
+    fn pi_publication_preserves_active_turns_and_empty_branch_without_file_fallback() {
         let directory = tempfile::tempdir().unwrap();
         let session_path = directory.path().join("session.jsonl");
-        std::fs::write(&session_path, "{}\n").unwrap();
+        std::fs::write(&session_path, "{\"unrelated_branch\":\"DoNotRead\"}\n").unwrap();
         let session_path = session_path.canonicalize().unwrap();
         let metadata = std::fs::metadata(&session_path).unwrap();
         let registry_path = directory.path().join("registry.json");
@@ -1374,49 +1495,137 @@ mod tests {
             inode: std::os::unix::fs::MetadataExt::ino(&metadata),
             pi_registry_path: Some(registry_path.clone()),
         };
-        std::fs::write(
-            &registry_path,
-            json!({
-                "version": 2,
-                "pid": 123,
-                "process_start_ticks": 456,
-                "session_id": "session-1",
-                "session_file": session_path,
-                "latest_completed_assistant_message": "new answer"
-            })
-            .to_string(),
-        )
-        .unwrap();
+        let mut payload = json!({
+            "version": 2, "pid": 123, "process_start_ticks": 456,
+            "session_id": "session-1", "session_file": session_path,
+            "recent_turns": (0..6).map(|index| json!({
+                "user": format!("User{index}"), "assistant": format!("Assistant{index}"),
+            })).collect::<Vec<_>>(),
+        });
+        std::fs::write(&registry_path, payload.to_string()).unwrap();
+        let turns = current_pi_published_turns(&locator).unwrap().unwrap();
+        assert_eq!(turns.len(), 5);
+        assert_eq!(turns[0].user, "User1");
+        assert_eq!(turns[4].assistant, "Assistant5");
+        let frozen = build_snapshot(AgentKind::Pi, &turns, 6_000).unwrap();
 
-        assert_eq!(
-            current_pi_published_reference(&locator).unwrap(),
-            Some("new answer".into())
+        payload["recent_turns"] = json!([]);
+        std::fs::write(&registry_path, payload.to_string()).unwrap();
+        assert!(
+            current_pi_published_turns(&locator)
+                .unwrap()
+                .unwrap()
+                .is_empty()
         );
+        assert!(
+            frozen
+                .select_for_refinement()
+                .terms
+                .contains(&"Assistant5".into())
+        );
+
+        payload.as_object_mut().unwrap().remove("recent_turns");
+        payload["latest_completed_assistant_message"] = json!("LegacyDoNotUse");
+        std::fs::write(&registry_path, payload.to_string()).unwrap();
+        assert!(current_pi_published_turns(&locator).unwrap().is_none());
+
+        payload["recent_turns"] = json!([{ "user": "StaleSession" }]);
+        payload["session_id"] = json!("different-session");
+        std::fs::write(&registry_path, payload.to_string()).unwrap();
+        assert!(current_pi_published_turns(&locator).unwrap().is_none());
     }
 
     #[test]
-    fn prefers_pi_reference_published_from_active_branch() {
-        let file = tempfile::NamedTempFile::new().unwrap();
-        assert_eq!(
-            latest_pi_reference(file.path(), "session-1", Some("published latest")).unwrap(),
-            Some("published latest".into())
-        );
-    }
-
-    #[test]
-    fn reads_latest_codex_final_answer() {
+    fn reads_codex_turn_with_user_and_final_answer_only() {
         let mut file = tempfile::NamedTempFile::new().unwrap();
         for value in [
             json!({"type":"session_meta","payload":{"id":"codex-1","source":"cli","thread_source":"user"}}),
+            json!({"type":"event_msg","payload":{"type":"user_message","message":"UserModel"}}),
             json!({"type":"response_item","payload":{"type":"message","role":"assistant","phase":"commentary","content":[{"type":"output_text","text":"working"}]}}),
             json!({"type":"response_item","payload":{"type":"message","role":"assistant","phase":"final_answer","content":[{"type":"output_text","text":"done"}]}}),
         ] {
             writeln!(file, "{value}").unwrap();
         }
-        assert_eq!(
-            latest_codex_assistant(file.path(), "codex-1").unwrap(),
-            Some("done".into())
+        let turns = recent_codex_turns(file.path(), "codex-1").unwrap().unwrap();
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].user, "UserModel");
+        assert_eq!(turns[0].assistant, "done");
+    }
+
+    #[test]
+    fn codex_turns_deduplicate_user_events_ignore_injections_and_apply_rollback() {
+        let mut values = vec![json!({"type":"response_item","payload":{
+            "type":"message", "role":"assistant", "phase":"final_answer",
+            "content":[{"type":"output_text","text":"OrphanDoNotUse"}]
+        }})];
+        for index in 0..6 {
+            values.push(json!({"type":"event_msg","payload":{"type":"task_started","turn_id":format!("turn-{index}")}}));
+            values.push(json!({"type":"response_item","payload":{
+                "type":"message", "role":"user",
+                "content":[{"type":"input_text","text":"InjectedDoNotUse"},
+                           {"type":"input_text","text":format!("UserModel{index}")}],
+                "internal_chat_message_metadata_passthrough":{
+                    "content_item_kinds":["agents_md.instructions","user.text"]
+                }
+            }}));
+            values.push(if index % 2 == 0 {
+                json!({"type":"event_msg","payload":{"type":"user_message","message":format!("UserModel{index}")}})
+            } else {
+                json!({"type":"event_msg","payload":{"type":"item_completed","turn_id":format!("turn-{index}"),
+                    "item":{"type":"UserMessage","content":[{"type":"text","text":format!("UserModel{index}")}]}}})
+            });
+            values.push(json!({"type":"response_item","payload":{
+                "type":"message","role":"assistant","phase":"commentary",
+                "content":[{"type":"output_text","text":"CommentaryDoNotUse"}]
+            }}));
+            if index != 2 {
+                values.push(json!({"type":"response_item","payload":{
+                    "type":"message","role":"assistant","phase":"final_answer",
+                    "content":[{"type":"output_text","text":format!("AssistantModel{index}")}]
+                }}));
+            }
+            values.push(json!({"type":"event_msg","payload":{"type":"task_complete",
+                "turn_id":format!("turn-{index}"),"last_agent_message":format!("FallbackModel{index}")}}));
+        }
+        let turns = super::codex_turns(&values);
+        assert_eq!(turns.len(), 5);
+        assert_eq!(turns[0].user, "UserModel1");
+        assert_eq!(turns[1].assistant, "FallbackModel2");
+        assert_eq!(turns[4].assistant, "AssistantModel5");
+
+        values.push(
+            json!({"type":"event_msg","payload":{"type":"thread_rolled_back","num_turns":1}}),
         );
+        values
+            .push(json!({"type":"event_msg","payload":{"type":"task_started","turn_id":"latest"}}));
+        values.push(
+            json!({"type":"event_msg","payload":{"type":"user_message","message":"LatestUser"}}),
+        );
+        let turns = super::codex_turns(&values);
+        assert_eq!(turns.len(), 5);
+        assert_eq!(turns[0].user, "UserModel1");
+        assert_eq!(turns[4].user, "LatestUser");
+        assert!(turns[4].assistant.is_empty());
+        assert!(turns.iter().all(|turn| !turn.assistant.contains("DoNotUse") && !turn.user.contains("DoNotUse")));
+    }
+
+    #[test]
+    fn codex_response_only_messages_preserve_rounds_and_filter_bootstrap() {
+        let values = vec![
+            json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"# AGENTS.md instructions for /tmp\nBootstrap"}]}}),
+            json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"FirstUser"}]}}),
+            json!({"type":"response_item","payload":{"type":"message","role":"assistant","phase":"final_answer","content":[{"type":"output_text","text":"FirstAssistant"}]}}),
+            json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"SecondUser"}]}}),
+            json!({"type":"event_msg","payload":{"type":"task_complete","last_agent_message":"SecondAssistant"}}),
+            json!({"type":"event_msg","payload":{"type":"task_started","turn_id":"no-user"}}),
+            json!({"type":"event_msg","payload":{"type":"task_complete","last_agent_message":"OrphanDoNotUse"}}),
+        ];
+        let turns = super::codex_turns(&values);
+        assert_eq!(turns.len(), 2);
+        assert_eq!(turns[0].user, "FirstUser");
+        assert_eq!(turns[0].assistant, "FirstAssistant");
+        assert_eq!(turns[1].user, "SecondUser");
+        assert_eq!(turns[1].assistant, "SecondAssistant");
     }
 
     #[test]
@@ -1505,12 +1714,7 @@ mod tests {
                 .filter(|term| term.text == "DEEPSEEK")
                 .all(|term| !term.normalization_eligible)
         );
-        let snapshot = AgentTerminologySnapshot {
-            agent: AgentKind::Pi,
-            terms,
-            source_char_count: 64,
-            extraction_elapsed: std::time::Duration::ZERO,
-        };
+        let snapshot = snapshot_from_candidates(AgentKind::Pi, vec![(terms, vec![])], 64).unwrap();
         assert_eq!(
             snapshot.normalize_technical_terms("Deepseek 和 DEEPSEEK‑v4‑pro"),
             "Deepseek 和 deepseek-v4-pro"
@@ -1682,14 +1886,13 @@ mod tests {
 
     #[test]
     fn terminology_frequency_is_ascending_with_stable_candidate_ties() {
-        let snapshot = super::AgentTerminologySnapshot {
-            agent: AgentKind::Pi,
-            terms: extract_terminology(
+        let snapshot = AgentTerminologySnapshot::from_turns(
+            AgentKind::Pi,
+            &[(
                 "RareModel CommonTerm CommonTerm Qwen-Audio-3 CommonTerm AnotherRare",
-            ),
-            source_char_count: 72,
-            extraction_elapsed: std::time::Duration::ZERO,
-        };
+                "",
+            )],
+        );
         let frequencies = snapshot.frequencies();
         let rare_model = frequencies
             .iter()
@@ -1730,13 +1933,127 @@ mod tests {
         let references = terms.iter().map(String::as_str).collect::<Vec<_>>();
         let snapshot = super::AgentTerminologySnapshot::from_terms(AgentKind::Pi, &references);
         let context = snapshot.select_for_audio3().unwrap();
-        assert!(context.text.chars().count() <= MAX_AUDIO3_SESSION_CONTEXT_CHARS);
+        let text = context.messages[0]["content"][0]["text"].as_str().unwrap();
+        assert!(text.chars().count() <= MAX_AUDIO3_TURN_CHARS);
         assert!(
-            context
-                .text
-                .split('\n')
+            text.split('\n')
                 .all(|selected| terms.iter().any(|term| term == selected))
         );
+    }
+
+    #[test]
+    fn snapshot_keeps_five_role_preserving_bounded_glossaries_and_refine_union() {
+        let source = (0..6)
+            .map(|index| ConversationTurn {
+                user: format!(
+                    "UserModel{index} SharedModel\nAPI_KEY={}HiddenSecret",
+                    "x".repeat(1_000)
+                ),
+                assistant: format!(
+                    "AssistantModel{index} SharedModel {}",
+                    "ExtraModel ".repeat(200)
+                ),
+            })
+            .collect::<Vec<_>>();
+        let snapshot = build_snapshot(AgentKind::Pi, &source, 6_000).unwrap();
+        assert!(snapshot.source_char_count <= 6_000);
+        let context = snapshot.select_for_audio3().unwrap();
+        assert_eq!(context.messages.len(), MAX_CONTEXT_TURNS * 2);
+        let mut asr_terms = std::collections::HashSet::new();
+        for (index, pair) in context.messages.as_chunks::<2>().0.iter().enumerate() {
+            assert_eq!(pair[0]["role"], "user");
+            assert_eq!(pair[0]["content"][0]["type"], "input_text");
+            assert_eq!(pair[1]["role"], "assistant");
+            assert_eq!(pair[1]["content"][0]["type"], "text");
+            let user = pair[0]["content"][0]["text"].as_str().unwrap();
+            let assistant = pair[1]["content"][0]["text"].as_str().unwrap();
+            assert!(user.contains(&format!("UserModel{}", index + 1)));
+            assert!(assistant.contains(&format!("AssistantModel{}", index + 1)));
+            assert!(user.chars().count() + assistant.chars().count() <= MAX_AUDIO3_TURN_CHARS);
+            for term in user.lines().chain(assistant.lines()) {
+                assert!(!term.contains("HiddenSecret") && !term.contains("REDACTED"));
+                asr_terms.insert(term.to_lowercase());
+            }
+        }
+        let refined = snapshot.select_for_refinement();
+        let refine_terms = refined
+            .terms
+            .iter()
+            .map(|term| term.to_lowercase())
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(asr_terms, refine_terms);
+        assert_eq!(refine_terms.len(), refined.terms.len());
+        assert!(!refined.terms.contains(&"UserModel0".into()));
+    }
+
+    #[test]
+    fn both_roles_share_400_characters_without_splitting_unicode_terms() {
+        let candidates = (0..80)
+            .map(|index| super::TerminologyTerm {
+                text: format!("术语{index}{}", "甲".repeat(15)),
+                frequency: 1,
+                candidate_order: index,
+                normalization_eligible: false,
+            })
+            .collect::<Vec<_>>();
+        let snapshot = snapshot_from_candidates(
+            AgentKind::Codex,
+            vec![(candidates[..40].to_vec(), candidates[40..].to_vec())],
+            3_000,
+        )
+        .unwrap();
+        let messages = snapshot.select_for_audio3().unwrap().messages;
+        let user = messages[0]["content"][0]["text"].as_str().unwrap();
+        let assistant = messages[1]["content"][0]["text"].as_str().unwrap();
+        assert!(!user.is_empty() && !assistant.is_empty());
+        assert!(user.chars().count() + assistant.chars().count() <= MAX_AUDIO3_TURN_CHARS);
+        assert!(user.lines().all(|term| {
+            candidates[..40]
+                .iter()
+                .any(|candidate| candidate.text == term)
+        }));
+        assert!(assistant.lines().all(|term| {
+            candidates[40..]
+                .iter()
+                .any(|candidate| candidate.text == term)
+        }));
+    }
+
+    #[test]
+    fn empty_roles_do_not_reassign_assistant_terms_or_backfill_older_turns() {
+        let source = vec![
+            ConversationTurn {
+                user: "好".into(),
+                assistant: "AssistantModel".into(),
+            },
+            ConversationTurn {
+                user: "PendingUser".into(),
+                assistant: String::new(),
+            },
+        ];
+        let snapshot = build_snapshot(AgentKind::Pi, &source, 6_000).unwrap();
+        let messages = snapshot.select_for_audio3().unwrap().messages;
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0]["role"], "user");
+        assert_eq!(messages[0]["content"][0]["text"], "");
+        assert_eq!(messages[1]["role"], "assistant");
+        assert!(
+            messages[1]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("AssistantModel")
+        );
+        assert_eq!(messages[2]["role"], "user");
+
+        let mut source = vec![ConversationTurn {
+            user: "TooOld".into(),
+            assistant: String::new(),
+        }];
+        source.extend((0..5).map(|_| ConversationTurn {
+            user: "好".into(),
+            assistant: String::new(),
+        }));
+        assert!(build_snapshot(AgentKind::Pi, &source, 6_000).is_none());
     }
 
     #[test]
@@ -1752,16 +2069,15 @@ mod tests {
         let sanitized = sanitize_reference(&source, 12_000);
         let terminology = extract_terminology(&sanitized);
 
-        assert!(terminology.len() > MAX_REFINEMENT_TERMINOLOGY_COUNT);
-        let snapshot = super::AgentTerminologySnapshot {
-            agent: AgentKind::Pi,
-            terms: terminology,
-            source_char_count: sanitized.chars().count(),
-            extraction_elapsed: std::time::Duration::ZERO,
-        };
+        assert!(terminology.len() > 96);
+        let snapshot = snapshot_from_candidates(
+            AgentKind::Pi,
+            vec![(terminology, vec![])],
+            sanitized.chars().count(),
+        )
+        .unwrap();
         let refinement = snapshot.select_for_refinement();
-        assert!(refinement.terms.len() <= MAX_REFINEMENT_TERMINOLOGY_COUNT);
-        assert!(refinement.char_count <= MAX_REFINEMENT_TERMINOLOGY_CHARS);
+        assert!(refinement.char_count <= MAX_AUDIO3_TURN_CHARS);
         assert!(
             refinement
                 .terms
@@ -1776,6 +2092,13 @@ mod tests {
         );
         assert!(refinement.terms.iter().all(|term| term != &"a".repeat(64)));
         let audio3 = snapshot.select_for_audio3().unwrap();
-        assert!(audio3.text.chars().count() <= MAX_AUDIO3_SESSION_CONTEXT_CHARS);
+        assert!(
+            audio3.messages[0]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .chars()
+                .count()
+                <= MAX_AUDIO3_TURN_CHARS
+        );
     }
 }

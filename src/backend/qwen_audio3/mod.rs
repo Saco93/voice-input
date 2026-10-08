@@ -29,7 +29,7 @@ impl AsrBackend for QwenAudio3Backend {
     }
 
     fn transcribe_file(&self, config: &Config, wav_path: &Path) -> Result<String> {
-        Ok(native::transcribe_full_audio(config, wav_path)?.unwrap_or_default())
+        Ok(native::transcribe_full_audio(config, wav_path, None)?.unwrap_or_default())
     }
 }
 

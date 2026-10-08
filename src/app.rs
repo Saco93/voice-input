@@ -289,7 +289,7 @@ fn run_asr_test(options: AsrTestOptions) -> Result<()> {
 
     apply_audio3_test_credentials(&mut config)?;
 
-    match backend::transcribe_qwen_audio3_full_audio(&config, &options.file)? {
+    match backend::transcribe_qwen_audio3_full_audio(&config, &options.file, None)? {
         Some(transcript) => println!("{transcript}"),
         None => println!("No transcript (empty audio)."),
     }

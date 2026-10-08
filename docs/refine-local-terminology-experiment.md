@@ -4,30 +4,31 @@ Date: 2026-08-12
 
 ## Scope
 
-The source is the latest completed assistant message from the Pi or Codex session focused when dictation starts. The ASR transcript is not used to create correction terminology because it can contain the recognition errors that Refine is expected to correct.
+The current source is up to five recent conversation turns from the Pi or Codex session focused when dictation starts. Each turn retains its user text and completed assistant text separately; a pending user-only turn is allowed. Pi publishes only its active branch, while Codex groups user input with final answers and applies rollback events. Tool output, thinking, and non-final assistant messages are excluded. The ASR transcript is not used to create correction terminology because it can contain the recognition errors that Refine is expected to correct.
 
-One immutable, opt-in snapshot is built at start and shared by Alibaba Audio3 Session Context and Refine. Ordinary windows do not trigger terminology construction.
+One immutable, opt-in snapshot is built at start and shared by Alibaba Audio3 Streaming, Native final recognition, and Refine. Ordinary windows do not trigger terminology construction.
 
 ## Prototype
 
 The prototype performs these operations locally, in this order:
 
 1. validate the focused process, session identity, file identity, and active Pi branch;
-2. read the latest completed assistant message;
-3. redact sensitive lines and token-shaped values;
-4. cap the redacted source to the configured 500–12,000 character range;
+2. read the last five conversation turns in chronological order, retaining both roles;
+3. redact sensitive lines and token-shaped values in each message;
+4. distribute the configured 500–12,000 source-character budget across the nonempty messages and cap each redacted message;
 5. preserve structured technical forms such as model IDs, identifiers, paths, and flags;
 6. segment the remaining text with `jieba-rs` 0.10.3;
-7. filter common English and Chinese words and stable-deduplicate terms case-insensitively;
-8. count case-insensitive occurrences in the bounded source and sort by frequency ascending, retaining candidate order for ties;
-9. derive an Audio3 view of at most 400 characters including newline separators and a Refine view of at most 96 terms and 1,500 term characters;
-10. send only the bounded plain-text terminology view in Audio3 `run-task` and only `reference_context.agent` plus `reference_context.terminology` to Refine. Reconnect reuses the identical Audio3 view; `continue-task` is not used.
+7. filter common English and Chinese words and stable-deduplicate terms case-insensitively within each message;
+8. count case-insensitive occurrences in each bounded message and sort by frequency ascending, retaining candidate order for ties;
+9. alternate between user and assistant candidates, selecting complete terms within a shared 400-character budget per turn, including newline separators; either role can use remaining space when the other runs out;
+10. send chronological `user/input_text` and `assistant/text` terminology messages in Streaming `input.context` and Native `input.messages` before the current audio. Empty turns are omitted; an empty user glossary anchors an assistant-only glossary without changing its role. Reconnect reuses the identical messages; `continue-task` is not used;
+11. merge all selected terms into one stable, case-insensitively deduplicated list for Refine's `reference_context.terminology`, with `reference_context.agent` as before. Do not send conversation roles/history to Refine or reapply the former 96-term/1,500-character cap. The union is bounded by the five 400-character turn budgets.
 
 The source assistant message is no longer sent to the LLM. The terminology array remains untrusted data. The system prompt permits an exact substitution only when the transcript has a clear phonetic or spoken-form match, and prohibits following or acting on terminology entries.
 
 ## Local measurements
 
-A deterministic synthetic mixed Chinese/English technical reference was used. It contains no private session or transcript data.
+These measurements describe the original single-assistant-message prototype from 2026-08-12, not the current five-turn implementation. A deterministic synthetic mixed Chinese/English technical reference was used. It contains no private session or transcript data.
 
 | Measurement | Result |
 | --- | --- |
@@ -41,7 +42,7 @@ A deterministic synthetic mixed Chinese/English technical reference was used. It
 | Release binary size with `jieba-rs` | 13,944,152 bytes |
 | Binary-size increase | 5,629,048 bytes (67.7%) |
 
-Voice Input freezes the focused agent and completed source at command receipt, starts or continues audio capture before local segmentation, and performs Jieba initialization and terminology extraction in a start-time worker. Audio3 waits for the one-shot snapshot before sending `run-task`. Runtime logs contain only source character count, terminology count, terminology character count, and extraction duration; they do not contain terms or source text.
+Voice Input freezes the focused agent and recent turns at command receipt, starts or continues audio capture before local segmentation, and performs Jieba initialization and terminology extraction in a start-time worker. Audio3 waits for the one-shot snapshot before sending `run-task`. Runtime logs contain only source character count, terminology count, terminology character count, and extraction duration; they do not contain terms or source text.
 
 ## Interpretation
 

@@ -28,7 +28,7 @@ use tungstenite::{
 };
 
 use crate::{
-    agent_context::AgentTerminologyCapture,
+    agent_context::{AgentTerminologyCapture, Audio3SessionContext},
     backend::{
         ASR_CONTROL_QUEUE_CAPACITY, AsrControl, AsrEvent, AsrSessionHandle, AsrSessionOptions,
         AudioSpec, TimestampDiagnosticsDelta,
@@ -146,13 +146,12 @@ fn run_session(
     let context_wait_budget = Duration::from_millis(config.asr.connect_timeout_ms.min(5_000));
     let session_context = agent_terminology
         .and_then(|capture| capture.wait_with_abort(&abort_flag, context_wait_budget))
-        .and_then(|snapshot| snapshot.select_for_audio3())
-        .map(|context| Arc::<str>::from(context.text));
+        .and_then(|snapshot| snapshot.select_for_audio3());
 
     run_reconnect_driver(
         &config,
         spec,
-        session_context.as_deref(),
+        session_context.as_ref(),
         control_rx,
         &abort_flag,
         &event_tx,
@@ -326,7 +325,7 @@ enum ActiveAttemptOutcome {
 fn run_reconnect_driver<F, I, P, C>(
     config: &Config,
     spec: AudioSpec,
-    session_context: Option<&str>,
+    session_context: Option<&Audio3SessionContext>,
     control_rx: mpsc::Receiver<AsrControl>,
     abort_flag: &AtomicBool,
     event_tx: &mpsc::Sender<AsrEvent>,
@@ -507,7 +506,7 @@ fn start_task<S: SocketIo, C: DeadlineClock>(
     clock: &C,
     config: &Config,
     spec: AudioSpec,
-    session_context: Option<&str>,
+    session_context: Option<&Audio3SessionContext>,
     task_id: &str,
     startup_deadline: C::Deadline,
     abort_flag: &AtomicBool,
@@ -549,7 +548,7 @@ fn start_task<S: SocketIo, C: DeadlineClock>(
             .to_string(),
         ))
         .context("failed to send Qwen-Audio-3 run-task")?;
-    if session_context.is_some_and(|context| !context.trim().is_empty()) {
+    if session_context.is_some_and(|context| !context.messages.is_empty()) {
         let _ = event_tx.send(AsrEvent::SessionContextSent);
     }
 
@@ -1190,7 +1189,7 @@ struct Audio3RequestControls<'a> {
     heartbeat_enabled: bool,
     recognition: EffectiveAudio3RecognitionControls,
     vocabulary: &'a [Audio3VocabularyTerm],
-    session_context: Option<&'a str>,
+    session_context: Option<&'a Audio3SessionContext>,
 }
 
 fn run_task_envelope(
@@ -1240,14 +1239,8 @@ fn run_task_envelope(
     if let Some(vocabulary) = super::vocabulary_value(vocabulary) {
         envelope["payload"]["parameters"]["vocabulary"] = vocabulary;
     }
-    if let Some(context) = session_context.filter(|context| !context.is_empty()) {
-        envelope["payload"]["input"]["context"] = json!([{
-            "role": "user",
-            "content": [{
-                "type": "input_text",
-                "text": context
-            }]
-        }]);
+    if let Some(context) = session_context.filter(|context| !context.messages.is_empty()) {
+        envelope["payload"]["input"]["context"] = Value::Array(context.messages.clone());
     }
     envelope
 }
@@ -2217,6 +2210,7 @@ mod tests {
     };
 
     use crate::{
+        agent_context::Audio3SessionContext,
         backend::AsrEvent,
         config::{
             AlibabaAudio3Config, Audio3EndpointMode, Audio3RecognitionPreset, Audio3Region,
@@ -2232,7 +2226,8 @@ mod tests {
         TaskIdSource, TimestampDiagnosticsDelta, TranscriptAssembler, finish_task_envelope,
         new_task_id, parse_server_event, pcm16_le_bytes, report_task_failure,
         run_established_socket, run_reconnect_driver, run_task_envelope,
-        sanitize_websocket_handshake_failure, websocket_request, websocket_request_for_config,
+        sanitize_websocket_handshake_failure, start_task, websocket_request,
+        websocket_request_for_config,
     };
 
     const TASK_ID: &str = "0123456789abcdef0123456789abcdef";
@@ -2577,6 +2572,62 @@ mod tests {
         serde_json::from_str(&text).unwrap()
     }
 
+    fn two_round_context() -> Audio3SessionContext {
+        Audio3SessionContext {
+            messages: vec![
+                json!({"role": "user", "content": [{"type": "input_text", "text": "RareModel"}]}),
+                json!({"role": "assistant", "content": [{"type": "text", "text": "Qwen-Audio-3"}]}),
+                json!({"role": "user", "content": [{"type": "input_text", "text": "Voice Input"}]}),
+                json!({"role": "assistant", "content": [{"type": "text", "text": "DashScope"}]}),
+            ],
+        }
+    }
+
+    #[test]
+    fn start_task_omits_absent_or_empty_context_without_sent_diagnostic() {
+        let empty = Audio3SessionContext { messages: vec![] };
+        for context in [None, Some(&empty)] {
+            let config = crate::config::Config::default();
+            let clock = ManualClock::default();
+            let (read_tx, read_rx) = mpsc::channel();
+            let (checkpoint_tx, checkpoint_rx) = mpsc::channel();
+            let (event_tx, event_rx) = mpsc::channel();
+            let mut socket = ScriptedSocket {
+                read_rx,
+                checkpoint_tx,
+            };
+            read_tx
+                .send(ScriptRead::Message(provider_event(
+                    "task-started",
+                    json!({}),
+                )))
+                .unwrap();
+            assert!(
+                start_task(
+                    &mut socket,
+                    &clock,
+                    &config,
+                    AudioSpec {
+                        sample_rate_hz: 16_000
+                    },
+                    context,
+                    TASK_ID,
+                    clock.deadline_after(Duration::from_millis(STARTUP_DEADLINE_MS)),
+                    &AtomicBool::new(false),
+                    &event_tx,
+                    None,
+                )
+                .unwrap()
+            );
+            let Message::Text(text) = expect_sent(&checkpoint_rx) else {
+                panic!("run-task must be text");
+            };
+            let envelope: serde_json::Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(envelope["payload"]["input"], json!({}));
+            assert!(event_rx.try_recv().is_err());
+        }
+    }
+
     #[test]
     fn reconnect_replays_exact_prefix_to_distinct_task_and_only_replacement_final_survives() {
         let mut config = crate::config::Config::default();
@@ -2607,7 +2658,7 @@ mod tests {
                 AudioSpec {
                     sample_rate_hz: 16_000,
                 },
-                Some("RareModel\nQwen-Audio-3"),
+                Some(&two_round_context()),
                 control_rx,
                 &abort,
                 &event_tx,
@@ -2621,6 +2672,7 @@ mod tests {
         let initial_run_task = sent_json(&sent_rx);
         assert_eq!(initial_run_task["header"]["task_id"], first_id);
         let initial_context = initial_run_task["payload"]["input"]["context"].clone();
+        assert_eq!(initial_context, json!(two_round_context().messages));
         first_tx
             .send(ScriptRead::Message(task_event(
                 first_id,
@@ -3643,7 +3695,8 @@ mod tests {
     }
 
     #[test]
-    fn run_task_envelope_sends_one_plain_text_session_context_message() {
+    fn run_task_envelope_preserves_two_round_context_roles_and_types() {
+        let context = two_round_context();
         let envelope = run_task_envelope(
             TASK_ID,
             "model",
@@ -3656,19 +3709,25 @@ mod tests {
                 heartbeat_enabled: false,
                 recognition: AlibabaAudio3Config::default().effective_recognition_controls(),
                 vocabulary: &[],
-                session_context: Some("RareModel\nQwen-Audio-3"),
+                session_context: Some(&context),
             },
         );
         assert_eq!(
-            envelope["payload"]["input"]["context"],
-            json!([{
-                "role": "user",
-                "content": [{
-                    "type": "input_text",
-                    "text": "RareModel\nQwen-Audio-3"
-                }]
-            }])
+            envelope["payload"]["input"],
+            json!({"context": context.messages})
         );
+        let messages = envelope["payload"]["input"]["context"].as_array().unwrap();
+        assert_eq!(messages.len(), 4);
+        for (index, message) in messages.iter().enumerate() {
+            let (role, content_type) = if index % 2 == 0 {
+                ("user", "input_text")
+            } else {
+                ("assistant", "text")
+            };
+            assert_eq!(message["role"], role);
+            assert_eq!(message["content"][0]["type"], content_type);
+            assert!(message.get("source").is_none());
+        }
         assert!(!envelope.to_string().contains("continue-task"));
     }
 

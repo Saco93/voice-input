@@ -13,7 +13,7 @@ QMLLINT ?= $(shell command -v qmllint 2>/dev/null || if [ -x /usr/lib/qt6/bin/qm
 HUD_SHADER_SOURCE := assets/quickshell/shaders/wavy-halo.frag
 HUD_SHADER_OUTPUT := target/quickshell/shaders/wavy-halo.frag.qsb
 
-.PHONY: build run validate validate-qml install install-hud-assets hud-shaders clean enable-service disable-service
+.PHONY: build run validate validate-qml validate-pi install install-hud-assets hud-shaders clean enable-service disable-service
 
 build:
 	cargo build --release --locked
@@ -21,11 +21,14 @@ build:
 run:
 	cargo run --locked -- daemon
 
-validate: validate-qml
+validate: validate-qml validate-pi
 	cargo fmt --all -- --check
 	cargo check --locked --all-targets
 	cargo test --locked
 	cargo clippy --locked --all-targets -- -D warnings
+
+validate-pi:
+	node --test assets/pi/voice-input-session-registry.test.mjs
 
 validate-qml:
 	@test -n "$(QMLLINT)" || { printf '%s\n' 'Qt QML lint tools are required; install qt6-declarative or set QMLLINT=/path/to/qmllint' >&2; exit 1; }

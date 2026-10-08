@@ -16,6 +16,11 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v5
 
+      - name: Install Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: '24'
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -82,6 +87,9 @@ jobs:
 
       - name: Cache Rust build
         uses: Swatinem/rust-cache@v2
+
+      - name: Test Pi session registry
+        run: make validate-pi
 
       - name: Check formatting
         run: cargo fmt --all -- --check

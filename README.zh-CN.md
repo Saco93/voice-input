@@ -23,13 +23,14 @@ flowchart LR
     A3 -. 实时文本 .-> HUD[Quickshell HUD]
     Local[本地 CLI fallback] -. 远程识别恢复 .-> LLM
     Agent[开始时聚焦的 Pi / Codex] -. 术语快照 .-> A3
-    Agent -. 同一快照 .-> LLM
+    Agent -. 同一快照 .-> Final
+    Agent -. 合并后的词汇表 .-> LLM
 ```
 
 1. 常驻 PipeWire capture service 保留一小段 pre-roll，避免快捷键按下后最开始的语音被截掉。录音达到配置的时长上限后会自动停止并进入最终处理；默认上限为五分钟。
 2. Qwen-Audio-3 Streaming 通过容量受限的非阻塞 queue 和公平的双向 WebSocket 处理，把 partial transcript 发送到 HUD。如果在发送 `finish-task` 前发生一次可恢复的传输中断，worker 会创建一个 replacement task，并从头重放保留的全部原始 PCM packet，同时继续录音。
 3. Toggle off 后，流式任务会提供主要的最终 transcript。用户可以通过 Adaptive 或 Always 模式，让可选的 Qwen-Audio-3 Native 最终处理再次识别完整录音。如果流式恢复失败、远程音频传输落后，或者已选择的 Native 最终处理失败且没有可用的流式结果，Voice Input 会使用已配置的本地 fallback。
-4. 如果开始听写时聚焦的是 Pi 或 Codex，并且用户启用了 Session 术语，Voice Input 会在本地对最新一条已完成的 assistant message 脱敏并分词一次，按照术语在该来源中出现的次数从少到多排列，并为本次操作保留一份不可变快照。Audio3 Streaming 在 `run-task` 中接收不超过 400 个字符且使用换行分隔的术语视图；重连后的 replacement task 接收完全相同的视图。Refine 从同一快照接收最多 96 个术语和 1,500 个术语字符。程序会在 Refine 前后将仅存在 ASCII 大小写或分隔符差异的高置信度技术词变体恢复为快照中的拼写。Adaptive 模式下，如果 Streaming 确实发送了 Session Context，并且正常完成且结果可用，程序不会仅因录音超过 30 秒而使用 Native 识别覆盖该结果；所有异常恢复条件和明确选择的 Always 模式保持不变。OpenAI-compatible LLM 对文本做轻量整理。Toggle off 时聚焦的窗口仍然决定 refinement 风格：Pi 和 Codex 使用紧凑的 Markdown，将明确的顺序转换为有序列表，将没有顺序的多项列举转换为无序列表，并将不同部分分成独立段落；系统中已安装的原生即时通讯客户端（WeChat、飞书/Lark、Signal 和 Telegram Desktop）使用自然的聊天标点，保留具有表达作用的口语语气词，并去掉消息末尾的句号，同时保留问号、感叹号和有意使用的省略号；其他窗口继续采用轻度书面化的默认风格。Refinement 使用配置的 timeout（默认 15 秒，最多 30 秒）；预算达到 10 秒时，包含 coding agent 上下文的请求会为纯 transcript 清理重试预留 5 秒，最终失败时使用 Final ASR。
+4. 如果开始听写时聚焦的是 Pi 或 Codex，并且用户启用了 Session 术语，Voice Input 会读取最近最多五轮对话，在本地分别对用户消息和已完成的助手回复脱敏、分词，并为本次操作保留一份不可变快照。Audio3 Streaming 和 Native 按时间顺序接收保留 `user`／`assistant` 角色的词汇表消息，不发送对话原文。每轮的两种角色合计最多 400 个字符，包含换行符；程序从各角色按低频优先排列的候选词中交替选词。重连后的任务接收完全相同的上下文。Refine 只接收所有已选词汇合并并忽略大小写去重后的单一词汇表，不再按 96 条／1,500 字符再次截断。配置中的来源字符预算由这些消息共享。程序会在 Refine 前后将仅存在 ASCII 大小写或分隔符差异的高置信度技术词变体恢复为快照中的拼写。Adaptive 模式下，如果 Streaming 确实发送了 Session Context，并且正常完成且结果可用，程序不会仅因录音超过 30 秒而使用 Native 识别覆盖该结果；所有异常恢复条件和明确选择的 Always 模式保持不变。OpenAI-compatible LLM 对文本做轻量整理。Toggle off 时聚焦的窗口仍然决定 refinement 风格：Pi 和 Codex 使用紧凑的 Markdown，将明确的顺序转换为有序列表，将没有顺序的多项列举转换为无序列表，并将不同部分分成独立段落；系统中已安装的原生即时通讯客户端（WeChat、飞书/Lark、Signal 和 Telegram Desktop）使用自然的聊天标点，保留具有表达作用的口语语气词，并去掉消息末尾的句号，同时保留问号、感叹号和有意使用的省略号；其他窗口继续采用轻度书面化的默认风格。Refinement 使用配置的 timeout（默认 15 秒，最多 30 秒）；预算达到 10 秒时，包含 coding agent 上下文的请求会为纯 transcript 清理重试预留 5 秒，最终失败时使用 Final ASR。
 5. 所有文本都通过剪贴板粘贴，并在结束后自动恢复原剪贴板。原生 Wayland 投递会把临时 transcript 和恢复的内容都标记为敏感，使兼容的剪贴板管理器不会保存或重新排序这些内容。Wayland 使用 Hyprland 的 `sendshortcut` dispatcher 发送粘贴快捷键，XWayland 使用 `xdotool`；Voice Input 不再创建 `wtype` 字符 keymap。
 
 Streaming、Native 或本地 ASR 确认没有 transcript 后，无语音 session 会直接回到 idle。音频采集、ASR、HUD、状态持久化和文本输出彼此隔离，缓慢的界面或剪贴板客户端不会阻塞识别。
@@ -58,7 +59,7 @@ make enable-service
 git pull --ff-only && make enable-service
 ```
 
-该命令会覆盖已安装的二进制文件、服务定义和内置桌面资产，但会保留用户配置和加密凭据。更新后，请重新打开 Settings、重新加载 Pi，并重新加载 Hyprland 配置。如果你复制了 Waybar snippet，而不是引用已安装的 snippet，还需要把当前版本的 snippet 重新合并到 Waybar 配置中。
+该命令会覆盖已安装的二进制文件、服务定义和内置桌面资产，但会保留用户配置和加密凭据。更新后，请重新打开 Settings、重新加载 Pi，并重新加载 Hyprland 配置。五轮上下文需要新版 Pi 扩展；重新加载 Pi 之前，Voice Input 会省略 Pi 上下文，不会改读可能属于非活动分支的 JSONL 文件末尾。如果你复制了 Waybar snippet，而不是引用已安装的 snippet，还需要把当前版本的 snippet 重新合并到 Waybar 配置中。
 
 然后打开设置：
 
@@ -127,7 +128,7 @@ Qwen-Audio-3 是默认的远程 provider，也是主要的识别路径。本地 
 
 Alibaba API key 必须与所选区域和业务空间匹配，并具有所选模型的权限。更改区域或业务空间后，用户可能需要替换加密的 Alibaba 凭据。Voice Input 绝不会探测其他区域，也不会自动迁移 key。支持选择新加坡区域并不表示已经实现完整功能一致性；每个模型、控制项组合以及语言或词汇表场景仍需完成经过授权的在线验证。本次业务空间专属域名变更未进行真实 API 测试。
 
-流式模型负责提供实时文本。用户启用 Session 术语，并且听写开始时聚焦的是经过验证的 Pi 或 Codex session 时，`run-task` 还会接收最多 400 个字符且低频优先的本地脱敏 Session Context 术语；程序不会发送 `continue-task`。如果在发送 `finish-task` 前发生一次可恢复的传输中断，Voice Input 会创建新的 Audio3 task，使旧 task 的 transcript 失效，并且以 4 倍实时速度从头重放保留的 PCM，同时继续录音。保留的 PCM 必须包含完整前缀，其上限取配置的最大录音时长、300 秒和 10 MiB PCM 三者中的最小值；超过上限会停用重连，不会改为保留或重放不完整的前缀。第二次中断或发送 `finish-task` 后的中断会使用现有的 Native 或本地完整音频恢复。**语言提示**和**流式 heartbeat** 是两个相互独立的选用设置，默认均为关闭。启用语言提示后，程序会把现有语言选项发送给 Audio3：英语使用 `en`；简体中文和繁体中文使用 `zh,en`；日语使用 `ja,en`；韩语使用 `ko,en`。中文、日语和韩语的额外英语提示用于保留英语混合识别；关闭该开关会保留服务商的自动检测行为。启用流式 heartbeat 后，只要程序继续发送格式正确的音频帧，它就能使长时间静音的按键说话 session 保持连接。
+流式模型负责提供实时文本。用户启用 Session 术语，并且听写开始时聚焦的是经过验证的 Pi 或 Codex session 时，`run-task` 还会接收最近最多五轮的本地脱敏术语，保留用户和助手的角色，每轮最多 400 个字符；程序不会发送 `continue-task`。如果在发送 `finish-task` 前发生一次可恢复的传输中断，Voice Input 会创建新的 Audio3 task，使旧 task 的 transcript 失效，并且以 4 倍实时速度从头重放保留的 PCM，同时继续录音。保留的 PCM 必须包含完整前缀，其上限取配置的最大录音时长、300 秒和 10 MiB PCM 三者中的最小值；超过上限会停用重连，不会改为保留或重放不完整的前缀。第二次中断或发送 `finish-task` 后的中断会使用现有的 Native 或本地完整音频恢复。**语言提示**和**流式 heartbeat** 是两个相互独立的选用设置，默认均为关闭。启用语言提示后，程序会把现有语言选项发送给 Audio3：英语使用 `en`；简体中文和繁体中文使用 `zh,en`；日语使用 `ja,en`；韩语使用 `ko,en`。中文、日语和韩语的额外英语提示用于保留英语混合识别；关闭该开关会保留服务商的自动检测行为。启用流式 heartbeat 后，只要程序继续发送格式正确的音频帧，它就能使长时间静音的按键说话 session 保持连接。
 
 **识别预设**默认使用**标准**。该预设保留现有行为：最大句末静音时长为 `800` 毫秒，语义标点和多阈值模式均关闭，并且不发送语音/噪声阈值。**低延迟听写**使用 `400` 毫秒并启用多阈值模式；**长篇语音**使用 `1300` 毫秒并启用语义标点。经过授权的单说话人评估确认服务端接受这两个映射；在插入了 250–2200 毫秒数字静音的测试矩阵中，两者都保留了静音前后的内容。声学语音边界仍取决于本地 RMS 裁剪。有限样本无法形成通用的准确率或延迟建议，因此标准预设仍为默认值。详见 [`docs/qwen-audio3-milestone2-evaluation.md`](docs/qwen-audio3-milestone2-evaluation.md)。**自定义**会显示全部原始控制项；语义标点与多阈值模式不能同时启用。可选的语音/噪声阈值必须是 `-1` 到 `1` 之间的有限数值；Alibaba 未公布默认值，因此省略该字段可以保留服务商行为。Settings 会显示自定义请求可能发送的每一个值。
 
@@ -135,7 +136,7 @@ Alibaba API key 必须与所选区域和业务空间匹配，并具有所选模�
 
 **原生最终处理**提供三种模式。默认的**仅流式识别**不会发送完整录音。**自适应**模式会在实时音频传输过载、后端或事件 worker 中断、流式识别为空/失败/降级、服务端未发送明确的 `Finished` 完成事件，或者录音通常达到 30 秒时运行原生识别。可用、未过载且明确完成的流式识别在短于 30 秒时会跳过原生识别；如果它确实发送了 Session Context，即使录音更长也同样会跳过。所有异常恢复条件仍然生效。**始终运行**是明确请求最高准确度的选项，会对每段未取消且非空的录音运行原生识别。旧配置中的 boolean 为 `true` 时会迁移到**始终运行**，为 `false` 时会迁移到**仅流式识别**。
 
-运行原生识别时，程序会把完整录音发送给 `qwen-audio-3.0-asr-flash`。成功的原生 transcript 优先级最高。如果原生服务返回无词结果，并且没有可用的流式 transcript，该结果具有最终效力；如果已有可用的流式 transcript，程序会保留它。原生请求失败或超时时，程序会保留可用的流式文本；仍无可用文本时，才会使用已配置的本地备用识别。取消操作不会启动原生识别。原生请求最多接受 10 MiB 的原始 WAV 音频。
+运行原生识别时，程序会把本次完整录音发送给 `qwen-audio-3.0-asr-flash`，并在音频消息之前附带与 Streaming 相同的录音开始时词汇表消息（如果存在）。程序不会重新发送历史录音。成功的原生 transcript 优先级最高。如果原生服务返回无词结果，并且没有可用的流式 transcript，该结果具有最终效力；如果已有可用的流式 transcript，程序会保留它。原生请求失败或超时时，程序会保留可用的流式文本；仍无可用文本时，才会使用已配置的本地备用识别。取消操作不会启动原生识别。原生请求最多接受 10 MiB 的原始 WAV 音频。
 
 开发者可以使用预先录制的 16 kHz、单声道、PCM16 WAV 分别测试两个 API。以下命令不会启动守护进程，也不会把识别文本输入其他应用：
 
@@ -177,7 +178,7 @@ voice-input asr test --file sample.wav         # 原生完整音频识别
 
 ## 隐私
 
-远程 Qwen-Audio-3 识别会把音频发送到所选的业务空间专属地址、区域路由或完全按原值使用的自定义 Alibaba 端点。LLM refinement 会把 transcript 和粗粒度的目标风格（coding agent 结构化 Markdown、`instant-messaging` 或默认风格）通过 system prompt 发送到配置的 provider。只有在用户明确启用 Session 术语时，Voice Input 才会捕获听写开始时聚焦的 Pi 或 Codex session，在本地对其最近一条已完成的 assistant message 进行脱敏和截断，使用 Jieba 分词并去重，再按照出现次数从少到多排列。Audio3 Streaming 和 Refine 会接收这份不可变快照各自受限的视图；两类请求都不会包含 Agent source message、频次数据、窗口标题、进程 ID 或原始桌面元数据。公开示例配置默认关闭远程 refinement 和 Session 术语。Voice Input 不收集遥测或分析数据。
+远程 Qwen-Audio-3 识别会把音频发送到所选的业务空间专属地址、区域路由或完全按原值使用的自定义 Alibaba 端点。LLM refinement 会把 transcript 和粗粒度的目标风格（coding agent 结构化 Markdown、`instant-messaging` 或默认风格）通过 system prompt 发送到配置的 provider。只有在用户明确启用 Session 术语时，Voice Input 才会捕获听写开始时聚焦的 Pi 或 Codex session 中最近最多五轮的用户与助手消息。Pi 扩展发布活动分支的对话；Codex 将用户消息与最终回复配对，并处理对话回退事件。尚未获得助手回复的用户消息会保留；工具输出、思考内容和非最终助手消息会被排除。程序在本地对来源文本脱敏，在共享预算内截断，使用 Jieba 分词，并对每条消息的词汇去重。Audio3 Streaming 和 Native 接收同一快照中保留角色且限制长度的词汇表消息；Refine 只接收合并去重后的词汇表。这些请求都不会包含对话原文、频次数据、窗口标题、进程 ID 或原始桌面元数据。公开示例配置默认关闭远程 refinement 和 Session 术语。Voice Input 不收集遥测或分析数据。
 
 ## 项目状态
 

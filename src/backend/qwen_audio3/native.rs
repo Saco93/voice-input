@@ -6,6 +6,7 @@ use reqwest::StatusCode;
 use serde_json::{Value, json};
 
 use crate::{
+    agent_context::Audio3SessionContext,
     config::{Audio3VocabularyTerm, Config, Language},
     http_client,
 };
@@ -14,7 +15,11 @@ use super::super::text::apply_script_conversion;
 
 pub(crate) const MAX_RAW_AUDIO_BYTES: usize = 10 * 1024 * 1024;
 
-pub(crate) fn transcribe_full_audio(config: &Config, wav_path: &Path) -> Result<Option<String>> {
+pub(crate) fn transcribe_full_audio(
+    config: &Config,
+    wav_path: &Path,
+    context: Option<&Audio3SessionContext>,
+) -> Result<Option<String>> {
     let audio3 = &config.asr.alibaba_audio3;
     if audio3.api_key.trim().is_empty() {
         bail!("Qwen-Audio-3 native ASR requires a configured credential");
@@ -28,6 +33,7 @@ pub(crate) fn transcribe_full_audio(config: &Config, wav_path: &Path) -> Result<
         config.asr.language,
         audio3.language_hints_enabled,
         &audio3.vocabulary,
+        context,
     )?;
     let response = http_client::post_json_sanitized(
         endpoints.native(),
@@ -68,21 +74,26 @@ fn request_body(
     language: Language,
     language_hints_enabled: bool,
     vocabulary: &[Audio3VocabularyTerm],
+    context: Option<&Audio3SessionContext>,
 ) -> Result<Value> {
     enforce_raw_audio_limit(wav_bytes.len())?;
     let audio_uri = format!("data:audio/wav;base64,{}", STANDARD.encode(wav_bytes));
+    let mut messages = context
+        .map(|context| context.messages.clone())
+        .unwrap_or_default();
+    messages.push(json!({
+        "role": "user",
+        "content": [{
+            "type": "input_audio",
+            "input_audio": {
+                "data": audio_uri
+            }
+        }]
+    }));
     let mut body = json!({
         "model": model,
         "input": {
-            "messages": [{
-                "role": "user",
-                "content": [{
-                    "type": "input_audio",
-                    "input_audio": {
-                        "data": audio_uri
-                    }
-                }]
-            }]
+            "messages": messages
         },
         "parameters": {
             "format": "wav",
@@ -150,7 +161,21 @@ mod tests {
         MAX_RAW_AUDIO_BYTES, enforce_raw_audio_limit, parse_response, request_body,
         transcribe_full_audio,
     };
-    use crate::config::{Audio3EndpointMode, Audio3VocabularyTerm, Config, Language};
+    use crate::{
+        agent_context::Audio3SessionContext,
+        config::{Audio3EndpointMode, Audio3VocabularyTerm, Config, Language},
+    };
+
+    fn two_round_context() -> Audio3SessionContext {
+        Audio3SessionContext {
+            messages: vec![
+                json!({"role": "user", "content": [{"type": "input_text", "text": "RareModel"}]}),
+                json!({"role": "assistant", "content": [{"type": "text", "text": "Qwen-Audio-3"}]}),
+                json!({"role": "user", "content": [{"type": "input_text", "text": "Voice Input"}]}),
+                json!({"role": "assistant", "content": [{"type": "text", "text": "DashScope"}]}),
+            ],
+        }
+    }
 
     #[test]
     fn request_body_matches_official_native_shape_and_data_uri() {
@@ -161,6 +186,7 @@ mod tests {
                 Language::SimplifiedChinese,
                 true,
                 &[],
+                None,
             )
             .unwrap(),
             json!({
@@ -186,6 +212,43 @@ mod tests {
     }
 
     #[test]
+    fn request_body_prepends_two_round_context_before_current_audio() {
+        let context = two_round_context();
+        let body = request_body(
+            "model",
+            b"wav",
+            Language::English,
+            false,
+            &[],
+            Some(&context),
+        )
+        .unwrap();
+        assert_eq!(
+            body["input"],
+            json!({"messages": [
+                {"role": "user", "content": [{"type": "input_text", "text": "RareModel"}]},
+                {"role": "assistant", "content": [{"type": "text", "text": "Qwen-Audio-3"}]},
+                {"role": "user", "content": [{"type": "input_text", "text": "Voice Input"}]},
+                {"role": "assistant", "content": [{"type": "text", "text": "DashScope"}]},
+                {"role": "user", "content": [{
+                    "type": "input_audio",
+                    "input_audio": {"data": "data:audio/wav;base64,d2F2"}
+                }]}
+            ]})
+        );
+        assert!(body["parameters"].get("vocabulary").is_none());
+    }
+
+    #[test]
+    fn request_body_omits_empty_context() {
+        let empty = Audio3SessionContext { messages: vec![] };
+        assert_eq!(
+            request_body("model", b"wav", Language::English, false, &[], Some(&empty)).unwrap(),
+            request_body("model", b"wav", Language::English, false, &[], None).unwrap()
+        );
+    }
+
+    #[test]
     fn raw_audio_limit_accepts_ten_mib_and_rejects_one_byte_more() {
         assert!(enforce_raw_audio_limit(MAX_RAW_AUDIO_BYTES).is_ok());
         assert!(enforce_raw_audio_limit(MAX_RAW_AUDIO_BYTES + 1).is_err());
@@ -196,6 +259,7 @@ mod tests {
                 Language::English,
                 false,
                 &[],
+                None,
             )
             .is_err()
         );
@@ -203,7 +267,7 @@ mod tests {
 
     #[test]
     fn native_controls_include_vocabulary_only_when_configured_and_never_heartbeat() {
-        let disabled = request_body("model", b"wav", Language::English, false, &[]).unwrap();
+        let disabled = request_body("model", b"wav", Language::English, false, &[], None).unwrap();
         assert!(disabled["parameters"].get("language_hints").is_none());
         assert!(disabled["parameters"].get("vocabulary").is_none());
         assert!(disabled["parameters"].get("heartbeat").is_none());
@@ -213,7 +277,7 @@ mod tests {
             weight: 5,
         }];
         let configured =
-            request_body("model", b"wav", Language::Korean, true, &vocabulary).unwrap();
+            request_body("model", b"wav", Language::Korean, true, &vocabulary, None).unwrap();
         assert_eq!(
             configured["parameters"]["language_hints"],
             json!(["ko", "en"])
@@ -301,7 +365,8 @@ mod tests {
         let mut config = Config::default();
         config.asr.alibaba_audio3.api_key = "test-key".into();
         let temp = tempfile::tempdir().unwrap();
-        let error = transcribe_full_audio(&config, &temp.path().join("missing.wav")).unwrap_err();
+        let error =
+            transcribe_full_audio(&config, &temp.path().join("missing.wav"), None).unwrap_err();
         assert!(error.to_string().contains("workspace ID is required"));
     }
 
@@ -316,7 +381,7 @@ mod tests {
         config.asr.alibaba_audio3.endpoint_mode = Audio3EndpointMode::Custom;
         config.asr.alibaba_audio3.native_endpoint = ENDPOINT_SENTINEL.into();
 
-        let error = transcribe_full_audio(&config, &wav_path)
+        let error = transcribe_full_audio(&config, &wav_path, None)
             .expect_err("malformed custom native target must fail generically");
         assert_eq!(error.to_string(), "native HTTP request failed");
         assert!(!format!("{error:#}").contains(ENDPOINT_SENTINEL));
@@ -347,7 +412,7 @@ mod tests {
         config.asr.alibaba_audio3.native_endpoint = endpoint.clone();
         config.asr.alibaba_audio3.native_timeout_ms = 300;
 
-        let error = transcribe_full_audio(&config, &wav_path)
+        let error = transcribe_full_audio(&config, &wav_path, None)
             .expect_err("server that never responds must time out");
         server.join().unwrap();
         let formatted = format!("{error:#}");
@@ -359,7 +424,16 @@ mod tests {
     }
 
     #[test]
-    fn loopback_request_uses_bearer_auth_and_exact_body() {
+    fn loopback_request_uses_bearer_auth_and_exact_body_without_context() {
+        assert_loopback_request(None);
+    }
+
+    #[test]
+    fn loopback_request_preserves_two_round_context_before_current_audio() {
+        assert_loopback_request(Some(&two_round_context()));
+    }
+
+    fn assert_loopback_request(context: Option<&Audio3SessionContext>) {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let endpoint = format!(
             "http://{}/native?route=exact%2Fvalue",
@@ -397,7 +471,7 @@ mod tests {
         config.asr.alibaba_audio3.native_model = "test-native-model".into();
 
         assert_eq!(
-            transcribe_full_audio(&config, &wav_path).unwrap(),
+            transcribe_full_audio(&config, &wav_path, context).unwrap(),
             Some("loopback transcript".into())
         );
         let request = request_rx.recv().unwrap();
@@ -414,19 +488,28 @@ mod tests {
         assert_eq!(body["parameters"]["language_hints"], json!(["ko", "en"]));
         assert_eq!(body["parameters"]["vocabulary"], json!({"Voice Input": 5}));
         assert!(body["parameters"].get("heartbeat").is_none());
+        let mut expected_messages = context
+            .map(|context| context.messages.clone())
+            .unwrap_or_default();
+        expected_messages.push(json!({
+            "role": "user",
+            "content": [{
+                "type": "input_audio",
+                "input_audio": {"data": "data:audio/wav;base64,d2F2"}
+            }]
+        }));
         assert_eq!(
             body,
-            request_body(
-                "test-native-model",
-                b"wav",
-                Language::Korean,
-                true,
-                &[Audio3VocabularyTerm {
-                    term: "Voice Input".into(),
-                    weight: 5,
-                }],
-            )
-            .unwrap()
+            json!({
+                "model": "test-native-model",
+                "input": {"messages": expected_messages},
+                "parameters": {
+                    "format": "wav",
+                    "sample_rate": "16000",
+                    "language_hints": ["ko", "en"],
+                    "vocabulary": {"Voice Input": 5}
+                }
+            })
         );
     }
 

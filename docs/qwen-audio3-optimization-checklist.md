@@ -113,10 +113,10 @@ Filetrans remains deferred. Alibaba Session Context is implemented as a start-ti
 
 ### 9. Shared local terminology for Audio3 Session Context and Refine
 
-- [x] Treat the latest completed Pi/Codex assistant message from the session focused at dictation start as the terminology source; do not derive correction vocabulary from the potentially incorrect ASR transcript.
+- [x] Use up to five recent user/assistant turns from the Pi/Codex session focused at dictation start as the terminology source; retain pending user-only turns, exclude tool/commentary output, and do not derive correction vocabulary from the current potentially incorrect ASR transcript.
 - [x] Build one immutable snapshot per Voice Input operation, count case-insensitive occurrences, and sort rare terms first with stable candidate-order ties. Ordinary windows do not construct terminology.
-- [x] Send a complete-term, newline-separated view of at most 400 characters only in Audio3 Streaming `run-task`; do not implement `continue-task`, and reuse the identical view for a reconnect replacement task.
-- [x] Select Refine's existing 96-term/1,500-character view independently from the same snapshot.
+- [x] Send up to five chronological user/assistant terminology turns, each with a shared 400-character budget including newlines, in Streaming `run-task` and Native before the current audio. Do not implement `continue-task`; reconnect reuses the identical context.
+- [x] Give Refine the flat, case-insensitively deduplicated union of those five turn glossaries, without the former 96-term/1,500-character recap.
 - [x] Normalize high-confidence dynamic technical variants around Refine using only the per-operation snapshot, with complete boundaries, separator/case folding, longest-match preference, and conflict rejection.
 - [x] In Adaptive mode, preserve a healthy completed Streaming result that actually sent nonempty Session Context instead of invoking Native solely for the 30-second duration threshold; retain Native for every degradation condition and Always mode.
 - [x] Redact the source locally before tokenization, then perform bounded local segmentation, stable deduplication, and filtering without sending the original unredacted message anywhere.

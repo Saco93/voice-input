@@ -1,20 +1,26 @@
-import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionContext, SessionEntry } from "@earendil-works/pi-coding-agent";
 import { chmod, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
 
 const MAX_REFERENCE_CHARS = 12_000;
+const MAX_RECENT_TURNS = 5;
 const REGISTRY_OWNER_KEY = Symbol.for("voice-input-session-registry:owner");
 
 type RegistryOwner = {
   instanceId: string;
 };
 
+type RecentTurn = {
+  user: string;
+  assistant: string;
+};
+
 type RegistrySnapshot = {
   sessionId: string;
   sessionFile: string;
   cwd: string;
-  latestCompletedAssistantMessage: string | undefined;
+  recentTurns: RecentTurn[];
 };
 
 function processStartTicks(stat: string): number {
@@ -26,29 +32,85 @@ function processStartTicks(stat: string): number {
   return value;
 }
 
-function capReference(value: string): string {
-  const characters = Array.from(value);
-  if (characters.length <= MAX_REFERENCE_CHARS) return value;
-  const headLength = Math.floor(MAX_REFERENCE_CHARS * 2 / 3);
-  const tailLength = MAX_REFERENCE_CHARS - headLength - 3;
-  return `${characters.slice(0, headLength).join("")}\n…\n${characters.slice(-tailLength).join("")}`;
+function* textParts(content: unknown): Generator<string> {
+  if (typeof content === "string") {
+    yield content;
+  } else if (Array.isArray(content)) {
+    for (const block of content) {
+      if (block?.type === "text" && typeof block.text === "string") yield block.text;
+    }
+  }
 }
 
-function latestCompletedAssistantMessage(ctx: ExtensionContext): string | undefined {
-  const branch = ctx.sessionManager.getBranch();
-  for (let index = branch.length - 1; index >= 0; index -= 1) {
-    const entry = branch[index];
-    if (entry.type !== "message") continue;
-    const message = entry.message;
-    if (message.role !== "assistant" || message.stopReason !== "stop") continue;
-    const text = message.content
-      .filter((block) => block.type === "text")
-      .map((block) => block.text)
-      .join("\n")
-      .trim();
-    if (text) return capReference(text);
+function startsRound(entry: SessionEntry): boolean {
+  if (entry.type !== "message" || entry.message.role !== "user") return false;
+  // Inspect the persisted role, not convertToLlm(): that conversion also turns
+  // custom, bash and summary messages into user messages. Pi 1.1 UserMessage
+  // has no separate persisted provenance field.
+  // Even image-only input starts a turn: its final answer must not attach to
+  // an earlier user. Images themselves are never published as source text.
+  return true;
+}
+
+function capReference(parts: Iterable<string>): string {
+  const headLength = Math.floor(MAX_REFERENCE_CHARS * 2 / 3);
+  const tailLength = MAX_REFERENCE_CHARS - headLength - 3;
+  let length = 0;
+  let head = "";
+  let tail = "";
+
+  function append(part: string): void {
+    // Never concatenate or scan an unbounded role. UTF-16 lengths are a
+    // conservative character budget; line boundaries also preserve surrogates.
+    head += part.slice(0, MAX_REFERENCE_CHARS - head.length);
+    tail = (tail + part.slice(-tailLength)).slice(-tailLength);
+    length = Math.min(MAX_REFERENCE_CHARS + 1, length + part.length);
   }
-  return undefined;
+
+  for (const part of parts) {
+    if (!part) continue;
+    if (length > 0) append("\n");
+    append(part);
+  }
+  if (length <= MAX_REFERENCE_CHARS) return head.trim();
+
+  // Rust redacts sensitive lines after publication. Discard boundary lines in
+  // full so a clipped credential label can never expose its remaining suffix.
+  const prefix = head.slice(0, headLength);
+  const headEnd = prefix.lastIndexOf("\n");
+  const tailStart = tail.indexOf("\n");
+  return `${headEnd < 0 ? "" : prefix.slice(0, headEnd)}\n…\n${tailStart < 0 ? "" : tail.slice(tailStart + 1)}`.trim();
+}
+
+export function collectRecentTurns(branch: readonly SessionEntry[]): RecentTurn[] {
+  const starts: number[] = [];
+  for (let index = branch.length - 1; index >= 0; index -= 1) {
+    if (startsRound(branch[index])) starts.push(index);
+    if (starts.length === MAX_RECENT_TURNS) break;
+  }
+  starts.reverse();
+
+  // Select rounds before extracting/capping any text. Empty capped rounds and
+  // the latest user-only round must not pull older conversations back in.
+  return starts.map((start, index) => {
+    const entry = branch[start];
+    const end = starts[index + 1] ?? branch.length;
+    function* assistantParts(): Generator<string> {
+      for (let cursor = start + 1; cursor < end; cursor += 1) {
+        const candidate = branch[cursor];
+        if (candidate.type !== "message") continue;
+        const message = candidate.message;
+        if (message.role === "assistant" && message.stopReason === "stop") {
+          yield* textParts(message.content);
+        }
+      }
+    }
+    return {
+      user: capReference(entry.type === "message" && entry.message.role === "user"
+        ? textParts(entry.message.content) : []),
+      assistant: capReference(assistantParts()),
+    };
+  });
 }
 
 function captureSnapshot(ctx: ExtensionContext): RegistrySnapshot | undefined {
@@ -58,7 +120,7 @@ function captureSnapshot(ctx: ExtensionContext): RegistrySnapshot | undefined {
     sessionId: ctx.sessionManager.getSessionId(),
     sessionFile,
     cwd: ctx.cwd,
-    latestCompletedAssistantMessage: latestCompletedAssistantMessage(ctx),
+    recentTurns: collectRecentTurns(ctx.sessionManager.getBranch()),
   };
 }
 
@@ -149,7 +211,7 @@ export default function (pi: ExtensionAPI) {
       session_id: snapshot.sessionId,
       session_file: snapshot.sessionFile,
       cwd: snapshot.cwd,
-      latest_completed_assistant_message: snapshot.latestCompletedAssistantMessage,
+      recent_turns: snapshot.recentTurns,
       updated_at_ms: Date.now(),
     });
     const temporary = `${registry}.tmp-${Date.now()}-${Math.random().toString(16).slice(2)}`;

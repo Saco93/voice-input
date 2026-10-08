@@ -1683,7 +1683,17 @@ impl Daemon {
                         None
                     };
                     let invocation = execute_native_final_pass(native_final_policy.invoke, || {
-                        self.transcribe_full_audio(&audio)
+                        let context = session.agent_terminology.as_ref().and_then(|capture| {
+                            capture
+                                .wait_with_abort(
+                                    &session.cancel_flag,
+                                    Duration::from_millis(
+                                        self.config.asr.connect_timeout_ms.min(5_000),
+                                    ),
+                                )
+                                .and_then(|snapshot| snapshot.select_for_audio3())
+                        });
+                        self.transcribe_full_audio(&audio, context.as_ref())
                     });
                     let final_state = invocation.state;
                     let final_text = invocation.text;
@@ -3177,11 +3187,15 @@ impl Daemon {
         result
     }
 
-    fn transcribe_full_audio(&self, audio: &[i16]) -> Result<Option<String>> {
+    fn transcribe_full_audio(
+        &self,
+        audio: &[i16],
+        context: Option<&agent_context::Audio3SessionContext>,
+    ) -> Result<Option<String>> {
         let temp_file = tempfile::NamedTempFile::new()
             .context("failed to create WAV temp file for full-audio retranscription")?;
         wav::write_pcm16_wav(temp_file.path(), self.config.audio.sample_rate, audio)?;
-        backend::transcribe_qwen_audio3_full_audio(&self.config, temp_file.path())
+        backend::transcribe_qwen_audio3_full_audio(&self.config, temp_file.path(), context)
     }
 
     fn transcribe_local_audio(&self, audio: &[i16]) -> Result<String> {
