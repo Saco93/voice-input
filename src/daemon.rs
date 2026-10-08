@@ -379,7 +379,7 @@ struct ControlServer {
 
 fn try_acquire_control_slot(active: &AtomicUsize) -> bool {
     active
-        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
+        .try_update(Ordering::SeqCst, Ordering::SeqCst, |count| {
             (count < MAX_CONTROL_CONNECTIONS).then_some(count + 1)
         })
         .is_ok()
