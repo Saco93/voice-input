@@ -1009,7 +1009,7 @@ impl Daemon {
         let captures_agent_source = terminology_window.as_ref().is_some_and(|window| {
             window
                 .as_ref()
-                .is_ok_and(|window| window.class().eq_ignore_ascii_case("kitty"))
+                .is_ok_and(focused_window::FocusedWindowSnapshot::is_kitty)
         });
         let mut prepared_capture = (!self.capture.is_enabled() || captures_agent_source)
             .then(|| PreparedPwRecord::spawn(&self.config))

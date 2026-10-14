@@ -255,7 +255,7 @@ impl FocusedAgentSnapshot {
 pub fn capture_focused_agent(
     window: &FocusedWindowSnapshot,
 ) -> Result<Option<FocusedAgentSnapshot>> {
-    if !window.class().eq_ignore_ascii_case("kitty") {
+    if !window.is_kitty() {
         return Ok(None);
     }
 
@@ -289,7 +289,7 @@ pub fn start_terminology_capture(
     window: FocusedWindowSnapshot,
     max_chars: usize,
 ) -> Result<Option<AgentTerminologyCapture>> {
-    if !window.class().eq_ignore_ascii_case("kitty") {
+    if !window.is_kitty() {
         return Ok(None);
     }
     // Freeze both the focused agent session and its recent conversation turns
@@ -383,18 +383,22 @@ fn build_snapshot(
     if message_count == 0 {
         return None;
     }
-    // Keep the configured source budget for the entire snapshot, distributed
-    // across messages so an oversized answer cannot erase other turns/roles.
+    // Share the configured terminology budget across messages. Extract from
+    // each complete redacted source before truncating its ranked terms.
     let message_budget =
         max_chars.clamp(MIN_AGENT_CONTEXT_CHARS, MAX_AGENT_CONTEXT_CHARS) / message_count;
     let started = Instant::now();
     let mut source_char_count = 0;
     let mut candidates = Vec::new();
     for turn in source {
-        let user = sanitize_reference(&turn.user, message_budget);
-        let assistant = sanitize_reference(&turn.assistant, message_budget);
+        let user = sanitize_reference(&turn.user);
+        let assistant = sanitize_reference(&turn.assistant);
         source_char_count += user.chars().count() + assistant.chars().count();
-        candidates.push((extract_terminology(&user), extract_terminology(&assistant)));
+        let mut user_terms = extract_terminology(&user);
+        let mut assistant_terms = extract_terminology(&assistant);
+        truncate_terminology(&mut user_terms, message_budget);
+        truncate_terminology(&mut assistant_terms, message_budget);
+        candidates.push((user_terms, assistant_terms));
     }
     let mut snapshot = snapshot_from_candidates(agent, candidates, source_char_count)?;
     snapshot.extraction_elapsed = started.elapsed();
@@ -926,10 +930,8 @@ fn tail_json_lines(path: &Path, max_bytes: u64) -> Result<Vec<Value>> {
         .collect())
 }
 
-fn sanitize_reference(value: &str, max_chars: usize) -> String {
-    // Redact complete lines before capping. Capping first could split a
-    // sensitive line, retain its value in the tail, and discard the marker
-    // that would have caused the whole line to be removed.
+fn sanitize_reference(value: &str) -> String {
+    // Redact complete lines before extracting terms from the full message.
     let mut redacted = Vec::new();
     for line in value.lines() {
         let lower = line.to_ascii_lowercase();
@@ -955,7 +957,7 @@ fn sanitize_reference(value: &str, max_chars: usize) -> String {
             redacted.push(redact_token_like_words(line));
         }
     }
-    cap_text(&redacted.join("\n"), max_chars)
+    redacted.join("\n")
 }
 
 fn redact_token_like_words(line: &str) -> String {
@@ -978,23 +980,20 @@ fn redact_token_like_words(line: &str) -> String {
         .collect()
 }
 
-fn cap_text(value: &str, max_chars: usize) -> String {
-    let count = value.chars().count();
-    if count <= max_chars {
-        return value.to_string();
-    }
-    let head_len = max_chars * 2 / 3;
-    let tail_len = max_chars.saturating_sub(head_len + 3);
-    let head = value.chars().take(head_len).collect::<String>();
-    let tail = value
-        .chars()
-        .rev()
-        .take(tail_len)
-        .collect::<String>()
-        .chars()
-        .rev()
-        .collect::<String>();
-    format!("{head}\n…\n{tail}")
+fn truncate_terminology(terms: &mut Vec<TerminologyTerm>, max_chars: usize) {
+    let mut char_count = 0;
+    let keep_count = terms
+        .iter()
+        .take_while(|term| {
+            let cost = term.text.chars().count() + usize::from(char_count > 0);
+            if char_count + cost > max_chars {
+                return false;
+            }
+            char_count += cost;
+            true
+        })
+        .count();
+    terms.truncate(keep_count);
 }
 
 fn extract_terminology(value: &str) -> Vec<TerminologyTerm> {
@@ -1455,10 +1454,10 @@ mod tests {
 
     use super::{
         AgentKind, AgentSessionLocator, AgentTerminologySnapshot, ConversationTurn,
-        MAX_AUDIO3_TURN_CHARS, MAX_CONTEXT_TURNS, PiRegistry, build_snapshot, cap_text,
+        MAX_AUDIO3_TURN_CHARS, MAX_CONTEXT_TURNS, PiRegistry, build_snapshot,
         current_pi_published_turns, extract_terminology, focused_kitty_agent_from_payload,
         recent_codex_turns, sanitize_reference, snapshot_from_candidates,
-        start_terminology_capture,
+        start_terminology_capture, truncate_terminology,
     };
 
     #[test]
@@ -1629,25 +1628,22 @@ mod tests {
     }
 
     #[test]
-    fn redacts_and_caps_reference() {
-        let value = format!(
-            "safe\nAPI_KEY=secret\n{}\nsecret: private-tail-value",
-            "test-token-shaped-placeholder".repeat(20)
-        );
-        let output = sanitize_reference(&value, 120);
+    fn redacts_reference_without_truncating_safe_text() {
+        let safe_text = "test-token-shaped-placeholder".repeat(20);
+        let value = format!("safe\nAPI_KEY=secret\n{safe_text}\nsecret: private-tail-value");
+        let output = sanitize_reference(&value);
         assert!(output.contains("safe"));
+        assert!(output.contains(&safe_text));
         assert!(!output.contains("API_KEY=secret"));
         assert!(!output.contains("private-tail-value"));
         assert!(output.contains("[REDACTED SENSITIVE LINE]"));
-        // Redaction markers can expand the already bounded source slightly.
-        assert!(output.chars().count() <= 160);
     }
 
     #[test]
-    fn redaction_happens_before_cap_can_split_a_sensitive_line() {
+    fn redacts_complete_sensitive_lines_before_terminology_extraction() {
         let sensitive = format!("API_KEY={}tail-secret", "x".repeat(500));
         let value = format!("safe-head\n{sensitive}\nsafe-tail");
-        let output = sanitize_reference(&value, 80);
+        let output = sanitize_reference(&value);
         assert!(output.contains("safe-head"));
         assert!(output.contains("safe-tail"));
         assert!(!output.contains("tail-secret"));
@@ -1655,10 +1651,28 @@ mod tests {
     }
 
     #[test]
-    fn cap_preserves_head_and_tail() {
-        let output = cap_text(&"a".repeat(200), 60);
-        assert!(output.starts_with(&"a".repeat(40)));
-        assert!(output.ends_with(&"a".repeat(17)));
+    fn terminology_budget_keeps_a_complete_ranked_prefix() {
+        let ranked = ["罕见词", "LongerModel", "GPU"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, text)| super::TerminologyTerm {
+                text: text.into(),
+                frequency: index + 1,
+                candidate_order: index,
+                normalization_eligible: true,
+            })
+            .collect::<Vec<_>>();
+        for (budget, kept) in [(0, 0), (2, 0), (3, 1), (7, 1), (14, 1), (15, 2), (19, 3)] {
+            let mut terms = ranked.clone();
+            truncate_terminology(&mut terms, budget);
+            assert_eq!(terms, ranked[..kept]);
+            let glossary = terms
+                .iter()
+                .map(|term| term.text.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(glossary.chars().count() <= budget);
+        }
     }
 
     #[test]
@@ -1942,6 +1956,56 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_extracts_middle_terms_and_counts_full_message_frequency() {
+        let middle_terms = [
+            "DIRECTOR_PROJECT_MAX_CONCURRENT_RUNS",
+            "maxParallelToolCalls",
+            "DirectorModelTransport",
+            "pi-ai",
+        ];
+        let padding = "CommonTerm ".repeat(450);
+        let long_message = format!("{padding} {} {padding}", middle_terms.join(" "));
+        let mut source = (0..5)
+            .map(|index| ConversationTurn {
+                user: format!("UserModel{index}"),
+                assistant: format!("AssistantModel{index}"),
+            })
+            .collect::<Vec<_>>();
+        source[4].assistant = long_message;
+
+        let snapshot = build_snapshot(AgentKind::Pi, &source, 6_000).unwrap();
+        let refinement = snapshot.select_for_refinement();
+        for term in middle_terms {
+            assert!(
+                refinement.terms.iter().any(|selected| selected == term),
+                "{term}"
+            );
+        }
+        assert!(snapshot.source_char_count > 6_000);
+        assert!(snapshot.frequencies().contains(&("CommonTerm", 900)));
+
+        let context = snapshot.select_for_audio3().unwrap();
+        assert_eq!(context.messages.len(), 10);
+        let assistant = context.messages[9]["content"][0]["text"].as_str().unwrap();
+        for term in middle_terms {
+            assert!(assistant.lines().any(|selected| selected == term), "{term}");
+        }
+        for pair in context.messages.as_chunks::<2>().0 {
+            let chars: usize = pair
+                .iter()
+                .map(|message| {
+                    message["content"][0]["text"]
+                        .as_str()
+                        .unwrap()
+                        .chars()
+                        .count()
+                })
+                .sum();
+            assert!(chars <= MAX_AUDIO3_TURN_CHARS);
+        }
+    }
+
+    #[test]
     fn snapshot_keeps_five_role_preserving_bounded_glossaries_and_refine_union() {
         let source = (0..6)
             .map(|index| ConversationTurn {
@@ -1956,7 +2020,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let snapshot = build_snapshot(AgentKind::Pi, &source, 6_000).unwrap();
-        assert!(snapshot.source_char_count <= 6_000);
+        assert!(snapshot.source_char_count > 6_000);
         let context = snapshot.select_for_audio3().unwrap();
         assert_eq!(context.messages.len(), MAX_CONTEXT_TURNS * 2);
         let mut asr_terms = std::collections::HashSet::new();
@@ -2066,7 +2130,7 @@ mod tests {
                 .collect::<Vec<_>>()
                 .join(" ")
         );
-        let sanitized = sanitize_reference(&source, 12_000);
+        let sanitized = sanitize_reference(&source);
         let terminology = extract_terminology(&sanitized);
 
         assert!(terminology.len() > 96);

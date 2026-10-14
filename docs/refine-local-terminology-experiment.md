@@ -15,11 +15,11 @@ The prototype performs these operations locally, in this order:
 1. validate the focused process, session identity, file identity, and active Pi branch;
 2. read the last five conversation turns in chronological order, retaining both roles;
 3. redact sensitive lines and token-shaped values in each message;
-4. distribute the configured 500–12,000 source-character budget across the nonempty messages and cap each redacted message;
-5. preserve structured technical forms such as model IDs, identifiers, paths, and flags;
-6. segment the remaining text with `jieba-rs` 0.10.3;
-7. filter common English and Chinese words and stable-deduplicate terms case-insensitively within each message;
-8. count case-insensitive occurrences in each bounded message and sort by frequency ascending, retaining candidate order for ties;
+4. preserve structured technical forms such as model IDs, identifiers, paths, and flags from each complete redacted message;
+5. segment the remaining text with `jieba-rs` 0.10.3;
+6. filter common English and Chinese words and stable-deduplicate terms case-insensitively within each message;
+7. count case-insensitive occurrences in each complete redacted message and sort by frequency ascending, retaining candidate order for ties;
+8. distribute the configured 500–12,000 terminology-character budget across the nonempty messages and retain each ranked list's complete-term prefix within its share, including newline separators. This budget no longer truncates source text; existing Pi publication and session-file scan bounds remain unchanged;
 9. alternate between user and assistant candidates, selecting complete terms within a shared 400-character budget per turn, including newline separators; either role can use remaining space when the other runs out;
 10. send chronological `user/input_text` and `assistant/text` terminology messages in Streaming `input.context` and Native `input.messages` before the current audio. Empty turns are omitted; an empty user glossary anchors an assistant-only glossary without changing its role. Reconnect reuses the identical messages; `continue-task` is not used;
 11. merge all selected terms into one stable, case-insensitively deduplicated list for Refine's `reference_context.terminology`, with `reference_context.agent` as before. Do not send conversation roles/history to Refine or reapply the former 96-term/1,500-character cap. The union is bounded by the five 400-character turn budgets.

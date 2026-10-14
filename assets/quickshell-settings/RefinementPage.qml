@@ -261,7 +261,7 @@ SettingsPage {
                     theme: root.theme
                     label: "Context limit"
                     value: root.controller.value("llm.agent_context_max_chars", 6000)
-                    help: "Maximum redacted source characters before local terminology extraction (500–12000)."
+                    help: "Maximum terminology characters shared across messages after extraction and sorting (500–12000)."
                     error: root.controller.errorFor("llm.agent_context_max_chars")
                     enabled: !root.controller.busy
                     onEdited: (value) => {

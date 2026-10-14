@@ -71,7 +71,7 @@ timeout_ms = 15000
 provider_sort = ""
 # Opt in to start-time Pi/Codex terminology for Audio3 Session Context and Refine.
 agent_context_enabled = false
-# Local redacted source budget; each consumer applies its own smaller output limit.
+# Shared terminology budget after extraction/sorting; ASR still caps each turn at 400 characters.
 agent_context_max_chars = 6000
 
 [hud]

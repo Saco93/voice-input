@@ -229,7 +229,7 @@ QtObject {
         "Optional OpenRouter provider ordering expression.": "可选的 OpenRouter 提供商顺序表达式。",
         "Session terminology": "Session 术语",
         "Context limit": "上下文限制",
-        "Maximum redacted source characters before local terminology extraction (500–12000).": "本地提取术语前最多读取 500–12000 个经过脱敏的源字符。",
+        "Maximum terminology characters shared across messages after extraction and sorting (500–12000).": "各条消息提取并排序后的词表共享 500–12000 字符预算。",
         "Clipboard delivery and input-method coordination.": "控制剪贴板粘贴和输入法协同。",
         "Delivery": "输出方式",
         "Mode": "模式",

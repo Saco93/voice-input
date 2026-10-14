@@ -50,8 +50,10 @@ impl FocusedWindowSnapshot {
         }
     }
 
-    pub(crate) fn class(&self) -> &str {
-        &self.class
+    pub(crate) fn is_kitty(&self) -> bool {
+        // Launchers can override the window class; use the actual executable.
+        std::fs::read_link(format!("/proc/{}/exe", self.pid))
+            .is_ok_and(|executable| executable.file_name().is_some_and(|name| name == "kitty"))
     }
 
     pub(crate) fn pid(&self) -> u32 {
@@ -61,7 +63,7 @@ impl FocusedWindowSnapshot {
     pub(crate) fn control_hint(&self) -> String {
         if self.refinement_category() == RefinementCategory::WeChat {
             "focus=instant-messaging".into()
-        } else if self.class.eq_ignore_ascii_case("kitty") {
+        } else if self.is_kitty() {
             format!("focus=kitty:{}", self.pid)
         } else {
             "focus=other".into()
@@ -112,10 +114,83 @@ pub(crate) fn capture() -> Result<FocusedWindowSnapshot> {
 
 #[cfg(test)]
 mod tests {
+    use std::process::{Child, Command, Stdio};
+
     use super::{FocusedWindowSnapshot, RefinementCategory, parse_control_hint};
 
     fn parse(payload: &str) -> FocusedWindowSnapshot {
         serde_json::from_str(payload).expect("focused window should parse")
+    }
+
+    struct TestProcess {
+        child: Child,
+        _directory: tempfile::TempDir,
+    }
+
+    impl TestProcess {
+        fn new(executable_name: &str) -> Self {
+            let directory = tempfile::tempdir().unwrap();
+            let executable = directory.path().join(executable_name);
+            // A symlink would resolve back to sleep in /proc/<pid>/exe.
+            std::fs::copy("/bin/sleep", &executable).unwrap();
+            let child = Command::new(executable)
+                .arg("30")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap();
+            Self {
+                child,
+                _directory: directory,
+            }
+        }
+
+        fn window(&self, class: &str) -> FocusedWindowSnapshot {
+            parse(&format!(
+                r#"{{"class":"{class}","initialClass":"{class}","pid":{}}}"#,
+                self.child.id()
+            ))
+        }
+    }
+
+    impl Drop for TestProcess {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+
+    #[test]
+    fn kitty_process_identity_survives_custom_classes_and_control_hints() {
+        let process = TestProcess::new("kitty");
+        for class in ["kitty", "org.omarchy.agent"] {
+            let window = process.window(class);
+            let hint = window.control_hint();
+            assert_eq!(hint, format!("focus=kitty:{}", process.child.id()));
+            let restored = parse_control_hint(&[&hint]).unwrap().unwrap();
+            assert_eq!(restored.pid(), process.child.id());
+            assert_eq!(restored.control_hint(), hint);
+        }
+    }
+
+    #[test]
+    fn non_kitty_process_is_not_trusted_by_window_class() {
+        let process = TestProcess::new("ghostty");
+        for class in ["kitty", "org.omarchy.agent"] {
+            assert_eq!(process.window(class).control_hint(), "focus=other");
+        }
+        let hint = format!("focus=kitty:{}", process.child.id());
+        let restored = parse_control_hint(&[&hint]).unwrap().unwrap();
+        assert_eq!(restored.control_hint(), "focus=other");
+    }
+
+    #[test]
+    fn missing_process_is_not_trusted_by_window_class() {
+        for class in ["kitty", "org.omarchy.agent"] {
+            let window = parse(&format!(r#"{{"class":"{class}","pid":{}}}"#, u32::MAX));
+            assert_eq!(window.control_hint(), "focus=other");
+        }
     }
 
     #[test]
@@ -134,7 +209,7 @@ mod tests {
         let kitty = parse_control_hint(&["focus=kitty:1234"])
             .unwrap()
             .expect("Kitty hint");
-        assert_eq!(kitty.class(), "kitty");
+        assert_eq!(kitty.class, "kitty");
         assert_eq!(kitty.pid(), 1234);
         assert!(parse_control_hint(&["focus=kitty:nope"]).is_err());
     }
