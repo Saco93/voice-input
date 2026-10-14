@@ -114,9 +114,15 @@ pub(crate) fn capture() -> Result<FocusedWindowSnapshot> {
 
 #[cfg(test)]
 mod tests {
-    use std::process::{Child, Command, Stdio};
+    use std::{
+        env,
+        io::{Read, Write},
+        process::{Child, Command, Stdio},
+    };
 
     use super::{FocusedWindowSnapshot, RefinementCategory, parse_control_hint};
+
+    const PROCESS_TEST_MODE: &str = "VOICE_INPUT_FOCUSED_WINDOW_PROCESS_TEST";
 
     fn parse(payload: &str) -> FocusedWindowSnapshot {
         serde_json::from_str(payload).expect("focused window should parse")
@@ -129,21 +135,39 @@ mod tests {
 
     impl TestProcess {
         fn new(executable_name: &str) -> Self {
-            let directory = tempfile::tempdir().unwrap();
+            let test_executable = env::current_exe().unwrap();
+            let directory = tempfile::tempdir_in(test_executable.parent().unwrap()).unwrap();
             let executable = directory.path().join(executable_name);
-            // A symlink would resolve back to sleep in /proc/<pid>/exe.
-            std::fs::copy("/bin/sleep", &executable).unwrap();
+            // A hard link preserves this name in /proc/<pid>/exe without
+            // opening an executable for writing while parallel tests spawn.
+            std::fs::hard_link(test_executable, &executable).unwrap();
             let child = Command::new(executable)
-                .arg("30")
-                .stdin(Stdio::null())
+                .args([
+                    "--exact",
+                    "focused_window::tests::process_test_child",
+                    "--nocapture",
+                ])
+                .env(PROCESS_TEST_MODE, "1")
+                .stdin(Stdio::piped())
                 .stdout(Stdio::null())
-                .stderr(Stdio::null())
+                .stderr(Stdio::piped())
                 .spawn()
                 .unwrap();
-            Self {
+            let mut process = Self {
                 child,
                 _directory: directory,
-            }
+            };
+            // Wait for the child test to run before inspecting /proc.
+            let mut ready = [0; 6];
+            process
+                .child
+                .stderr
+                .as_mut()
+                .unwrap()
+                .read_exact(&mut ready)
+                .unwrap();
+            assert_eq!(&ready, b"ready\n");
+            process
         }
 
         fn window(&self, class: &str) -> FocusedWindowSnapshot {
@@ -159,6 +183,16 @@ mod tests {
             let _ = self.child.kill();
             let _ = self.child.wait();
         }
+    }
+
+    #[test]
+    fn process_test_child() {
+        if env::var_os(PROCESS_TEST_MODE).is_none() {
+            return;
+        }
+        std::io::stderr().write_all(b"ready\n").unwrap();
+        // Keep the executable alive until the parent fixture is dropped.
+        let _ = std::io::stdin().read_exact(&mut [0]);
     }
 
     #[test]
