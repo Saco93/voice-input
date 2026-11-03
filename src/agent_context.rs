@@ -23,6 +23,8 @@ use crate::{
     focused_window::FocusedWindowSnapshot,
 };
 
+mod herdr;
+
 const MAX_SESSION_SCAN_BYTES: u64 = 8 * 1024 * 1024;
 const KITTY_QUERY_TIMEOUT_SECS: &str = "1";
 const MAX_CONTEXT_TURNS: usize = 5;
@@ -244,6 +246,7 @@ impl AgentTerminologyCapture {
 pub struct FocusedAgentSnapshot {
     kind: AgentKind,
     pid: u32,
+    herdr_session: Option<herdr::SessionRef>,
 }
 
 impl FocusedAgentSnapshot {
@@ -259,21 +262,22 @@ pub fn capture_focused_agent(
         return Ok(None);
     }
 
-    focused_kitty_agent(window.pid()).map(|process| {
-        process.map(|process| FocusedAgentSnapshot {
-            kind: process.kind,
-            pid: process.pid,
-        })
-    })
+    focused_kitty_agent(window.pid())
 }
 
 pub fn resolve_focused_session(
     snapshot: FocusedAgentSnapshot,
 ) -> Result<Option<AgentSessionLocator>> {
-    match snapshot.kind {
-        AgentKind::Pi => resolve_pi_session(snapshot.pid),
-        AgentKind::Codex => resolve_codex_session(snapshot.pid),
-    }
+    let locator = match snapshot.kind {
+        AgentKind::Pi => resolve_pi_session(snapshot.pid)?,
+        AgentKind::Codex => resolve_codex_session(snapshot.pid)?,
+    };
+    Ok(locator.filter(|locator| {
+        snapshot
+            .herdr_session
+            .as_ref()
+            .is_none_or(|session| session.matches(locator))
+    }))
 }
 
 pub fn warm_terminology_segmenter() -> Option<Duration> {
@@ -293,8 +297,8 @@ pub fn start_terminology_capture(
         return Ok(None);
     }
     // Freeze both the focused agent session and its recent conversation turns
-    // before launching the segmentation worker. A later Kitty tab switch or
-    // assistant response cannot change this Voice Input operation's snapshot.
+    // before launching the segmentation worker. A later Kitty tab / Herdr pane
+    // switch or assistant response cannot change this operation's snapshot.
     let Some(focused_agent) = capture_focused_agent(&window)? else {
         return Ok(None);
     };
@@ -489,7 +493,7 @@ struct FocusedAgentProcess {
     pid: u32,
 }
 
-fn focused_kitty_agent(kitty_pid: u32) -> Result<Option<FocusedAgentProcess>> {
+fn focused_kitty_agent(kitty_pid: u32) -> Result<Option<FocusedAgentSnapshot>> {
     let socket = format!("unix:/tmp/kitty-{kitty_pid}");
     let output = Command::new("timeout")
         .args([
@@ -510,10 +514,67 @@ fn focused_kitty_agent(kitty_pid: u32) -> Result<Option<FocusedAgentProcess>> {
 
     let payload: Value = serde_json::from_slice(&output.stdout)
         .context("failed to parse Kitty remote-control response")?;
-    Ok(focused_kitty_agent_from_payload(&payload))
+    focused_agent_from_kitty_payload(&payload)
+}
+
+fn focused_agent_from_kitty_payload(payload: &Value) -> Result<Option<FocusedAgentSnapshot>> {
+    if let Some(process) = focused_kitty_agent_from_payload(payload) {
+        return Ok(Some(FocusedAgentSnapshot {
+            kind: process.kind,
+            pid: process.pid,
+            herdr_session: None,
+        }));
+    }
+    let Some(processes) = focused_kitty_processes(payload) else {
+        return Ok(None);
+    };
+    for process in processes.iter().rev() {
+        let Some(args) = process["cmdline"].as_array() else {
+            continue;
+        };
+        if args
+            .first()
+            .and_then(Value::as_str)
+            .and_then(executable_name)
+            != Some("herdr")
+        {
+            continue;
+        }
+        let Some(pid) = process["pid"]
+            .as_u64()
+            .and_then(|pid| u32::try_from(pid).ok())
+        else {
+            continue;
+        };
+        let args = args.iter().filter_map(Value::as_str).collect::<Vec<_>>();
+        return herdr::capture(pid, &args);
+    }
+    Ok(None)
+}
+
+fn executable_name(arg: &str) -> Option<&str> {
+    Path::new(arg).file_name()?.to_str()
 }
 
 fn focused_kitty_agent_from_payload(payload: &Value) -> Option<FocusedAgentProcess> {
+    focused_kitty_processes(payload)?
+        .iter()
+        .rev()
+        .find_map(|process| {
+            let pid = process["pid"]
+                .as_u64()
+                .and_then(|pid| u32::try_from(pid).ok())?;
+            let executable = process["cmdline"].as_array()?.first()?.as_str()?;
+            let kind = match executable_name(executable)? {
+                "pi" => AgentKind::Pi,
+                "codex" => AgentKind::Codex,
+                _ => return None,
+            };
+            Some(FocusedAgentProcess { kind, pid })
+        })
+}
+
+fn focused_kitty_processes(payload: &Value) -> Option<&[Value]> {
     let os_windows = payload.as_array()?;
     for os_window in os_windows {
         if !os_window["is_focused"].as_bool().unwrap_or(false) {
@@ -533,30 +594,7 @@ fn focused_kitty_agent_from_payload(payload: &Value) -> Option<FocusedAgentProce
                 if !window["is_active"].as_bool().unwrap_or(false) {
                     continue;
                 }
-                let Some(processes) = window["foreground_processes"].as_array() else {
-                    continue;
-                };
-                for process in processes.iter().rev() {
-                    let Some(pid) = process["pid"]
-                        .as_u64()
-                        .and_then(|pid| u32::try_from(pid).ok())
-                    else {
-                        continue;
-                    };
-                    let executable = process["cmdline"]
-                        .as_array()
-                        .and_then(|args| args.first())
-                        .and_then(Value::as_str)
-                        .and_then(|arg| Path::new(arg).file_name())
-                        .and_then(|name| name.to_str())
-                        .unwrap_or_default();
-                    let kind = match executable {
-                        "pi" => AgentKind::Pi,
-                        "codex" => AgentKind::Codex,
-                        _ => continue,
-                    };
-                    return Some(FocusedAgentProcess { kind, pid });
-                }
+                return window["foreground_processes"].as_array().map(Vec::as_slice);
             }
         }
     }
