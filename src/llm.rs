@@ -642,8 +642,8 @@ mod tests {
     }
 
     #[test]
-    fn pi_and_codex_use_markdown_structure_with_or_without_reference() {
-        for agent in [AgentKind::Pi, AgentKind::Codex] {
+    fn pi_codex_and_agy_use_markdown_structure_with_or_without_reference() {
+        for agent in [AgentKind::Pi, AgentKind::Codex, AgentKind::Agy] {
             assert_eq!(
                 refinement_system_prompt(RefinementCategory::Default, Some(agent), false),
                 AGENT_MARKDOWN_SYSTEM_PROMPT

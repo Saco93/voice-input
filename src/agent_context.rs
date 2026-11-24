@@ -38,6 +38,7 @@ static JIEBA: OnceLock<Jieba> = OnceLock::new();
 pub enum AgentKind {
     Pi,
     Codex,
+    Agy,
 }
 
 impl AgentKind {
@@ -45,6 +46,7 @@ impl AgentKind {
         match self {
             Self::Pi => "Pi",
             Self::Codex => "Codex",
+            Self::Agy => "AGY",
         }
     }
 }
@@ -271,6 +273,7 @@ pub fn resolve_focused_session(
     let locator = match snapshot.kind {
         AgentKind::Pi => resolve_pi_session(snapshot.pid)?,
         AgentKind::Codex => resolve_codex_session(snapshot.pid)?,
+        AgentKind::Agy => resolve_agy_session(snapshot.pid, snapshot.herdr_session.as_ref())?,
     };
     Ok(locator.filter(|locator| {
         snapshot
@@ -360,6 +363,7 @@ fn load_source(
         // Never substitute the physical JSONL tail for an empty publication.
         AgentKind::Pi => current_pi_published_turns(locator)?,
         AgentKind::Codex => recent_codex_turns(&locator.session_path, &locator.session_id)?,
+        AgentKind::Agy => recent_agy_turns(&locator.session_path)?,
     };
     Ok(turns
         .filter(|turns| !turns.is_empty())
@@ -568,6 +572,7 @@ fn focused_kitty_agent_from_payload(payload: &Value) -> Option<FocusedAgentProce
             let kind = match executable_name(executable)? {
                 "pi" => AgentKind::Pi,
                 "codex" => AgentKind::Codex,
+                "agy" | "antigravity" => AgentKind::Agy,
                 _ => return None,
             };
             Some(FocusedAgentProcess { kind, pid })
@@ -734,6 +739,144 @@ fn resolve_codex_session(pid: u32) -> Result<Option<AgentSessionLocator>> {
     }))
 }
 
+fn resolve_agy_session(
+    pid: u32,
+    herdr_session: Option<&herdr::SessionRef>,
+) -> Result<Option<AgentSessionLocator>> {
+    let start_ticks = process_start_ticks(pid)?;
+    let agy_home = process_environment_value(pid, "ANTIGRAVITY_APP_DATA_DIR")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| dirs::home_dir().map(|home| home.join(".gemini/antigravity-cli")))
+        .ok_or_else(|| anyhow!("Antigravity data directory not found"))?;
+    let Some(presence_root) =
+        canonical_optional_dir(&agy_home.join("presence"), "Antigravity presence directory")?
+    else {
+        return Ok(None);
+    };
+    let Some(brain_root) =
+        canonical_optional_dir(&agy_home.join("brain"), "Antigravity brain directory")?
+    else {
+        return Ok(None);
+    };
+
+    let mut fd_targets = Vec::new();
+    for entry in fs::read_dir(format!("/proc/{pid}/fd"))? {
+        let entry = entry?;
+        if let Ok(target) = fs::read_link(entry.path()) {
+            fd_targets.push(target);
+        }
+    }
+
+    resolve_agy_session_from_fd_targets(
+        pid,
+        start_ticks,
+        &presence_root,
+        &brain_root,
+        &fd_targets,
+        herdr_session,
+    )
+}
+
+fn canonical_optional_dir(path: &Path, description: &str) -> Result<Option<PathBuf>> {
+    match path.canonicalize() {
+        Ok(canonical) => Ok(Some(canonical)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).with_context(|| format!("failed to resolve {description}")),
+    }
+}
+
+fn resolve_agy_session_from_fd_targets(
+    pid: u32,
+    process_start_ticks: u64,
+    presence_root: &Path,
+    brain_root: &Path,
+    fd_targets: &[PathBuf],
+    herdr_session: Option<&herdr::SessionRef>,
+) -> Result<Option<AgentSessionLocator>> {
+    let mut seen = HashSet::new();
+    let mut open_session_ids = Vec::new();
+    for target in fd_targets {
+        if target.extension().and_then(|value| value.to_str()) != Some("lock") {
+            continue;
+        }
+        let Ok(canonical) = target.canonicalize() else {
+            continue;
+        };
+        if canonical.parent() != Some(presence_root) {
+            continue;
+        }
+        let Some(session_id) = canonical.file_stem().and_then(|value| value.to_str()) else {
+            continue;
+        };
+        if !is_valid_agy_session_id(session_id) {
+            continue;
+        }
+        if seen.insert(session_id.to_string()) {
+            open_session_ids.push(session_id.to_string());
+        }
+    }
+
+    // Outside Herdr, refuse to guess when more than one presence lock is open.
+    if herdr_session.is_none() && open_session_ids.len() != 1 {
+        return Ok(None);
+    }
+
+    let mut candidates = Vec::new();
+    for session_id in open_session_ids {
+        let Some(session_path) = resolve_agy_transcript_path(brain_root, &session_id) else {
+            continue;
+        };
+        let Ok(metadata) = fs::metadata(&session_path) else {
+            continue;
+        };
+        if !metadata.is_file() {
+            continue;
+        }
+        let locator = AgentSessionLocator {
+            kind: AgentKind::Agy,
+            pid,
+            process_start_ticks,
+            session_id,
+            session_path,
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            pi_registry_path: None,
+        };
+        if herdr_session.is_none_or(|session| session.matches(&locator)) {
+            candidates.push(locator);
+        }
+    }
+
+    if candidates.len() != 1 {
+        return Ok(None);
+    }
+    Ok(Some(candidates.remove(0)))
+}
+
+fn is_valid_agy_session_id(session_id: &str) -> bool {
+    !session_id.is_empty()
+        && session_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
+fn resolve_agy_transcript_path(brain_root: &Path, session_id: &str) -> Option<PathBuf> {
+    let logs_dir = brain_root
+        .join(session_id)
+        .join(".system_generated")
+        .join("logs");
+    for file_name in ["transcript_full.jsonl", "transcript.jsonl"] {
+        let Ok(canonical) = logs_dir.join(file_name).canonicalize() else {
+            continue;
+        };
+        if canonical.starts_with(brain_root) {
+            return Some(canonical);
+        }
+    }
+    None
+}
+
 fn current_pi_published_turns(
     locator: &AgentSessionLocator,
 ) -> Result<Option<Vec<ConversationTurn>>> {
@@ -778,6 +921,64 @@ fn recent_codex_turns(path: &Path, session_id: &str) -> Result<Option<Vec<Conver
     }
     let values = tail_json_lines(path, MAX_SESSION_SCAN_BYTES)?;
     Ok(Some(codex_turns(&values)))
+}
+
+fn recent_agy_turns(path: &Path) -> Result<Option<Vec<ConversationTurn>>> {
+    let values = tail_json_lines(path, MAX_SESSION_SCAN_BYTES)?;
+    Ok(Some(agy_turns(&values)))
+}
+
+fn agy_turns(values: &[Value]) -> Vec<ConversationTurn> {
+    let mut turns: Vec<ConversationTurn> = Vec::new();
+    let mut current: Option<usize> = None;
+    for value in values {
+        if value["status"] != "DONE" {
+            continue;
+        }
+        if value["type"] == "USER_INPUT" && value["source"] == "USER_EXPLICIT" {
+            let user = value["content"]
+                .as_str()
+                .map(agy_user_text)
+                .unwrap_or_default();
+            turns.push(ConversationTurn {
+                user,
+                assistant: String::new(),
+            });
+            current = Some(turns.len() - 1);
+            continue;
+        }
+        if value["type"] == "PLANNER_RESPONSE"
+            && value["source"] == "MODEL"
+            && !value["tool_calls"]
+                .as_array()
+                .is_some_and(|calls| !calls.is_empty())
+            && let Some(index) = current
+            && let Some(text) = value["content"].as_str()
+        {
+            let trimmed = text.trim();
+            if !trimmed.is_empty() {
+                let assistant = &mut turns[index].assistant;
+                if !assistant.is_empty() {
+                    assistant.push('\n');
+                }
+                assistant.push_str(trimmed);
+            }
+        }
+    }
+    turns.drain(..turns.len().saturating_sub(MAX_CONTEXT_TURNS));
+    turns
+}
+
+fn agy_user_text(content: &str) -> String {
+    const USER_REQUEST_OPEN: &str = "<USER_REQUEST>";
+    const USER_REQUEST_CLOSE: &str = "</USER_REQUEST>";
+
+    if let Some(after_open) = content.strip_prefix(USER_REQUEST_OPEN)
+        && let Some(close_index) = after_open.rfind(USER_REQUEST_CLOSE)
+    {
+        return after_open[..close_index].trim().to_string();
+    }
+    content.trim().to_string()
 }
 
 fn codex_turns(values: &[Value]) -> Vec<ConversationTurn> {
@@ -1663,6 +1864,247 @@ mod tests {
         assert_eq!(turns[0].assistant, "FirstAssistant");
         assert_eq!(turns[1].user, "SecondUser");
         assert_eq!(turns[1].assistant, "SecondAssistant");
+    }
+
+    #[test]
+    fn reads_agy_turns_with_user_requests_and_final_answers_only() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        let mut entries = vec![
+            json!({"step_index":0,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","content":"OrphanDoNotUse"}),
+            json!({"step_index":1,"source":"SYSTEM","type":"SYSTEM_MESSAGE","status":"DONE","content":"SystemDoNotUse"}),
+            json!({"step_index":2,"source":"SYSTEM","type":"CONVERSATION_HISTORY","status":"DONE"}),
+            json!({"step_index":3,"source":"SYSTEM","type":"CHECKPOINT","status":"DONE","content":"CheckpointDoNotUse"}),
+        ];
+        for index in 0..6 {
+            let user_body = if index == 1 {
+                format!("Check </USER_REQUEST> tag {index}")
+            } else if index == 2 {
+                String::new()
+            } else {
+                format!("AgyUser{index}")
+            };
+            entries.push(json!({
+                "step_index": 10 + index * 10,
+                "source": "USER_EXPLICIT",
+                "type": "USER_INPUT",
+                "status": "DONE",
+                "content": format!(
+                    "<USER_REQUEST>\n{user_body}\n</USER_REQUEST>\n<ADDITIONAL_METADATA>\nThe current local time is: 2026-11-24T10:00:00+08:00.\n</ADDITIONAL_METADATA>\n<USER_SETTINGS_CHANGE>\nSettingDoNotUse\n</USER_SETTINGS_CHANGE>"
+                )
+            }));
+            entries.push(json!({
+                "step_index": 11 + index * 10,
+                "source": "MODEL",
+                "type": "PLANNER_RESPONSE",
+                "status": "DONE",
+                "thinking": "ThinkingDoNotUse",
+                "content": "ToolNarrationDoNotUse",
+                "tool_calls": [{"name": "run_command", "args": {"CommandLine": "ls"}}]
+            }));
+            entries.push(json!({
+                "step_index": 12 + index * 10,
+                "source": "MODEL",
+                "type": "GENERIC",
+                "status": "DONE",
+                "content": "ToolOutputDoNotUse"
+            }));
+            entries.push(json!({
+                "step_index": 13 + index * 10,
+                "source": "MODEL",
+                "type": "PLANNER_RESPONSE",
+                "status": "RUNNING",
+                "content": "RunningDoNotUse"
+            }));
+            if index < 5 {
+                entries.push(json!({
+                    "step_index": 14 + index * 10,
+                    "source": "MODEL",
+                    "type": "PLANNER_RESPONSE",
+                    "status": "DONE",
+                    "thinking": "HiddenThinking",
+                    "content": format!("AgyAnswer{index}")
+                }));
+            }
+        }
+        for value in &entries {
+            writeln!(file, "{value}").unwrap();
+        }
+        let turns = super::recent_agy_turns(file.path()).unwrap().unwrap();
+        assert_eq!(turns.len(), MAX_CONTEXT_TURNS);
+        assert_eq!(turns[0].user, "Check </USER_REQUEST> tag 1");
+        assert_eq!(turns[0].assistant, "AgyAnswer1");
+        assert!(turns[1].user.is_empty());
+        assert_eq!(turns[1].assistant, "AgyAnswer2");
+        assert_eq!(turns[4].user, "AgyUser5");
+        assert!(turns[4].assistant.is_empty());
+        assert!(
+            turns
+                .iter()
+                .all(|turn| !turn.user.contains("DoNotUse") && !turn.assistant.contains("DoNotUse"))
+        );
+        assert!(
+            turns
+                .iter()
+                .all(|turn| !turn.user.contains("ADDITIONAL_METADATA"))
+        );
+    }
+
+    #[test]
+    fn resolves_agy_session_from_presence_lock_and_prefers_full_transcript() {
+        let root = tempfile::tempdir().unwrap();
+        let presence_root = root.path().join("presence");
+        let brain_root = root.path().join("brain");
+        std::fs::create_dir_all(&presence_root).unwrap();
+        std::fs::create_dir_all(&brain_root).unwrap();
+        let presence_root = presence_root.canonicalize().unwrap();
+        let brain_root = brain_root.canonicalize().unwrap();
+
+        let session_a = "af9a312f-936c-4f26-a1a5-0bc37d7277b2";
+        let session_b = "baffdd82-9476-40ce-b872-bb429202a1db";
+        let lock_a = presence_root.join(format!("{session_a}.lock"));
+        let lock_b = presence_root.join(format!("{session_b}.lock"));
+        std::fs::write(&lock_a, "").unwrap();
+        std::fs::write(&lock_b, "").unwrap();
+
+        let logs_a = brain_root.join(session_a).join(".system_generated/logs");
+        let logs_b = brain_root.join(session_b).join(".system_generated/logs");
+        std::fs::create_dir_all(&logs_a).unwrap();
+        std::fs::create_dir_all(&logs_b).unwrap();
+        let full_a = logs_a.join("transcript_full.jsonl");
+        let compact_a = logs_a.join("transcript.jsonl");
+        let compact_b = logs_b.join("transcript.jsonl");
+        std::fs::write(&full_a, "{}\n").unwrap();
+        std::fs::write(&compact_a, "{}\n").unwrap();
+        std::fs::write(&compact_b, "{}\n").unwrap();
+
+        // Duplicate FDs to the same lock resolve uniquely and prefer transcript_full.jsonl.
+        let locator = super::resolve_agy_session_from_fd_targets(
+            42,
+            100,
+            &presence_root,
+            &brain_root,
+            &[lock_a.clone(), lock_a.clone()],
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(locator.kind, AgentKind::Agy);
+        assert_eq!(locator.session_id, session_a);
+        assert_eq!(locator.session_path, full_a.canonicalize().unwrap());
+
+        // Falls back to transcript.jsonl when transcript_full.jsonl is absent.
+        let fallback = super::resolve_agy_session_from_fd_targets(
+            42,
+            100,
+            &presence_root,
+            &brain_root,
+            std::slice::from_ref(&lock_b),
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(fallback.session_id, session_b);
+        assert_eq!(fallback.session_path, compact_b.canonicalize().unwrap());
+
+        // Multiple open presence locks fail closed without Herdr disambiguation.
+        assert!(
+            super::resolve_agy_session_from_fd_targets(
+                42,
+                100,
+                &presence_root,
+                &brain_root,
+                &[lock_a.clone(), lock_b.clone()],
+                None,
+            )
+            .unwrap()
+            .is_none()
+        );
+
+        // Herdr session identity disambiguates multiple open locks (both id and path refs).
+        let herdr_id: super::herdr::SessionRef = serde_json::from_value(json!({
+            "agent": "agy",
+            "kind": "id",
+            "value": session_b
+        }))
+        .unwrap();
+        let disambiguated = super::resolve_agy_session_from_fd_targets(
+            42,
+            100,
+            &presence_root,
+            &brain_root,
+            &[lock_a.clone(), lock_b.clone()],
+            Some(&herdr_id),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(disambiguated.session_id, session_b);
+
+        let herdr_path: super::herdr::SessionRef = serde_json::from_value(json!({
+            "agent": "agy",
+            "kind": "path",
+            "value": compact_a
+        }))
+        .unwrap();
+        let disambiguated_by_path = super::resolve_agy_session_from_fd_targets(
+            42,
+            100,
+            &presence_root,
+            &brain_root,
+            &[lock_a.clone(), lock_b],
+            Some(&herdr_path),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(disambiguated_by_path.session_id, session_a);
+        assert_eq!(
+            disambiguated_by_path.session_path,
+            full_a.canonicalize().unwrap()
+        );
+
+        // Symlinks escaping brain_root must be rejected.
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        let escaped_id = "escaped-session";
+        let escaped_lock = presence_root.join(format!("{escaped_id}.lock"));
+        std::fs::write(&escaped_lock, "").unwrap();
+        let escaped_logs = brain_root.join(escaped_id).join(".system_generated/logs");
+        std::fs::create_dir_all(&escaped_logs).unwrap();
+        std::os::unix::fs::symlink(outside.path(), escaped_logs.join("transcript_full.jsonl"))
+            .unwrap();
+        assert!(
+            super::resolve_agy_session_from_fd_targets(
+                42,
+                100,
+                &presence_root,
+                &brain_root,
+                &[escaped_lock],
+                None,
+            )
+            .unwrap()
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn kitty_recognizes_direct_agy_and_antigravity_processes() {
+        for executable in [
+            "agy",
+            "/home/test/.local/bin/agy",
+            "/home/test/.local/share/mise/installs/antigravity-cli/1.5.15/antigravity",
+        ] {
+            let payload = json!([{
+                "is_focused": true,
+                "tabs": [{
+                    "is_active": true,
+                    "windows": [{
+                        "is_active": true,
+                        "foreground_processes": [{"pid": 505, "cmdline": [executable]}]
+                    }]
+                }]
+            }]);
+            let agent = focused_kitty_agent_from_payload(&payload).unwrap();
+            assert_eq!(agent.kind, AgentKind::Agy);
+            assert_eq!(agent.pid, 505);
+        }
     }
 
     #[test]

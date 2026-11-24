@@ -47,9 +47,25 @@ impl SessionRef {
             SessionRefKind::Id => self.value == locator.session_id,
             SessionRefKind::Path => Path::new(&self.value)
                 .canonicalize()
-                .is_ok_and(|path| path == locator.session_path),
+                .is_ok_and(|path| matches_session_path(locator, &path)),
         }
     }
+}
+
+fn matches_session_path(locator: &AgentSessionLocator, reported_path: &Path) -> bool {
+    if reported_path == locator.session_path {
+        return true;
+    }
+    // Herdr's antigravity-cli hook reports transcript.jsonl while Voice Input
+    // prefers the untruncated sibling transcript_full.jsonl in the same logs dir.
+    locator.kind == AgentKind::Agy
+        && reported_path.parent() == locator.session_path.parent()
+        && reported_path.file_name().and_then(|name| name.to_str()) == Some("transcript.jsonl")
+        && locator
+            .session_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            == Some("transcript_full.jsonl")
 }
 
 #[derive(Deserialize)]
@@ -64,6 +80,16 @@ fn agent_kind(name: &str) -> Option<AgentKind> {
     match name {
         "pi" => Some(AgentKind::Pi),
         "codex" => Some(AgentKind::Codex),
+        "agy" => Some(AgentKind::Agy),
+        _ => None,
+    }
+}
+
+fn process_agent_kind(executable: &str) -> Option<AgentKind> {
+    match executable_name(executable)? {
+        "pi" => Some(AgentKind::Pi),
+        "codex" => Some(AgentKind::Codex),
+        "agy" | "antigravity" => Some(AgentKind::Agy),
         _ => None,
     }
 }
@@ -112,7 +138,7 @@ fn capture_from_socket(socket: &Path) -> Result<Option<FocusedAgentSnapshot>> {
             .ok()
             .filter(|pid| *pid > 0)?;
         let executable = process["argv"].as_array()?.first()?.as_str()?;
-        (executable_name(executable).and_then(agent_kind) == Some(kind)).then_some(pid)
+        (process_agent_kind(executable) == Some(kind)).then_some(pid)
     });
     let Some(pid) = candidates.next() else {
         return Ok(None);
@@ -389,6 +415,125 @@ mod tests {
         assert_eq!(turns[0].user, "CodexUser");
         assert_eq!(turns[0].assistant, "CodexAnswer");
         locator.session_id = "different-session".into();
+        assert!(!session.matches(&locator));
+    }
+
+    #[test]
+    fn focused_herdr_agy_uses_matching_session_id_and_history() {
+        let directory = tempfile::tempdir().unwrap();
+        let logs = directory.path().join("agy-session/.system_generated/logs");
+        fs::create_dir_all(&logs).unwrap();
+        let session_path = logs.join("transcript_full.jsonl");
+        fs::write(
+            &session_path,
+            [
+                json!({
+                    "step_index": 0,
+                    "source": "USER_EXPLICIT",
+                    "type": "USER_INPUT",
+                    "status": "DONE",
+                    "content": "<USER_REQUEST>\nAgyUser\n</USER_REQUEST>\n<ADDITIONAL_METADATA>\nMeta\n</ADDITIONAL_METADATA>"
+                }),
+                json!({
+                    "step_index": 1,
+                    "source": "MODEL",
+                    "type": "PLANNER_RESPONSE",
+                    "status": "DONE",
+                    "content": "IntermediateNarration",
+                    "tool_calls": [{"name": "read_file"}]
+                }),
+                json!({
+                    "step_index": 2,
+                    "source": "MODEL",
+                    "type": "PLANNER_RESPONSE",
+                    "status": "DONE",
+                    "content": "AgyAnswer"
+                }),
+            ]
+            .iter()
+            .map(|value| format!("{value}\n"))
+            .collect::<String>(),
+        )
+        .unwrap();
+        let session_path = session_path.canonicalize().unwrap();
+        let metadata = fs::metadata(&session_path).unwrap();
+        let agy_processes = json!({"type": "pane_process_info", "process_info": {
+            "pane_id": "w1:p2",
+            "foreground_processes": [
+                {"pid": std::process::id(), "argv": ["agy"]},
+                {"pid": 999999, "argv": ["python3", "/home/test/.local/bin/agy-terminal-title"]}
+            ]
+        }});
+        let (_server_dir, socket, worker) =
+            mock_server(vec![pane("agy", "id", "agy-session"), agy_processes]);
+        let snapshot = capture_from_socket(&socket).unwrap().unwrap();
+        worker.join().unwrap();
+        assert_eq!(snapshot.kind, AgentKind::Agy);
+        assert_eq!(snapshot.pid, std::process::id());
+        let mut locator = AgentSessionLocator {
+            kind: snapshot.kind,
+            pid: snapshot.pid,
+            process_start_ticks: process_start_ticks(snapshot.pid).unwrap(),
+            session_id: "agy-session".into(),
+            session_path,
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            pi_registry_path: None,
+        };
+        let session = snapshot.herdr_session.unwrap();
+        assert!(session.matches(&locator));
+        let (agent, turns) = load_source(&locator).unwrap().unwrap();
+        assert_eq!(agent, AgentKind::Agy);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].user, "AgyUser");
+        assert_eq!(turns[0].assistant, "AgyAnswer");
+        locator.session_id = "other-agy-session".into();
+        assert!(!session.matches(&locator));
+    }
+
+    #[test]
+    fn focused_herdr_agy_path_ref_matches_sibling_full_transcript_and_rejects_other_session() {
+        let directory = tempfile::tempdir().unwrap();
+        let logs_a = directory.path().join("session-a/.system_generated/logs");
+        let logs_b = directory.path().join("session-b/.system_generated/logs");
+        fs::create_dir_all(&logs_a).unwrap();
+        fs::create_dir_all(&logs_b).unwrap();
+        let compact_a = logs_a.join("transcript.jsonl");
+        let full_a = logs_a.join("transcript_full.jsonl");
+        let full_b = logs_b.join("transcript_full.jsonl");
+        fs::write(&compact_a, "{}\n").unwrap();
+        fs::write(&full_a, "{}\n").unwrap();
+        fs::write(&full_b, "{}\n").unwrap();
+        let compact_a = compact_a.canonicalize().unwrap();
+        let full_a = full_a.canonicalize().unwrap();
+        let full_b = full_b.canonicalize().unwrap();
+        let metadata = fs::metadata(&full_a).unwrap();
+
+        let (_server_dir, socket, worker) = mock_server(vec![
+            pane("agy", "path", compact_a.to_str().unwrap()),
+            processes("antigravity"),
+        ]);
+        let snapshot = capture_from_socket(&socket).unwrap().unwrap();
+        worker.join().unwrap();
+        assert_eq!(snapshot.kind, AgentKind::Agy);
+
+        let session = snapshot.herdr_session.unwrap();
+        let mut locator = AgentSessionLocator {
+            kind: AgentKind::Agy,
+            pid: snapshot.pid,
+            process_start_ticks: process_start_ticks(snapshot.pid).unwrap(),
+            session_id: "session-a".into(),
+            session_path: full_a,
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            pi_registry_path: None,
+        };
+        assert!(session.matches(&locator));
+
+        locator.session_path = compact_a;
+        assert!(session.matches(&locator));
+
+        locator.session_path = full_b;
         assert!(!session.matches(&locator));
     }
 
