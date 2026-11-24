@@ -1588,8 +1588,7 @@ fn term_is_useful(term: &str, char_count: usize) -> bool {
     if char_count < 2 || is_stopword(term) {
         return false;
     }
-    let lower = term.to_ascii_lowercase();
-    if lower.starts_with("http://") || lower.starts_with("https://") {
+    if is_uri_or_url(term) || is_pure_ordinal_marker(term) {
         return false;
     }
     // Long unstructured ASCII values are more likely to be identifiers,
@@ -1599,6 +1598,48 @@ fn term_is_useful(term: &str, char_count: usize) -> bool {
         .chars()
         .any(|character| matches!(character, '-' | '_' | '/' | '.' | ':' | '+' | '#' | '@'));
     char_count <= 48 || structured
+}
+
+fn is_uri_or_url(term: &str) -> bool {
+    if let Some((prefix, _)) = term.split_once("://") {
+        let scheme = prefix.rsplit(':').next().unwrap_or(prefix);
+        if is_uri_scheme(scheme) {
+            return true;
+        }
+    }
+    let Some((scheme, rest)) = term.split_once(':') else {
+        return false;
+    };
+    if rest.is_empty() {
+        return false;
+    }
+    match scheme.to_ascii_lowercase().as_str() {
+        "mailto" | "urn" | "tel" | "javascript" | "about" => true,
+        "data" => rest.contains('/') || rest.contains(';'),
+        "unix" => rest.starts_with('/'),
+        _ => false,
+    }
+}
+
+fn is_uri_scheme(scheme: &str) -> bool {
+    let mut bytes = scheme.bytes();
+    let Some(first) = bytes.next() else {
+        return false;
+    };
+    first.is_ascii_alphabetic()
+        && bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'-' | b'.'))
+}
+
+fn is_pure_ordinal_marker(term: &str) -> bool {
+    let body = term.strip_prefix('#').unwrap_or(term);
+    let has_hash = body.len() != term.len();
+    let has_digit = body.bytes().any(|byte| byte.is_ascii_digit());
+    let has_dot = body.bytes().any(|byte| byte == b'.');
+    has_digit
+        && (has_dot || has_hash)
+        && body
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || byte == b'.')
 }
 
 fn term_looks_sensitive(term: &str) -> bool {
@@ -2417,6 +2458,65 @@ mod tests {
         assert!(!terms.iter().any(|term| term.text.contains("AKIA")));
         assert!(!terms.iter().any(|term| term.text.contains("password@")));
         assert!(terms.iter().any(|term| term.text == "safe-model"));
+    }
+
+    #[test]
+    fn terminology_skips_whole_uris_and_ordinals_while_segmenting_their_text() {
+        let source = "1. 检查 2.3.1 #12 [shell.qml](file:///home/saco/.config/quickshell/power-profile-history/shell.qml#L141-L149) \
+            和 https://docs.example.com/guides/udev-overview \
+            以及 wss://dashscope.aliyuncs.com/api-ws/v1/inference ssh://git@github.com/org/repo.git \
+            git+https://example.org/project.git URL:https://example.net/topic \
+            mailto:alice@example.com urn:isbn:0451450523 data:image/png;base64,AAAA unix:/tmp/kitty-42 \
+            保留 system-udev AgentKind::Agy localhost:35129 C# v1.5.15 qwen-audio-3.0 data:value。";
+        let terms = extract_terminology(source);
+        let texts = terms
+            .iter()
+            .map(|term| term.text.as_str())
+            .collect::<Vec<_>>();
+
+        for forbidden in [
+            "1.",
+            "2.3.1",
+            "#12",
+            "file:///home/saco/.config/quickshell/power-profile-history/shell.qml#L141-L149",
+            "https://docs.example.com/guides/udev-overview",
+            "wss://dashscope.aliyuncs.com/api-ws/v1/inference",
+            "ssh://git@github.com/org/repo.git",
+            "git+https://example.org/project.git",
+            "URL:https://example.net/topic",
+            "mailto:alice@example.com",
+            "urn:isbn:0451450523",
+            "data:image/png;base64,AAAA",
+            "unix:/tmp/kitty-42",
+        ] {
+            assert!(
+                !texts.contains(&forbidden),
+                "unexpected monolithic marker/URI: {forbidden}"
+            );
+        }
+
+        // Ordinary words from the same text and inside URIs are still segmented,
+        // and genuine technical identifiers outside URIs are preserved.
+        for expected in [
+            "检查",
+            "shell.qml",
+            "quickshell",
+            "guides",
+            "overview",
+            "dashscope",
+            "system-udev",
+            "AgentKind::Agy",
+            "localhost:35129",
+            "C#",
+            "v1.5.15",
+            "qwen-audio-3.0",
+            "data:value",
+        ] {
+            assert!(
+                texts.iter().any(|text| text.eq_ignore_ascii_case(expected)),
+                "missing expected term: {expected}; got: {texts:?}"
+            );
+        }
     }
 
     #[test]
